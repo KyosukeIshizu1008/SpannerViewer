@@ -47,9 +47,11 @@ pub struct Channels {
     pub kube_topo_req_tx: UnboundedSender<()>,
     pub kube_topo_rx: Receiver<SchemaGraph>,
     pub kube_log_req_tx: UnboundedSender<k8s::LogReq>,
-    pub kube_log_rx: Receiver<k8s::LogResult>,
+    pub kube_log_rx: Receiver<k8s::LogEvent>,
     pub kube_ev_req_tx: UnboundedSender<()>,
     pub kube_ev_rx: Receiver<k8s::EventsResult>,
+    pub kube_action_req_tx: UnboundedSender<k8s::ActionReq>,
+    pub kube_action_rx: Receiver<k8s::ActionResult>,
     pub poll_interval: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub conn_info: String,
 }
@@ -91,12 +93,13 @@ pub struct MonitorApp {
     kube_zoom: f32,
     kube_view: KubeView,
 
-    // k8s ログ
+    // k8s ログ（追従ストリーム）
     kube_log_req_tx: UnboundedSender<k8s::LogReq>,
-    kube_log_rx: Receiver<k8s::LogResult>,
-    kube_log: Option<k8s::LogResult>,
+    kube_log_rx: Receiver<k8s::LogEvent>,
+    kube_log_title: String,
+    kube_log_buf: String,
     kube_log_open: bool,
-    kube_log_pending: bool,
+    kube_log_following: bool,
 
     // k8s イベント
     kube_ev_req_tx: UnboundedSender<()>,
@@ -104,10 +107,18 @@ pub struct MonitorApp {
     kube_events: Option<k8s::EventsResult>,
     kube_ev_pending: bool,
 
+    // k8s 操作
+    kube_action_req_tx: UnboundedSender<k8s::ActionReq>,
+    kube_action_rx: Receiver<k8s::ActionResult>,
+    confirm: Option<(String, k8s::ActionReq)>, // 破壊的操作の確認ダイアログ
+
     // 設定
     poll_interval: std::sync::Arc<std::sync::atomic::AtomicU64>,
     conn_info: String,
     settings_open: bool,
+    contexts: Vec<String>,
+    current_context: Option<String>,
+    contexts_loaded: bool,
 
     section: Section,
     view: View,
@@ -148,16 +159,23 @@ impl MonitorApp {
             kube_view: KubeView::Monitor,
             kube_log_req_tx: ch.kube_log_req_tx,
             kube_log_rx: ch.kube_log_rx,
-            kube_log: None,
+            kube_log_title: String::new(),
+            kube_log_buf: String::new(),
             kube_log_open: false,
-            kube_log_pending: false,
+            kube_log_following: false,
             kube_ev_req_tx: ch.kube_ev_req_tx,
             kube_ev_rx: ch.kube_ev_rx,
             kube_events: None,
             kube_ev_pending: false,
+            kube_action_req_tx: ch.kube_action_req_tx,
+            kube_action_rx: ch.kube_action_rx,
+            confirm: None,
             poll_interval: ch.poll_interval,
             conn_info: ch.conn_info,
             settings_open: false,
+            contexts: Vec::new(),
+            current_context: None,
+            contexts_loaded: false,
             section: Section::Spanner,
             view: View::Monitor,
         }
@@ -190,13 +208,43 @@ impl MonitorApp {
             self.kube_pending = false;
             self.kube_graph = Some(g);
         }
-        while let Ok(l) = self.kube_log_rx.try_recv() {
-            self.kube_log_pending = false;
-            self.kube_log = Some(l);
+        while let Ok(ev) = self.kube_log_rx.try_recv() {
+            match ev {
+                k8s::LogEvent::Start(title) => {
+                    self.kube_log_title = title;
+                    self.kube_log_buf.clear();
+                    self.kube_log_following = true;
+                }
+                k8s::LogEvent::Line(l) => {
+                    self.kube_log_buf.push_str(&l);
+                    self.kube_log_buf.push('\n');
+                    // バッファが肥大化しないよう前方を切り詰め（char 境界で）
+                    if self.kube_log_buf.len() > 200_000 {
+                        let mut start = self.kube_log_buf.len() - 150_000;
+                        while !self.kube_log_buf.is_char_boundary(start) {
+                            start += 1;
+                        }
+                        self.kube_log_buf = self.kube_log_buf[start..].to_string();
+                    }
+                }
+                k8s::LogEvent::Error(e) => {
+                    self.kube_log_buf.push_str(&format!("[error] {e}\n"));
+                    self.kube_log_following = false;
+                }
+            }
         }
         while let Ok(e) = self.kube_ev_rx.try_recv() {
             self.kube_ev_pending = false;
             self.kube_events = Some(e);
+        }
+        while let Ok(r) = self.kube_action_rx.try_recv() {
+            self.copy_note = Some(r.message);
+            if let Some((title, text)) = r.describe {
+                self.kube_log_title = title;
+                self.kube_log_buf = text;
+                self.kube_log_open = true;
+                self.kube_log_following = false;
+            }
         }
     }
 
@@ -220,9 +268,13 @@ impl MonitorApp {
         };
         if self.kube_log_req_tx.send(req).is_ok() {
             self.kube_log_open = true;
-            self.kube_log_pending = true;
-            self.kube_log = None;
+            self.kube_log_following = true;
+            self.kube_log_buf.clear();
         }
+    }
+
+    fn send_action(&mut self, req: k8s::ActionReq) {
+        let _ = self.kube_action_req_tx.send(req);
     }
 
     fn latest_ok(&self) -> Option<&Sample> {
@@ -316,6 +368,7 @@ impl eframe::App for MonitorApp {
 
         self.settings_window(ctx);
         self.logs_window(ctx);
+        self.confirm_window(ctx);
     }
 }
 
@@ -323,10 +376,20 @@ impl MonitorApp {
     /// 左アクティビティバー: セクション切替（Spanner / Kubernetes）。
     fn activity_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(12.0);
-        if activity_item(ui, self.section == Section::Spanner, draw_db_icon, "Spanner") {
+        if activity_item(
+            ui,
+            self.section == Section::Spanner,
+            draw_db_icon,
+            "Spanner",
+        ) {
             self.section = Section::Spanner;
         }
-        if activity_item(ui, self.section == Section::Kube, draw_k8s_icon, "Kubernetes") {
+        if activity_item(
+            ui,
+            self.section == Section::Kube,
+            draw_k8s_icon,
+            "Kubernetes",
+        ) {
             self.section = Section::Kube;
         }
         // 設定（歯車）はバー下部に
@@ -364,7 +427,10 @@ impl MonitorApp {
                 }
             });
             if let Some(e) = &self.last_error {
-                ui.colored_label(egui::Color32::from_rgb(248, 113, 113), format!("エラー: {e}"));
+                ui.colored_label(
+                    egui::Color32::from_rgb(248, 113, 113),
+                    format!("エラー: {e}"),
+                );
             }
             ui.add_space(6.0);
         });
@@ -385,8 +451,7 @@ impl MonitorApp {
                 .collect();
 
             ui.label(
-                egui::RichText::new("CPU 使用率 (%) — 横軸: 計測開始からの経過 (分)")
-                    .color(MUTED),
+                egui::RichText::new("CPU 使用率 (%) — 横軸: 計測開始からの経過 (分)").color(MUTED),
             );
             Plot::new("cpu_plot")
                 .height(260.0)
@@ -419,9 +484,7 @@ impl MonitorApp {
                 .map(|s| [(s.t - t0) / 60.0, s.storage_used / s.storage_limit * 100.0])
                 .collect();
 
-            ui.label(
-                egui::RichText::new("ストレージ使用率 (%) — 横軸: 経過 (分)").color(MUTED),
-            );
+            ui.label(egui::RichText::new("ストレージ使用率 (%) — 横軸: 経過 (分)").color(MUTED));
             Plot::new("storage_plot")
                 .height(260.0)
                 .legend(Legend::default())
@@ -517,13 +580,18 @@ impl MonitorApp {
         });
 
         let mut log_req: Option<(String, String, String)> = None;
+        let mut action_req: Option<k8s::ActionReq> = None;
+        let mut confirm_req: Option<(String, k8s::ActionReq)> = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(m) = &self.kube_metrics else {
                 centered_hint(ui, "kubectl から取得中…");
                 return;
             };
             if m.error.is_some() {
-                centered_hint(ui, "クラスタに接続できません（kubectl とクラスタ接続を確認）");
+                centered_hint(
+                    ui,
+                    "クラスタに接続できません（kubectl とクラスタ接続を確認）",
+                );
                 return;
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -603,25 +671,38 @@ impl MonitorApp {
                                 .color(MUTED)
                                 .small(),
                         );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(egui::RichText::new(&p.age).color(MUTED).small());
-                                ui.label(
-                                    egui::RichText::new(format!("再起動 {}", p.restarts))
-                                        .color(if p.restarts > 0 { CPU_COLOR } else { MUTED })
-                                        .small(),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{:.0}m / {:.0}Mi",
-                                        p.cpu_milli, p.mem_mib
-                                    ))
-                                    .color(MUTED)
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("削除").clicked() {
+                                confirm_req = Some((
+                                    format!("Pod {}/{} を削除しますか？", p.ns, p.name),
+                                    k8s::ActionReq::DeletePod {
+                                        ns: p.ns.clone(),
+                                        pod: p.name.clone(),
+                                    },
+                                ));
+                            }
+                            if ui.small_button("詳細").clicked() {
+                                action_req = Some(k8s::ActionReq::Describe {
+                                    ns: p.ns.clone(),
+                                    kind: "pod".into(),
+                                    name: p.name.clone(),
+                                });
+                            }
+                            ui.label(egui::RichText::new(&p.age).color(MUTED).small());
+                            ui.label(
+                                egui::RichText::new(format!("再起動 {}", p.restarts))
+                                    .color(if p.restarts > 0 { CPU_COLOR } else { MUTED })
                                     .small(),
-                                );
-                            },
-                        );
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{:.0}m / {:.0}Mi",
+                                    p.cpu_milli, p.mem_mib
+                                ))
+                                .color(MUTED)
+                                .small(),
+                            );
+                        });
                     })
                     .body(|ui| {
                         egui::Grid::new(("kc", p.ns.as_str(), p.name.as_str()))
@@ -667,6 +748,49 @@ impl MonitorApp {
         if let Some((ns, pod, c)) = log_req {
             self.open_logs(&ns, &pod, &c);
         }
+        if let Some(a) = action_req {
+            self.send_action(a);
+        }
+        if let Some(c) = confirm_req {
+            self.confirm = Some(c);
+        }
+    }
+
+    /// 破壊的操作の確認ダイアログ。
+    fn confirm_window(&mut self, ctx: &egui::Context) {
+        let Some((msg, _)) = &self.confirm else {
+            return;
+        };
+        let msg = msg.clone();
+        let mut decision: Option<bool> = None;
+        egui::Window::new("確認")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(msg);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new("実行").fill(egui::Color32::from_rgb(220, 60, 60)))
+                        .clicked()
+                    {
+                        decision = Some(true);
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        match decision {
+            Some(true) => {
+                if let Some((_, req)) = self.confirm.take() {
+                    self.send_action(req);
+                }
+            }
+            Some(false) => self.confirm = None,
+            None => {}
+        }
     }
 
     fn kube_events_view(&mut self, ctx: &egui::Context) {
@@ -684,9 +808,14 @@ impl MonitorApp {
                     ui.spinner();
                 } else if let Some(r) = &self.kube_events {
                     if let Some(e) = &r.error {
-                        ui.colored_label(egui::Color32::from_rgb(248, 113, 113), format!("エラー: {e}"));
+                        ui.colored_label(
+                            egui::Color32::from_rgb(248, 113, 113),
+                            format!("エラー: {e}"),
+                        );
                     } else {
-                        ui.label(egui::RichText::new(format!("{} 件", r.events.len())).color(MUTED));
+                        ui.label(
+                            egui::RichText::new(format!("{} 件", r.events.len())).color(MUTED),
+                        );
                     }
                 }
             });
@@ -738,64 +867,121 @@ impl MonitorApp {
         if !self.settings_open {
             return;
         }
+        if !self.contexts_loaded {
+            let (list, current) = k8s::list_contexts_blocking();
+            self.contexts = list;
+            self.current_context = current;
+            self.contexts_loaded = true;
+        }
         let mut open = self.settings_open;
+        let mut chosen = self.current_context.clone();
         egui::Window::new("設定")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new("接続").color(MUTED).small());
+                ui.label(egui::RichText::new("Spanner 接続").color(MUTED).small());
                 ui.label(&self.conn_info);
                 ui.separator();
-                ui.label(egui::RichText::new("ポーリング間隔（秒）").color(MUTED).small());
-                let mut secs = self.poll_interval.load(std::sync::atomic::Ordering::Relaxed);
+
+                ui.label(
+                    egui::RichText::new("kubectl コンテキスト")
+                        .color(MUTED)
+                        .small(),
+                );
+                if self.contexts.is_empty() {
+                    ui.label(
+                        egui::RichText::new("(kubectl 未検出 / コンテキストなし)").color(MUTED),
+                    );
+                } else {
+                    egui::ComboBox::from_id_salt("kctx")
+                        .selected_text(chosen.clone().unwrap_or_else(|| "(既定)".into()))
+                        .show_ui(ui, |ui| {
+                            for c in &self.contexts {
+                                ui.selectable_value(&mut chosen, Some(c.clone()), c);
+                            }
+                        });
+                }
+                ui.separator();
+
+                ui.label(
+                    egui::RichText::new("ポーリング間隔（秒）")
+                        .color(MUTED)
+                        .small(),
+                );
+                let mut secs = self
+                    .poll_interval
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 if ui.add(egui::Slider::new(&mut secs, 1..=120)).changed() {
                     self.poll_interval
                         .store(secs, std::sync::atomic::Ordering::Relaxed);
                 }
                 ui.label(
-                    egui::RichText::new("監視・k8s メトリクスの取得間隔。\nCloud Monitoring は最小約60秒。")
-                        .color(MUTED)
-                        .small(),
+                    egui::RichText::new(
+                        "監視・k8s メトリクスの取得間隔。\nCloud Monitoring は最小約60秒。",
+                    )
+                    .color(MUTED)
+                    .small(),
                 );
             });
         self.settings_open = open;
+
+        // コンテキスト切替 → 以降の kubectl 呼び出しに反映し、表示をリセット
+        if chosen != self.current_context {
+            self.current_context = chosen.clone();
+            k8s::set_context(chosen);
+            self.kube_graph = None;
+            self.kube_events = None;
+            self.kube_metrics = None;
+            self.copy_note = Some("コンテキストを切り替えました".into());
+        }
     }
 
     fn logs_window(&mut self, ctx: &egui::Context) {
         if !self.kube_log_open {
             return;
         }
+        // 追従中はこまめに再描画してストリームを反映
+        if self.kube_log_following {
+            ctx.request_repaint_after(Duration::from_millis(300));
+        }
         let mut open = self.kube_log_open;
-        let title = self
-            .kube_log
-            .as_ref()
-            .map(|l| l.title.clone())
-            .unwrap_or_else(|| "ログ".into());
-        egui::Window::new(format!("ログ · {title}"))
+        egui::Window::new(format!("ログ · {}", self.kube_log_title))
             .open(&mut open)
-            .default_size([660.0, 420.0])
+            .default_size([680.0, 440.0])
             .resizable(true)
             .show(ctx, |ui| {
-                if self.kube_log_pending {
-                    ui.horizontal(|ui| {
+                ui.horizontal(|ui| {
+                    if self.kube_log_following {
                         ui.spinner();
-                        ui.label(egui::RichText::new("取得中…").color(MUTED));
+                        ui.label(
+                            egui::RichText::new("追従中 (logs -f)")
+                                .color(STORAGE_COLOR)
+                                .small(),
+                        );
+                    } else {
+                        ui.label(egui::RichText::new("停止").color(MUTED).small());
+                    }
+                    if ui.button("コピー").clicked() {
+                        ui.ctx().copy_text(self.kube_log_buf.clone());
+                    }
+                    if ui.button("クリア").clicked() {
+                        self.kube_log_buf.clear();
+                    }
+                });
+                ui.separator();
+                let mut text = self.kube_log_buf.as_str();
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.add_sized(
+                            ui.available_size(),
+                            egui::TextEdit::multiline(&mut text)
+                                .code_editor()
+                                .desired_width(f32::INFINITY),
+                        );
                     });
-                }
-                if let Some(l) = &self.kube_log {
-                    let mut text = l.text.clone(); // 編集は破棄（選択/コピー用）
-                    egui::ScrollArea::both()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.add_sized(
-                                ui.available_size(),
-                                egui::TextEdit::multiline(&mut text)
-                                    .code_editor()
-                                    .desired_width(f32::INFINITY),
-                            );
-                        });
-                }
             });
         self.kube_log_open = open;
     }
@@ -851,7 +1037,15 @@ impl MonitorApp {
         } = self;
         let g = kube_graph.as_ref();
         egui::CentralPanel::default().show(ctx, |ui| {
-            Self::draw_graph(ui, g, kube_positions, kube_selected, kube_pan, kube_zoom, copy_note);
+            Self::draw_graph(
+                ui,
+                g,
+                kube_positions,
+                kube_selected,
+                kube_pan,
+                kube_zoom,
+                copy_note,
+            );
         });
     }
 
@@ -963,7 +1157,10 @@ impl MonitorApp {
             return;
         };
         if let Some(e) = &graph.error {
-            ui.colored_label(egui::Color32::from_rgb(248, 113, 113), format!("エラー: {e}"));
+            ui.colored_label(
+                egui::Color32::from_rgb(248, 113, 113),
+                format!("エラー: {e}"),
+            );
             return;
         }
         if graph.nodes.is_empty() {
@@ -973,7 +1170,11 @@ impl MonitorApp {
 
         let rect = ui.available_rect_before_wrap();
         // 背景（パン/ズーム/選択解除）。ノードより先に登録して下層に置く。
-        let bg = ui.interact(rect, ui.id().with("schema_bg"), egui::Sense::click_and_drag());
+        let bg = ui.interact(
+            rect,
+            ui.id().with("schema_bg"),
+            egui::Sense::click_and_drag(),
+        );
         if bg.dragged() {
             *diagram_pan += bg.drag_delta();
         }
@@ -998,7 +1199,11 @@ impl MonitorApp {
             } else {
                 egui::FontId::proportional(size)
             };
-            ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE).size().x)
+            ui.fonts(|f| {
+                f.layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE)
+                    .size()
+                    .x
+            })
         };
         let mut widths: HashMap<String, f32> = HashMap::new();
         for n in &graph.nodes {
@@ -1042,7 +1247,10 @@ impl MonitorApp {
             outgoing.entry(e.from.as_str()).or_default().push(i);
         }
         let slot = |list: &[usize], i: usize| -> (usize, usize) {
-            (list.iter().position(|&x| x == i).unwrap_or(0), list.len().max(1))
+            (
+                list.iter().position(|&x| x == i).unwrap_or(0),
+                list.len().max(1),
+            )
         };
 
         // エッジ（背面）
@@ -1072,7 +1280,7 @@ impl MonitorApp {
                 EdgeKind::Interleave => ACCENT,
                 EdgeKind::ForeignKey => CPU_COLOR,
             };
-            let active = sel.as_deref().map_or(true, |s| e.from == s || e.to == s);
+            let active = sel.as_deref().is_none_or(|s| e.from == s || e.to == s);
             let color = if active {
                 base_color
             } else {
@@ -1102,7 +1310,7 @@ impl MonitorApp {
             let is_sel = sel.as_deref() == Some(node.name.as_str());
             let dimmed = related
                 .as_ref()
-                .map_or(false, |r| !r.contains(node.name.as_str()));
+                .is_some_and(|r| !r.contains(node.name.as_str()));
             let dim = |c: egui::Color32| if dimmed { c.gamma_multiply(0.35) } else { c };
             let fs = |s: f32| (s * z).max(6.0);
             // ノード内のテキストは枠外へはみ出さないようクリップ
@@ -1169,7 +1377,8 @@ impl MonitorApp {
                     *copy_note = Some(format!("コピー: {name} のカラム"));
                     ui.close_menu();
                 }
-                if !idx_joined.is_empty() && ui.button("インデックス一覧をコピー").clicked() {
+                if !idx_joined.is_empty() && ui.button("インデックス一覧をコピー").clicked()
+                {
                     ui.ctx().copy_text(idx_joined.clone());
                     *copy_note = Some(format!("コピー: {name} のインデックス"));
                     ui.close_menu();
@@ -1187,7 +1396,16 @@ impl MonitorApp {
                 let rid = ui.id().with(("col", node.name.as_str(), i));
                 let label = format!("{}  {}", col.name, col.ty);
                 let color = if col.pk { dim(PK_COLOR) } else { dim(TEXT) };
-                if diagram_row(ui, &pc, rr, rid, &label, egui::FontId::monospace(fs(11.5)), color, z) {
+                if diagram_row(
+                    ui,
+                    &pc,
+                    rr,
+                    rid,
+                    &label,
+                    egui::FontId::monospace(fs(11.5)),
+                    color,
+                    z,
+                ) {
                     ui.ctx().copy_text(label.clone());
                     *copy_note = Some(copied(&label));
                 }
@@ -1222,7 +1440,16 @@ impl MonitorApp {
                         egui::vec2(screen.width(), row_h),
                     );
                     let rid = ui.id().with(("idx", node.name.as_str(), i));
-                    if diagram_row(ui, &pc, rr, rid, idx, egui::FontId::monospace(fs(11.0)), dim(ACCENT), z) {
+                    if diagram_row(
+                        ui,
+                        &pc,
+                        rr,
+                        rid,
+                        idx,
+                        egui::FontId::monospace(fs(11.0)),
+                        dim(ACCENT),
+                        z,
+                    ) {
                         ui.ctx().copy_text(idx.clone());
                         *copy_note = Some(copied(idx));
                     }
@@ -1248,6 +1475,7 @@ fn copied(value: &str) -> String {
 }
 
 /// ノード内の 1 行（カラム/インデックス）。クリックでコピー、ホバーで強調。
+#[allow(clippy::too_many_arguments)]
 fn diagram_row(
     ui: &egui::Ui,
     painter: &egui::Painter,
@@ -1337,8 +1565,8 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
 
 fn phase_color(phase: &str) -> egui::Color32 {
     match phase {
-        "Running" => egui::Color32::from_rgb(34, 197, 94),   // 緑
-        "Pending" => egui::Color32::from_rgb(251, 191, 36),  // 黄
+        "Running" => egui::Color32::from_rgb(34, 197, 94), // 緑
+        "Pending" => egui::Color32::from_rgb(251, 191, 36), // 黄
         "Succeeded" => egui::Color32::from_rgb(56, 189, 248), // 青
         "Failed" | "Unknown" => egui::Color32::from_rgb(248, 113, 113), // 赤
         _ => MUTED,
@@ -1437,7 +1665,6 @@ fn draw_db_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
     }
 }
 
-
 // ── スキーマダイアグラム描画 ──
 
 const NODE_W: f32 = 230.0;
@@ -1451,8 +1678,7 @@ const V_GAP: f32 = 70.0;
 const LAYOUT_FILE: &str = "schema_layout.json";
 
 fn save_layout(positions: &HashMap<String, egui::Pos2>) -> std::io::Result<()> {
-    let map: HashMap<&String, [f32; 2]> =
-        positions.iter().map(|(k, p)| (k, [p.x, p.y])).collect();
+    let map: HashMap<&String, [f32; 2]> = positions.iter().map(|(k, p)| (k, [p.x, p.y])).collect();
     let json = serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".into());
     std::fs::write(LAYOUT_FILE, json)
 }
@@ -1468,11 +1694,7 @@ fn load_layout() -> HashMap<String, egui::Pos2> {
 }
 
 /// 依存の深さでレベル分けし、各ノードの矩形（ワールド座標）を返す。
-fn layout_nodes(
-    graph: &SchemaGraph,
-    widths: &HashMap<String, f32>,
-) -> HashMap<String, egui::Rect> {
-
+fn layout_nodes(graph: &SchemaGraph, widths: &HashMap<String, f32>) -> HashMap<String, egui::Rect> {
     // レベル = 依存の深さ（不動点反復、循環は反復回数で打ち切り）
     let mut level: HashMap<&str, usize> =
         graph.nodes.iter().map(|n| (n.name.as_str(), 0)).collect();
@@ -1543,10 +1765,7 @@ fn draw_arrow(
     let p1 = egui::pos2(from.x, bend_y);
     let p2 = egui::pos2(to.x, bend_y);
     // 折れ線本体
-    painter.add(egui::Shape::line(
-        vec![from, p1, p2, to],
-        stroke,
-    ));
+    painter.add(egui::Shape::line(vec![from, p1, p2, to], stroke));
 
     // 矢じり（終点へ向かう向き = p2→to。通常は垂直方向）
     let dir = (to - p2).normalized();
@@ -1573,7 +1792,10 @@ fn result_status(ui: &mut egui::Ui, pending: bool, result: Option<&QueryOutcome>
         ui.label(egui::RichText::new("実行中…").color(MUTED));
     } else if let Some(r) = result {
         if let Some(e) = &r.error {
-            ui.colored_label(egui::Color32::from_rgb(248, 113, 113), format!("エラー: {e}"));
+            ui.colored_label(
+                egui::Color32::from_rgb(248, 113, 113),
+                format!("エラー: {e}"),
+            );
         } else {
             let mut msg = format!("{} 行 / {} ms", r.rows.len(), r.elapsed_ms);
             if r.truncated {
@@ -1694,7 +1916,11 @@ fn install_japanese_font(ctx: &egui::Context) {
         .insert("jp".to_owned(), egui::FontData::from_owned(bytes));
     // 既定（英数）フォントの後ろに足すことで、未収録の和文だけ JP フォントが埋める
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts.families.entry(family).or_default().push("jp".to_owned());
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("jp".to_owned());
     }
     ctx.set_fonts(fonts);
 }

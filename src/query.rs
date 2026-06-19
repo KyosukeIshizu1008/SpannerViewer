@@ -434,16 +434,67 @@ fn mock_graph() -> SchemaGraph {
     };
     SchemaGraph {
         nodes: vec![
-            node("Singers", &[("SingerId", "INT64", true), ("Name", "STRING(MAX)", false)], &["IDX_Singers_Name (Name)"]),
-            node("Albums", &[("SingerId", "INT64", true), ("AlbumId", "INT64", true), ("Title", "STRING(MAX)", false)], &["IDX_Albums_Title (Title)"]),
-            node("Songs", &[("SingerId", "INT64", true), ("AlbumId", "INT64", true), ("TrackId", "INT64", true), ("Title", "STRING(MAX)", false)], &[]),
-            node("Customers", &[("CustomerId", "INT64", true), ("Name", "STRING(MAX)", false)], &["IDX_Customers_Name (Name)  UNIQUE"]),
-            node("Orders", &[("OrderId", "INT64", true), ("CustomerId", "INT64", false), ("Amount", "NUMERIC", false)], &["IDX_Orders_Customer (CustomerId)"]),
+            node(
+                "Singers",
+                &[("SingerId", "INT64", true), ("Name", "STRING(MAX)", false)],
+                &["IDX_Singers_Name (Name)"],
+            ),
+            node(
+                "Albums",
+                &[
+                    ("SingerId", "INT64", true),
+                    ("AlbumId", "INT64", true),
+                    ("Title", "STRING(MAX)", false),
+                ],
+                &["IDX_Albums_Title (Title)"],
+            ),
+            node(
+                "Songs",
+                &[
+                    ("SingerId", "INT64", true),
+                    ("AlbumId", "INT64", true),
+                    ("TrackId", "INT64", true),
+                    ("Title", "STRING(MAX)", false),
+                ],
+                &[],
+            ),
+            node(
+                "Customers",
+                &[
+                    ("CustomerId", "INT64", true),
+                    ("Name", "STRING(MAX)", false),
+                ],
+                &["IDX_Customers_Name (Name)  UNIQUE"],
+            ),
+            node(
+                "Orders",
+                &[
+                    ("OrderId", "INT64", true),
+                    ("CustomerId", "INT64", false),
+                    ("Amount", "NUMERIC", false),
+                ],
+                &["IDX_Orders_Customer (CustomerId)"],
+            ),
         ],
         edges: vec![
-            Edge { from: "Albums".into(), to: "Singers".into(), kind: EdgeKind::Interleave, label: "CASCADE".into() },
-            Edge { from: "Songs".into(), to: "Albums".into(), kind: EdgeKind::Interleave, label: "CASCADE".into() },
-            Edge { from: "Orders".into(), to: "Customers".into(), kind: EdgeKind::ForeignKey, label: "FK_Orders_Customers".into() },
+            Edge {
+                from: "Albums".into(),
+                to: "Singers".into(),
+                kind: EdgeKind::Interleave,
+                label: "CASCADE".into(),
+            },
+            Edge {
+                from: "Songs".into(),
+                to: "Albums".into(),
+                kind: EdgeKind::Interleave,
+                label: "CASCADE".into(),
+            },
+            Edge {
+                from: "Orders".into(),
+                to: "Customers".into(),
+                kind: EdgeKind::ForeignKey,
+                label: "FK_Orders_Customers".into(),
+            },
         ],
         error: None,
     }
@@ -520,8 +571,9 @@ mod tests {
         };
         let client = client().await;
         // LoadTest には十分な行がある前提（loadgen 実行済み）
-        let (_, rows, truncated) =
-            try_query(&client, "SELECT Id FROM LoadTest LIMIT 5000").await.unwrap();
+        let (_, rows, truncated) = try_query(&client, "SELECT Id FROM LoadTest LIMIT 5000")
+            .await
+            .unwrap();
         assert_eq!(rows.len(), MAX_ROWS);
         assert!(truncated);
     }
@@ -541,9 +593,8 @@ mod tests {
         assert_eq!(cols, vec!["テーブル", "種別", "依存先", "詳細"]);
         // インターリーブ: DepChild → DepParent
         assert!(
-            rows.iter().any(|r| r[0] == "DepChild"
-                && r[1] == "インターリーブ"
-                && r[2] == "DepParent"),
+            rows.iter()
+                .any(|r| r[0] == "DepChild" && r[1] == "インターリーブ" && r[2] == "DepParent"),
             "interleave 行が見つからない: {rows:?}"
         );
         // 外部キー: DepOrders → DepParent
@@ -576,7 +627,10 @@ mod tests {
         assert!(orders.columns.iter().any(|c| c.name == "ParentId"));
         // セカンダリインデックスが含まれる
         assert!(
-            orders.indexes.iter().any(|i| i.contains("IDX_DepOrders_Parent")),
+            orders
+                .indexes
+                .iter()
+                .any(|i| i.contains("IDX_DepOrders_Parent")),
             "インデックスが見つからない: {:?}",
             orders.indexes
         );
@@ -611,7 +665,11 @@ mod tests {
             ],
             ..Default::default()
         };
-        let mut op = admin.database().update_database_ddl(req, None).await.unwrap();
+        let mut op = admin
+            .database()
+            .update_database_ddl(req, None)
+            .await
+            .unwrap();
         op.wait(None).await.unwrap();
     }
 }

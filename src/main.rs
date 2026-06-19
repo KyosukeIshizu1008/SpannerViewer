@@ -59,8 +59,7 @@ fn main() -> eframe::Result<()> {
     // 監視サンプル: 背景 → UI
     let (sample_tx, sample_rx) = mpsc::channel::<monitoring::Sample>();
     // クエリ要求: UI → 背景（async 受信のため tokio チャネル）。種別付き。
-    let (req_tx, req_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(query::Target, String)>();
+    let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel::<(query::Target, String)>();
     // クエリ結果: 背景 → UI
     let (res_tx, res_rx) = mpsc::channel::<query::QueryOutcome>();
     // スキーマ図: 背景 → UI
@@ -70,12 +69,16 @@ fn main() -> eframe::Result<()> {
     // k8s 構成図: 要求 UI → 背景、結果 背景 → UI
     let (kube_topo_req_tx, kube_topo_req_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let (kube_topo_tx, kube_topo_rx) = mpsc::channel::<query::SchemaGraph>();
-    // k8s ログ: 要求 → 結果
+    // k8s ログ追従: 要求 → ストリームイベント
     let (kube_log_req_tx, kube_log_req_rx) = tokio::sync::mpsc::unbounded_channel::<k8s::LogReq>();
-    let (kube_log_tx, kube_log_rx) = mpsc::channel::<k8s::LogResult>();
+    let (kube_log_tx, kube_log_rx) = mpsc::channel::<k8s::LogEvent>();
     // k8s イベント: 要求 → 結果
     let (kube_ev_req_tx, kube_ev_req_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let (kube_ev_tx, kube_ev_rx) = mpsc::channel::<k8s::EventsResult>();
+    // k8s 操作: 要求 → 結果
+    let (kube_action_req_tx, kube_action_req_rx) =
+        tokio::sync::mpsc::unbounded_channel::<k8s::ActionReq>();
+    let (kube_action_tx, kube_action_rx) = mpsc::channel::<k8s::ActionResult>();
 
     // 背景で 1 つのランタイムを回し、各ループを同時実行
     let bg_interval = poll_interval.clone();
@@ -93,6 +96,7 @@ fn main() -> eframe::Result<()> {
                 k8s::topology_loop(k8s::Config { mock }, kube_topo_req_rx, kube_topo_tx),
                 k8s::logs_loop(k8s::Config { mock }, kube_log_req_rx, kube_log_tx),
                 k8s::events_loop(k8s::Config { mock }, kube_ev_req_rx, kube_ev_tx),
+                k8s::action_loop(k8s::Config { mock }, kube_action_req_rx, kube_action_tx),
             );
         });
     });
@@ -119,6 +123,8 @@ fn main() -> eframe::Result<()> {
                     kube_log_rx,
                     kube_ev_req_tx,
                     kube_ev_rx,
+                    kube_action_req_tx,
+                    kube_action_rx,
                     poll_interval,
                     conn_info,
                 },

@@ -91,7 +91,10 @@ pub async fn poll_loop(
     let provider = match gcp_auth::provider().await {
         Ok(p) => p,
         Err(e) => {
-            let _ = tx.send(Sample::error_at(now_unix(), format!("認証初期化に失敗: {e}")));
+            let _ = tx.send(Sample::error_at(
+                now_unix(),
+                format!("認証初期化に失敗: {e}"),
+            ));
             return;
         }
     };
@@ -142,7 +145,9 @@ async fn mock_loop(interval: std::sync::Arc<std::sync::atomic::AtomicU64>, tx: S
 /// tick から -1.0..1.0 の決定的な擬似ノイズを作る（rand クレート不要）。
 fn pseudo_noise(tick: u64) -> f64 {
     // 線形合同法的なハッシュで散らす
-    let h = tick.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let h = tick
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     let frac = (h >> 11) as f64 / (1u64 << 53) as f64; // 0.0..1.0
     frac * 2.0 - 1.0
 }

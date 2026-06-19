@@ -5,16 +5,58 @@
 //! kubectl 不在・クラスタ未接続でも mock で動作する。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::Value;
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::query::{Column, Edge, EdgeKind, SchemaGraph, TableNode};
 
 pub struct Config {
     pub mock: bool,
+}
+
+/// 選択中の kubectl コンテキスト（None なら current-context）。
+static CONTEXT: Mutex<Option<String>> = Mutex::new(None);
+
+/// UI から選択コンテキストを設定する。
+pub fn set_context(ctx: Option<String>) {
+    *CONTEXT.lock().unwrap() = ctx;
+}
+
+fn context_args() -> Vec<String> {
+    match CONTEXT.lock().unwrap().clone() {
+        Some(c) if !c.is_empty() => vec!["--context".into(), c],
+        _ => Vec::new(),
+    }
+}
+
+/// 利用可能なコンテキスト一覧と現在のコンテキスト（同期・UI から呼ぶ）。
+pub fn list_contexts_blocking() -> (Vec<String>, Option<String>) {
+    let names = std::process::Command::new("kubectl")
+        .args(["config", "get-contexts", "-o", "name"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let current = std::process::Command::new("kubectl")
+        .args(["config", "current-context"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+    (names, current)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -81,10 +123,43 @@ pub struct LogReq {
     pub container: String,
 }
 
+/// ログのストリーミングイベント。
+#[derive(Clone, Debug)]
+pub enum LogEvent {
+    Start(String), // タイトル（新規ストリーム開始 → バッファクリア）
+    Line(String),
+    Error(String),
+}
+
+/// k8s 操作リクエスト。
+/// Scale / RolloutRestart はバックエンド実装済み（UI 露出は今後）。
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub enum ActionReq {
+    DeletePod {
+        ns: String,
+        pod: String,
+    },
+    Scale {
+        ns: String,
+        deploy: String,
+        replicas: i32,
+    },
+    RolloutRestart {
+        ns: String,
+        deploy: String,
+    },
+    Describe {
+        ns: String,
+        kind: String,
+        name: String,
+    },
+}
+
 #[derive(Clone, Debug, Default)]
-pub struct LogResult {
-    pub title: String,
-    pub text: String,
+pub struct ActionResult {
+    pub message: String,
+    pub describe: Option<(String, String)>, // (title, text) → ログ窓に表示
 }
 
 /// クラスタイベント（1件）
@@ -124,36 +199,188 @@ pub async fn monitor_loop(
     }
 }
 
-/// ログ取得ループ。
+/// ログ追従ループ。新しいリクエストが来たら直前のストリームを中断する。
 pub async fn logs_loop(
     cfg: Config,
     mut req_rx: UnboundedReceiver<LogReq>,
-    tx: std::sync::mpsc::Sender<LogResult>,
+    tx: std::sync::mpsc::Sender<LogEvent>,
 ) {
-    while let Some(r) = req_rx.recv().await {
-        let title = format!("{}/{} · {}", r.ns, r.pod, r.container);
-        let text = if cfg.mock {
-            mock_logs(&r)
-        } else {
-            match run(&[
-                "logs",
-                "-n",
-                r.ns.as_str(),
-                r.pod.as_str(),
-                "-c",
-                r.container.as_str(),
-                "--tail=300",
-            ])
-            .await
-            {
-                Ok(o) if o.trim().is_empty() => "(ログ出力なし)".into(),
-                Ok(o) => o,
-                Err(e) => format!("ログ取得失敗: {e}"),
+    let mut handle: Option<tokio::task::JoinHandle<()>> = None;
+    while let Some(req) = req_rx.recv().await {
+        if let Some(h) = handle.take() {
+            h.abort(); // 直前の kubectl logs -f を停止（kill_on_drop）
+        }
+        handle = Some(tokio::spawn(stream_logs(req, cfg.mock, tx.clone())));
+    }
+    if let Some(h) = handle.take() {
+        h.abort();
+    }
+}
+
+async fn stream_logs(req: LogReq, mock: bool, tx: std::sync::mpsc::Sender<LogEvent>) {
+    let title = format!("{}/{} · {}", req.ns, req.pod, req.container);
+    if tx.send(LogEvent::Start(title)).is_err() {
+        return;
+    }
+
+    if mock {
+        for i in 0..100000 {
+            let line = format!(
+                "2026-06-19T10:00:{:02}Z INFO  {} log line {}",
+                i % 60,
+                req.container,
+                i
+            );
+            if tx.send(LogEvent::Line(line)).is_err() {
+                return;
             }
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+        return;
+    }
+
+    let mut child = match tokio::process::Command::new("kubectl")
+        .args(context_args())
+        .args([
+            "logs",
+            "-f",
+            "-n",
+            req.ns.as_str(),
+            req.pod.as_str(),
+            "-c",
+            req.container.as_str(),
+            "--tail=200",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(LogEvent::Error(format!("kubectl 実行失敗: {e}")));
+            return;
+        }
+    };
+
+    if let Some(out) = child.stdout.take() {
+        let mut lines = tokio::io::BufReader::new(out).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    if tx.send(LogEvent::Line(line)).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx.send(LogEvent::Error(e.to_string()));
+                    break;
+                }
+            }
+        }
+    }
+
+    // 失敗時は stderr を回収して通知
+    let _ = child.wait().await;
+    if let Some(mut err) = child.stderr.take() {
+        use tokio::io::AsyncReadExt;
+        let mut s = String::new();
+        let _ = err.read_to_string(&mut s).await;
+        if !s.trim().is_empty() {
+            let _ = tx.send(LogEvent::Error(s.trim().to_string()));
+        }
+    }
+}
+
+/// k8s 操作ループ。
+pub async fn action_loop(
+    cfg: Config,
+    mut req_rx: UnboundedReceiver<ActionReq>,
+    tx: std::sync::mpsc::Sender<ActionResult>,
+) {
+    while let Some(a) = req_rx.recv().await {
+        let r = if cfg.mock {
+            ActionResult {
+                message: format!("(mock) {}", action_label(&a)),
+                describe: describe_mock(&a),
+            }
+        } else {
+            run_action(a).await
         };
-        if tx.send(LogResult { title, text }).is_err() {
+        if tx.send(r).is_err() {
             break;
         }
+    }
+}
+
+fn action_label(a: &ActionReq) -> String {
+    match a {
+        ActionReq::DeletePod { pod, .. } => format!("Pod {pod} を削除"),
+        ActionReq::Scale {
+            deploy, replicas, ..
+        } => format!("{deploy} を {replicas} にスケール"),
+        ActionReq::RolloutRestart { deploy, .. } => format!("{deploy} を再起動"),
+        ActionReq::Describe { kind, name, .. } => format!("describe {kind}/{name}"),
+    }
+}
+
+fn describe_mock(a: &ActionReq) -> Option<(String, String)> {
+    match a {
+        ActionReq::Describe { kind, name, ns } => Some((
+            format!("describe {kind}/{name}"),
+            format!("Name: {name}\nNamespace: {ns}\nKind: {kind}\n(mock describe)"),
+        )),
+        _ => None,
+    }
+}
+
+async fn run_action(a: ActionReq) -> ActionResult {
+    let label = action_label(&a);
+    match a {
+        ActionReq::DeletePod { ns, pod } => {
+            simple(run(&["delete", "pod", "-n", &ns, &pod]).await, label)
+        }
+        ActionReq::Scale {
+            ns,
+            deploy,
+            replicas,
+        } => {
+            let rep = format!("--replicas={replicas}");
+            simple(
+                run(&["scale", "deployment", "-n", &ns, &deploy, &rep]).await,
+                label,
+            )
+        }
+        ActionReq::RolloutRestart { ns, deploy } => simple(
+            run(&["rollout", "restart", "deployment", "-n", &ns, &deploy]).await,
+            label,
+        ),
+        ActionReq::Describe { ns, kind, name } => {
+            match run(&["describe", &kind, "-n", &ns, &name]).await {
+                Ok(o) => ActionResult {
+                    message: label.clone(),
+                    describe: Some((label, o)),
+                },
+                Err(e) => ActionResult {
+                    message: format!("describe 失敗: {e}"),
+                    describe: None,
+                },
+            }
+        }
+    }
+}
+
+fn simple(res: Result<String, String>, ok_msg: String) -> ActionResult {
+    match res {
+        Ok(_) => ActionResult {
+            message: ok_msg,
+            describe: None,
+        },
+        Err(e) => ActionResult {
+            message: format!("失敗: {e}"),
+            describe: None,
+        },
     }
 }
 
@@ -198,6 +425,7 @@ pub async fn topology_loop(
 
 async fn run(args: &[&str]) -> Result<String, String> {
     let out = tokio::process::Command::new("kubectl")
+        .args(context_args())
         .args(args)
         .output()
         .await
@@ -279,7 +507,11 @@ async fn fetch_metrics() -> KubeMetrics {
     }
     let mut namespaces: Vec<NsAgg> = per_ns
         .into_iter()
-        .map(|(name, (pods, containers))| NsAgg { name, pods, containers })
+        .map(|(name, (pods, containers))| NsAgg {
+            name,
+            pods,
+            containers,
+        })
         .collect();
     namespaces.sort_by(|a, b| b.containers.cmp(&a.containers).then(a.name.cmp(&b.name)));
 
@@ -378,10 +610,7 @@ fn state_str(status: &Value) -> String {
     }
 }
 
-fn parse_pods(
-    pj: &str,
-    cusage: &HashMap<(String, String, String), (f64, f64)>,
-) -> Vec<PodInfo> {
+fn parse_pods(pj: &str, cusage: &HashMap<(String, String, String), (f64, f64)>) -> Vec<PodInfo> {
     let Ok(v) = serde_json::from_str::<Value>(pj) else {
         return Vec::new();
     };
@@ -527,17 +756,6 @@ fn parse_events(json: &str) -> Vec<KubeEvent> {
     events
 }
 
-fn mock_logs(r: &LogReq) -> String {
-    format!(
-        "2026-06-19T10:00:01Z INFO  starting {} in {}/{}\n\
-         2026-06-19T10:00:02Z INFO  config loaded\n\
-         2026-06-19T10:00:03Z INFO  listening on :8080\n\
-         2026-06-19T10:00:05Z WARN  slow downstream (mock)\n\
-         2026-06-19T10:00:06Z INFO  request handled status=200",
-        r.container, r.ns, r.pod
-    )
-}
-
 fn mock_events() -> Vec<KubeEvent> {
     vec![
         KubeEvent {
@@ -631,7 +849,11 @@ fn build_topology(nodes_json: &str, pods_json: &str) -> SchemaGraph {
                     cols.push(line_col(&format!("- {cn}")));
                 }
             }
-            for c in item["spec"]["initContainers"].as_array().into_iter().flatten() {
+            for c in item["spec"]["initContainers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
                 if let Some(cn) = c["name"].as_str() {
                     cols.push(line_col(&format!("- {cn} (init)")));
                 }
@@ -676,18 +898,19 @@ fn build_topology(nodes_json: &str, pods_json: &str) -> SchemaGraph {
 // ── モック ──
 
 fn mock_metrics() -> KubeMetrics {
-    let ctr = |name: &str, image: &str, state: &str, restarts: i64, init: bool, cpu: f64, mem: f64| {
-        ContainerInfo {
-            name: name.into(),
-            image: image.into(),
-            ready: state == "Running",
-            restarts,
-            state: state.into(),
-            init,
-            cpu_milli: cpu,
-            mem_mib: mem,
-        }
-    };
+    let ctr =
+        |name: &str, image: &str, state: &str, restarts: i64, init: bool, cpu: f64, mem: f64| {
+            ContainerInfo {
+                name: name.into(),
+                image: image.into(),
+                ready: state == "Running",
+                restarts,
+                state: state.into(),
+                init,
+                cpu_milli: cpu,
+                mem_mib: mem,
+            }
+        };
     let pods = vec![
         PodInfo {
             ns: "default".into(),
@@ -699,9 +922,25 @@ fn mock_metrics() -> KubeMetrics {
             cpu_milli: 250.0,
             mem_mib: 180.0,
             containers: vec![
-                ctr("init-migrate", "migrate:1.2", "Completed", 0, true, 0.0, 0.0),
+                ctr(
+                    "init-migrate",
+                    "migrate:1.2",
+                    "Completed",
+                    0,
+                    true,
+                    0.0,
+                    0.0,
+                ),
                 ctr("api", "myorg/api:1.8.0", "Running", 1, false, 230.0, 160.0),
-                ctr("sidecar", "envoyproxy/envoy:v1.30", "Running", 0, false, 20.0, 20.0),
+                ctr(
+                    "sidecar",
+                    "envoyproxy/envoy:v1.30",
+                    "Running",
+                    0,
+                    false,
+                    20.0,
+                    20.0,
+                ),
             ],
         },
         PodInfo {
@@ -724,7 +963,15 @@ fn mock_metrics() -> KubeMetrics {
             restarts: 2,
             cpu_milli: 95.0,
             mem_mib: 512.0,
-            containers: vec![ctr("prometheus", "prom/prometheus:v2.53", "Running", 2, false, 95.0, 512.0)],
+            containers: vec![ctr(
+                "prometheus",
+                "prom/prometheus:v2.53",
+                "Running",
+                2,
+                false,
+                95.0,
+                512.0,
+            )],
         },
         PodInfo {
             ns: "default".into(),
@@ -735,25 +982,128 @@ fn mock_metrics() -> KubeMetrics {
             restarts: 6,
             cpu_milli: 0.0,
             mem_mib: 0.0,
-            containers: vec![ctr("worker", "myorg/worker:0.3", "CrashLoopBackOff", 6, false, 0.0, 0.0)],
+            containers: vec![ctr(
+                "worker",
+                "myorg/worker:0.3",
+                "CrashLoopBackOff",
+                6,
+                false,
+                0.0,
+                0.0,
+            )],
         },
     ];
     KubeMetrics {
         nodes: vec![
-            NodeUsage { name: "node-1".into(), cpu_pct: 42.0, mem_pct: 55.0, pods: 8, containers: 11 },
-            NodeUsage { name: "node-2".into(), cpu_pct: 18.0, mem_pct: 33.0, pods: 5, containers: 6 },
-            NodeUsage { name: "node-3".into(), cpu_pct: 76.0, mem_pct: 61.0, pods: 12, containers: 18 },
+            NodeUsage {
+                name: "node-1".into(),
+                cpu_pct: 42.0,
+                mem_pct: 55.0,
+                pods: 8,
+                containers: 11,
+            },
+            NodeUsage {
+                name: "node-2".into(),
+                cpu_pct: 18.0,
+                mem_pct: 33.0,
+                pods: 5,
+                containers: 6,
+            },
+            NodeUsage {
+                name: "node-3".into(),
+                cpu_pct: 76.0,
+                mem_pct: 61.0,
+                pods: 12,
+                containers: 18,
+            },
         ],
         pod_count: pods.len(),
         container_count: 5,
         init_count: 1,
         running_count: 3,
         namespaces: vec![
-            NsAgg { name: "default".into(), pods: 10, containers: 16 },
-            NsAgg { name: "kube-system".into(), pods: 9, containers: 12 },
-            NsAgg { name: "monitoring".into(), pods: 6, containers: 13 },
+            NsAgg {
+                name: "default".into(),
+                pods: 10,
+                containers: 16,
+            },
+            NsAgg {
+                name: "kube-system".into(),
+                pods: 9,
+                containers: 12,
+            },
+            NsAgg {
+                name: "monitoring".into(),
+                pods: 6,
+                containers: 13,
+            },
         ],
         pods,
+        error: None,
+    }
+}
+
+fn mock_topology() -> SchemaGraph {
+    let n = |key: &str, lines: &[&str]| TableNode {
+        name: key.into(),
+        columns: lines.iter().map(|l| line_col(l)).collect(),
+        indexes: Vec::new(),
+    };
+    let e = |from: &str, to: &str, kind: EdgeKind, label: &str| Edge {
+        from: from.into(),
+        to: to.into(),
+        kind,
+        label: label.into(),
+    };
+    SchemaGraph {
+        nodes: vec![
+            n("Node/node-1", &["Kubernetes Node"]),
+            n("Node/node-2", &["Kubernetes Node"]),
+            n("Deployment/api", &["Deployment"]),
+            n(
+                "default/api-7c9-abc",
+                &[
+                    "Pod · Running",
+                    "- api",
+                    "- sidecar",
+                    "- init-migrate (init)",
+                ],
+            ),
+            n("default/web-5d-xyz", &["Pod · Running", "- web"]),
+            n("kube-system/coredns-xyz", &["Pod · Running", "- coredns"]),
+        ],
+        edges: vec![
+            e(
+                "default/api-7c9-abc",
+                "Node/node-1",
+                EdgeKind::ForeignKey,
+                "node",
+            ),
+            e(
+                "default/web-5d-xyz",
+                "Node/node-2",
+                EdgeKind::ForeignKey,
+                "node",
+            ),
+            e(
+                "kube-system/coredns-xyz",
+                "Node/node-1",
+                EdgeKind::ForeignKey,
+                "node",
+            ),
+            e(
+                "default/api-7c9-abc",
+                "Deployment/api",
+                EdgeKind::Interleave,
+                "owned",
+            ),
+            e(
+                "default/web-5d-xyz",
+                "Deployment/api",
+                EdgeKind::Interleave,
+                "owned",
+            ),
+        ],
         error: None,
     }
 }
@@ -850,7 +1200,11 @@ mod tests {
         }"#;
         let mut usage = HashMap::new();
         usage.insert(
-            ("default".to_string(), "api-abc".to_string(), "api".to_string()),
+            (
+                "default".to_string(),
+                "api-abc".to_string(),
+                "api".to_string(),
+            ),
             (230.0, 160.0),
         );
         let pods = parse_pods(json, &usage);
@@ -872,37 +1226,5 @@ mod tests {
         let side = p.containers.iter().find(|c| c.name == "sidecar").unwrap();
         assert_eq!(side.state, "CrashLoopBackOff");
         assert!(!side.ready);
-    }
-}
-
-fn mock_topology() -> SchemaGraph {
-    let n = |key: &str, lines: &[&str]| TableNode {
-        name: key.into(),
-        columns: lines.iter().map(|l| line_col(l)).collect(),
-        indexes: Vec::new(),
-    };
-    let e = |from: &str, to: &str, kind: EdgeKind, label: &str| Edge {
-        from: from.into(),
-        to: to.into(),
-        kind,
-        label: label.into(),
-    };
-    SchemaGraph {
-        nodes: vec![
-            n("Node/node-1", &["Kubernetes Node"]),
-            n("Node/node-2", &["Kubernetes Node"]),
-            n("Deployment/api", &["Deployment"]),
-            n("default/api-7c9-abc", &["Pod · Running", "- api", "- sidecar", "- init-migrate (init)"]),
-            n("default/web-5d-xyz", &["Pod · Running", "- web"]),
-            n("kube-system/coredns-xyz", &["Pod · Running", "- coredns"]),
-        ],
-        edges: vec![
-            e("default/api-7c9-abc", "Node/node-1", EdgeKind::ForeignKey, "node"),
-            e("default/web-5d-xyz", "Node/node-2", EdgeKind::ForeignKey, "node"),
-            e("kube-system/coredns-xyz", "Node/node-1", EdgeKind::ForeignKey, "node"),
-            e("default/api-7c9-abc", "Deployment/api", EdgeKind::Interleave, "owned"),
-            e("default/web-5d-xyz", "Deployment/api", EdgeKind::Interleave, "owned"),
-        ],
-        error: None,
     }
 }
