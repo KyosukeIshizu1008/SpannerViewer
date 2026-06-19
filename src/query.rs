@@ -20,6 +20,24 @@ FROM INFORMATION_SCHEMA.COLUMNS \
 WHERE TABLE_SCHEMA = '' \
 ORDER BY TABLE_NAME, ORDINAL_POSITION";
 
+/// 各テーブルのセカンダリインデックスとその構成カラム。
+const INDEXES_SQL: &str = "\
+SELECT i.TABLE_NAME, i.INDEX_NAME, i.IS_UNIQUE, ic.COLUMN_NAME \
+FROM INFORMATION_SCHEMA.INDEXES i \
+JOIN INFORMATION_SCHEMA.INDEX_COLUMNS ic \
+  ON i.TABLE_SCHEMA = ic.TABLE_SCHEMA \
+ AND i.TABLE_NAME = ic.TABLE_NAME \
+ AND i.INDEX_NAME = ic.INDEX_NAME \
+WHERE i.TABLE_SCHEMA = '' AND i.INDEX_TYPE = 'INDEX' \
+ AND ic.ORDINAL_POSITION IS NOT NULL \
+ORDER BY i.TABLE_NAME, i.INDEX_NAME, ic.ORDINAL_POSITION";
+
+/// 主キーを構成するカラム（PK バッジ表示用）。
+const PK_SQL: &str = "\
+SELECT TABLE_NAME, COLUMN_NAME \
+FROM INFORMATION_SCHEMA.INDEX_COLUMNS \
+WHERE TABLE_SCHEMA = '' AND INDEX_TYPE = 'PRIMARY_KEY'";
+
 /// テーブル間の依存（インターリーブの親子 + 外部キー）を一覧する SQL。
 pub const DEPENDENCY_SQL: &str = "\
 SELECT TABLE_NAME AS `テーブル`, 'インターリーブ' AS `種別`, \
@@ -70,11 +88,20 @@ pub enum EdgeKind {
     ForeignKey,
 }
 
+/// 1 カラム
+#[derive(Clone, Debug)]
+pub struct Column {
+    pub name: String,
+    pub ty: String,
+    pub pk: bool, // 主キー構成カラムか
+}
+
 /// テーブル（ダイアグラムのノード）
 #[derive(Clone, Debug)]
 pub struct TableNode {
     pub name: String,
-    pub columns: Vec<String>, // "ColName TYPE" 形式
+    pub columns: Vec<Column>,
+    pub indexes: Vec<String>, // "IndexName (col, ...) [UNIQUE]" 形式
 }
 
 /// 依存関係（ダイアグラムのエッジ）。from が to に依存する。
@@ -188,24 +215,73 @@ async fn fetch_schema(client: &Client) -> SchemaGraph {
 }
 
 async fn try_fetch_schema(client: &Client) -> anyhow::Result<SchemaGraph> {
+    // 主キー構成カラム
+    let (_, pk_rows, _) = try_query(client, PK_SQL).await?;
+    let pk_set: std::collections::HashSet<(String, String)> = pk_rows
+        .into_iter()
+        .filter_map(|r| Some((r.first()?.clone(), r.get(1)?.clone())))
+        .collect();
+
     // ノード（テーブル + カラム）
     let (_, col_rows, _) = try_query(client, COLUMNS_SQL).await?;
     let mut order: Vec<String> = Vec::new();
-    let mut cols: HashMap<String, Vec<String>> = HashMap::new();
+    let mut cols: HashMap<String, Vec<Column>> = HashMap::new();
     for r in col_rows {
         let table = r.first().cloned().unwrap_or_default();
-        let col = r.get(1).cloned().unwrap_or_default();
+        let name = r.get(1).cloned().unwrap_or_default();
         let ty = r.get(2).cloned().unwrap_or_default();
         if !cols.contains_key(&table) {
             order.push(table.clone());
         }
-        cols.entry(table).or_default().push(format!("{col}  {ty}"));
+        let pk = pk_set.contains(&(table.clone(), name.clone()));
+        cols.entry(table).or_default().push(Column { name, ty, pk });
     }
+    // インデックス（(table, index) ごとにカラムを集約）
+    let (_, idx_rows, _) = try_query(client, INDEXES_SQL).await?;
+    let mut idx_order: HashMap<String, Vec<String>> = HashMap::new(); // table -> [index_name...]
+    let mut idx_cols: HashMap<(String, String), (bool, Vec<String>)> = HashMap::new();
+    for r in idx_rows {
+        let table = r.first().cloned().unwrap_or_default();
+        let index = r.get(1).cloned().unwrap_or_default();
+        let unique = r.get(2).map(|s| s == "true").unwrap_or(false);
+        let col = r.get(3).cloned().unwrap_or_default();
+        let key = (table.clone(), index.clone());
+        if !idx_cols.contains_key(&key) {
+            idx_order.entry(table).or_default().push(index);
+        }
+        let entry = idx_cols.entry(key).or_insert((unique, Vec::new()));
+        entry.0 = unique;
+        entry.1.push(col);
+    }
+    let index_strings = |table: &str| -> Vec<String> {
+        idx_order
+            .get(table)
+            .map(|names| {
+                names
+                    .iter()
+                    .map(|name| {
+                        let (unique, c) = idx_cols
+                            .get(&(table.to_string(), name.clone()))
+                            .cloned()
+                            .unwrap_or((false, Vec::new()));
+                        let u = if unique { "  UNIQUE" } else { "" };
+                        format!("{name} ({}){u}", c.join(", "))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
     let nodes = order
         .into_iter()
         .map(|name| {
             let columns = cols.remove(&name).unwrap_or_default();
-            TableNode { name, columns }
+            let indexes = index_strings(&name);
+            TableNode {
+                name,
+                columns,
+                indexes,
+            }
         })
         .collect();
 
@@ -343,17 +419,26 @@ fn mock_data() -> QueryOutcome {
 
 /// モックモード用のスキーマグラフ（Singers→Albums→Songs のインターリーブ + FK）。
 fn mock_graph() -> SchemaGraph {
-    let node = |name: &str, cols: &[&str]| TableNode {
+    // (name, type, pk)
+    let node = |name: &str, cols: &[(&str, &str, bool)], idx: &[&str]| TableNode {
         name: name.into(),
-        columns: cols.iter().map(|c| c.to_string()).collect(),
+        columns: cols
+            .iter()
+            .map(|(n, t, pk)| Column {
+                name: n.to_string(),
+                ty: t.to_string(),
+                pk: *pk,
+            })
+            .collect(),
+        indexes: idx.iter().map(|c| c.to_string()).collect(),
     };
     SchemaGraph {
         nodes: vec![
-            node("Singers", &["SingerId  INT64", "Name  STRING(MAX)"]),
-            node("Albums", &["SingerId  INT64", "AlbumId  INT64", "Title  STRING(MAX)"]),
-            node("Songs", &["SingerId  INT64", "AlbumId  INT64", "TrackId  INT64", "Title  STRING(MAX)"]),
-            node("Customers", &["CustomerId  INT64", "Name  STRING(MAX)"]),
-            node("Orders", &["OrderId  INT64", "CustomerId  INT64", "Amount  NUMERIC"]),
+            node("Singers", &[("SingerId", "INT64", true), ("Name", "STRING(MAX)", false)], &["IDX_Singers_Name (Name)"]),
+            node("Albums", &[("SingerId", "INT64", true), ("AlbumId", "INT64", true), ("Title", "STRING(MAX)", false)], &["IDX_Albums_Title (Title)"]),
+            node("Songs", &[("SingerId", "INT64", true), ("AlbumId", "INT64", true), ("TrackId", "INT64", true), ("Title", "STRING(MAX)", false)], &[]),
+            node("Customers", &[("CustomerId", "INT64", true), ("Name", "STRING(MAX)", false)], &["IDX_Customers_Name (Name)  UNIQUE"]),
+            node("Orders", &[("OrderId", "INT64", true), ("CustomerId", "INT64", false), ("Amount", "NUMERIC", false)], &["IDX_Orders_Customer (CustomerId)"]),
         ],
         edges: vec![
             Edge { from: "Albums".into(), to: "Singers".into(), kind: EdgeKind::Interleave, label: "CASCADE".into() },
@@ -469,12 +554,44 @@ mod tests {
         );
     }
 
+    /// スキーマグラフ: 全カラムとセカンダリインデックスが取得できるか
+    #[tokio::test]
+    async fn schema_graph_has_columns_and_indexes() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        create_dep_schema().await;
+
+        let client = client().await;
+        let graph = try_fetch_schema(&client).await.unwrap();
+
+        let orders = graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "DepOrders")
+            .expect("DepOrders ノードがない");
+        // 全カラム（OrderId, ParentId）が含まれる
+        assert!(orders.columns.iter().any(|c| c.name == "OrderId" && c.pk));
+        assert!(orders.columns.iter().any(|c| c.name == "ParentId"));
+        // セカンダリインデックスが含まれる
+        assert!(
+            orders.indexes.iter().any(|i| i.contains("IDX_DepOrders_Parent")),
+            "インデックスが見つからない: {:?}",
+            orders.indexes
+        );
+    }
+
+    // エミュレータは同時スキーマ変更を拒否するため、DDL をプロセス内で直列化する。
+    static DDL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// テスト用に親子（インターリーブ）と外部キーを持つテーブルを作成（冪等）
     async fn create_dep_schema() {
         use gcloud_spanner::admin::client::Client as AdminClient;
         use gcloud_spanner::admin::AdminClientConfig;
         use google_cloud_googleapis::spanner::admin::database::v1::UpdateDatabaseDdlRequest;
 
+        let _guard = DDL_LOCK.lock().await;
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let cfg = AdminClientConfig::default().with_auth().await.unwrap();
         let admin = AdminClient::new(cfg).await.unwrap();
@@ -490,6 +607,7 @@ mod tests {
                  CONSTRAINT FK_DepOrders FOREIGN KEY (ParentId) REFERENCES DepParent (Id)) \
                  PRIMARY KEY (OrderId)"
                     .into(),
+                "CREATE INDEX IF NOT EXISTS IDX_DepOrders_Parent ON DepOrders (ParentId)".into(),
             ],
             ..Default::default()
         };

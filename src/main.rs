@@ -1,4 +1,5 @@
 mod app;
+mod k8s;
 mod monitoring;
 mod query;
 
@@ -36,8 +37,14 @@ fn main() -> eframe::Result<()> {
     let mon_cfg = monitoring::Config {
         project: project.clone(),
         instance: instance.clone(),
-        interval_secs,
         mock,
+    };
+    let conn_info = if mock {
+        "モックモード".to_string()
+    } else if std::env::var("SPANNER_EMULATOR_HOST").is_ok() {
+        format!("エミュレータ · {project}/{instance}/{database}")
+    } else {
+        format!("{project}/{instance}/{database}")
     };
     let q_cfg = query::Config {
         project,
@@ -45,6 +52,9 @@ fn main() -> eframe::Result<()> {
         database,
         mock,
     };
+
+    // 設定パネルから変更できる共有ポーリング間隔
+    let poll_interval = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(interval_secs));
 
     // 監視サンプル: 背景 → UI
     let (sample_tx, sample_rx) = mpsc::channel::<monitoring::Sample>();
@@ -55,8 +65,20 @@ fn main() -> eframe::Result<()> {
     let (res_tx, res_rx) = mpsc::channel::<query::QueryOutcome>();
     // スキーマ図: 背景 → UI
     let (schema_tx, schema_rx) = mpsc::channel::<query::SchemaGraph>();
+    // k8s 監視: 背景 → UI
+    let (kube_metrics_tx, kube_metrics_rx) = mpsc::channel::<k8s::KubeMetrics>();
+    // k8s 構成図: 要求 UI → 背景、結果 背景 → UI
+    let (kube_topo_req_tx, kube_topo_req_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (kube_topo_tx, kube_topo_rx) = mpsc::channel::<query::SchemaGraph>();
+    // k8s ログ: 要求 → 結果
+    let (kube_log_req_tx, kube_log_req_rx) = tokio::sync::mpsc::unbounded_channel::<k8s::LogReq>();
+    let (kube_log_tx, kube_log_rx) = mpsc::channel::<k8s::LogResult>();
+    // k8s イベント: 要求 → 結果
+    let (kube_ev_req_tx, kube_ev_req_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (kube_ev_tx, kube_ev_rx) = mpsc::channel::<k8s::EventsResult>();
 
-    // 背景で 1 つのランタイムを回し、監視ループとクエリループを同時実行
+    // 背景で 1 つのランタイムを回し、各ループを同時実行
+    let bg_interval = poll_interval.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -65,8 +87,12 @@ fn main() -> eframe::Result<()> {
             .expect("tokio runtime");
         rt.block_on(async move {
             tokio::join!(
-                monitoring::poll_loop(mon_cfg, sample_tx),
+                monitoring::poll_loop(mon_cfg, bg_interval.clone(), sample_tx),
                 query::query_loop(q_cfg, req_rx, res_tx, schema_tx),
+                k8s::monitor_loop(k8s::Config { mock }, bg_interval, kube_metrics_tx),
+                k8s::topology_loop(k8s::Config { mock }, kube_topo_req_rx, kube_topo_tx),
+                k8s::logs_loop(k8s::Config { mock }, kube_log_req_rx, kube_log_tx),
+                k8s::events_loop(k8s::Config { mock }, kube_ev_req_rx, kube_ev_tx),
             );
         });
     });
@@ -81,7 +107,22 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| {
             Ok(Box::new(app::MonitorApp::new(
-                cc, sample_rx, req_tx, res_rx, schema_rx,
+                app::Channels {
+                    sample_rx,
+                    req_tx,
+                    res_rx,
+                    schema_rx,
+                    kube_metrics_rx,
+                    kube_topo_req_tx,
+                    kube_topo_rx,
+                    kube_log_req_tx,
+                    kube_log_rx,
+                    kube_ev_req_tx,
+                    kube_ev_rx,
+                    poll_interval,
+                    conn_info,
+                },
+                cc,
             )))
         }),
     )

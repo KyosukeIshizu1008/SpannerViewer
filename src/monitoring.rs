@@ -12,7 +12,6 @@ const SCOPE: &str = "https://www.googleapis.com/auth/monitoring.read";
 pub struct Config {
     pub project: String,
     pub instance: String,
-    pub interval_secs: u64,
     pub mock: bool,
 }
 
@@ -78,10 +77,14 @@ impl TypedValue {
     }
 }
 
-/// ポーリングループ。UI 側の Receiver が落ちたら終了する。
-pub async fn poll_loop(cfg: Config, tx: Sender<Sample>) {
+/// ポーリングループ。UI 側の Receiver が落ちたら終了する。間隔は共有 Atomic から都度読む。
+pub async fn poll_loop(
+    cfg: Config,
+    interval: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    tx: Sender<Sample>,
+) {
     if cfg.mock {
-        mock_loop(cfg, tx).await;
+        mock_loop(interval, tx).await;
         return;
     }
 
@@ -99,13 +102,14 @@ pub async fn poll_loop(cfg: Config, tx: Sender<Sample>) {
         if tx.send(sample).is_err() {
             break; // UI が閉じられた
         }
-        tokio::time::sleep(Duration::from_secs(cfg.interval_secs)).await;
+        let secs = interval.load(std::sync::atomic::Ordering::Relaxed).max(1);
+        tokio::time::sleep(Duration::from_secs(secs)).await;
     }
 }
 
 /// 実 Spanner も認証も使わず、合成データを流すモード。
 /// UI / グラフ描画の開発・デモ用。
-async fn mock_loop(cfg: Config, tx: Sender<Sample>) {
+async fn mock_loop(interval: std::sync::Arc<std::sync::atomic::AtomicU64>, tx: Sender<Sample>) {
     const LIMIT: f64 = 2.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0; // 2 TiB 上限を想定
     let mut tick: u64 = 0;
 
@@ -130,7 +134,8 @@ async fn mock_loop(cfg: Config, tx: Sender<Sample>) {
             break;
         }
         tick = tick.wrapping_add(1);
-        tokio::time::sleep(Duration::from_secs(cfg.interval_secs)).await;
+        let secs = interval.load(std::sync::atomic::Ordering::Relaxed).max(1);
+        tokio::time::sleep(Duration::from_secs(secs)).await;
     }
 }
 
