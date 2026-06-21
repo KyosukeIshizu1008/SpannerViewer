@@ -130,52 +130,105 @@ pub async fn query_loop(
     data_tx: std::sync::mpsc::Sender<QueryOutcome>,
     schema_tx: std::sync::mpsc::Sender<SchemaGraph>,
 ) {
-    let mut client: Option<Client> = None;
+    let cfg = std::sync::Arc::new(cfg);
+    // クライアントはタスク間で共有する。tokio の Mutex は poison しないので、
+    // 1 リクエストがパニックしてもロックは解放され次のリクエストを処理できる。
+    let client: std::sync::Arc<tokio::sync::Mutex<Option<Client>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(None));
     let configured =
         !(cfg.project.is_empty() || cfg.instance.is_empty() || cfg.database.is_empty());
 
     while let Some((target, sql)) = req_rx.recv().await {
-        match target {
-            Target::Data => {
-                let start = Instant::now();
-                let mut out = if cfg.mock {
-                    mock_data()
-                } else if !configured {
-                    QueryOutcome {
-                        error: Some(NO_CONFIG.into()),
-                        ..Default::default()
-                    }
-                } else {
-                    ensure_and_run(&mut client, &cfg, &sql).await
-                };
-                out.target = Target::Data;
-                out.elapsed_ms = start.elapsed().as_millis();
-                if data_tx.send(out).is_err() {
-                    break;
+        let cfg = cfg.clone();
+        let client = client.clone();
+        // タスク用とパニック時のエラー通知用に別々のクローンを用意する。
+        let data_tx_task = data_tx.clone();
+        let schema_tx_task = schema_tx.clone();
+        let data_tx_err = data_tx.clone();
+        let schema_tx_err = schema_tx.clone();
+
+        // 各リクエストは独立タスクで実行する。Spanner クライアント側で万一
+        // パニックが起きても、この query_loop 自体は生き続け、UI からの次の
+        // 実行を受け付けられるようにする（実行ボタンが無反応になるのを防ぐ）。
+        let handle = tokio::spawn(async move {
+            match target {
+                Target::Data => {
+                    let start = Instant::now();
+                    let mut guard = client.lock().await;
+                    let mut out = if cfg.mock {
+                        mock_data(&sql)
+                    } else if !configured {
+                        QueryOutcome {
+                            error: Some(NO_CONFIG.into()),
+                            ..Default::default()
+                        }
+                    } else {
+                        ensure_and_run(&mut guard, &cfg, &sql).await
+                    };
+                    out.target = Target::Data;
+                    out.elapsed_ms = start.elapsed().as_millis();
+                    let _ = data_tx_task.send(out);
+                }
+                Target::Schema => {
+                    let mut guard = client.lock().await;
+                    let graph = if cfg.mock {
+                        mock_graph()
+                    } else if !configured {
+                        SchemaGraph {
+                            error: Some(NO_CONFIG.into()),
+                            ..Default::default()
+                        }
+                    } else {
+                        match ensure_client(&mut guard, &cfg).await {
+                            Ok(c) => fetch_schema(c).await,
+                            Err(e) => SchemaGraph {
+                                error: Some(e),
+                                ..Default::default()
+                            },
+                        }
+                    };
+                    let _ = schema_tx_task.send(graph);
                 }
             }
-            Target::Schema => {
-                let graph = if cfg.mock {
-                    mock_graph()
-                } else if !configured {
-                    SchemaGraph {
-                        error: Some(NO_CONFIG.into()),
+        });
+
+        // タスクがパニックで落ちた場合は、エラーとして UI に返し無反応を防ぐ。
+        if let Err(join_err) = handle.await {
+            let msg = panic_message(join_err);
+            match target {
+                Target::Data => {
+                    let _ = data_tx_err.send(QueryOutcome {
+                        target: Target::Data,
+                        error: Some(msg),
                         ..Default::default()
-                    }
-                } else {
-                    match ensure_client(&mut client, &cfg).await {
-                        Ok(c) => fetch_schema(c).await,
-                        Err(e) => SchemaGraph {
-                            error: Some(e),
-                            ..Default::default()
-                        },
-                    }
-                };
-                if schema_tx.send(graph).is_err() {
-                    break;
+                    });
+                }
+                Target::Schema => {
+                    let _ = schema_tx_err.send(SchemaGraph {
+                        error: Some(msg),
+                        ..Default::default()
+                    });
                 }
             }
         }
+    }
+}
+
+/// パニックしたタスクの JoinError から、UI 表示用のメッセージを作る。
+fn panic_message(err: tokio::task::JoinError) -> String {
+    if err.is_cancelled() {
+        return "処理がキャンセルされました".into();
+    }
+    let payload = err.into_panic();
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    if detail.is_empty() {
+        "処理が異常終了しました（パニック）".into()
+    } else {
+        format!("処理が異常終了しました: {detail}")
     }
 }
 
@@ -401,10 +454,12 @@ fn stringify_cell(row: &Row, i: usize) -> Option<String> {
 }
 
 /// モックモード用のデータ結果。
-fn mock_data() -> QueryOutcome {
+fn mock_data(sql: &str) -> QueryOutcome {
+    // モックは SQL を実行しないが、末尾の LIMIT n だけは尊重して紛らわしさを減らす。
+    let limit = parse_limit(sql).unwrap_or(20);
     QueryOutcome {
         columns: vec!["Id".into(), "Payload".into(), "Seq".into()],
-        rows: (0..20)
+        rows: (0..limit)
             .map(|i| {
                 vec![
                     format!("00000000-0000-0000-0000-{:012}", i),
@@ -415,6 +470,17 @@ fn mock_data() -> QueryOutcome {
             .collect(),
         ..Default::default()
     }
+}
+
+/// SQL 末尾の `LIMIT n` を取り出す（モック用の簡易パース）。
+fn parse_limit(sql: &str) -> Option<usize> {
+    let lower = sql.to_lowercase();
+    let pos = lower.rfind("limit")?;
+    sql[pos + "limit".len()..]
+        .split_whitespace()
+        .next()?
+        .parse::<usize>()
+        .ok()
 }
 
 /// モックモード用のスキーマグラフ（Singers→Albums→Songs のインターリーブ + FK）。

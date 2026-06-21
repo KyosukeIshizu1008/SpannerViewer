@@ -79,6 +79,14 @@ fn main() -> eframe::Result<()> {
     let (kube_action_req_tx, kube_action_req_rx) =
         tokio::sync::mpsc::unbounded_channel::<k8s::ActionReq>();
     let (kube_action_tx, kube_action_rx) = mpsc::channel::<k8s::ActionResult>();
+    // k8s 汎用リソースブラウザ: 要求 → 結果
+    let (kube_res_req_tx, kube_res_req_rx) =
+        tokio::sync::mpsc::unbounded_channel::<k8s::ResourceReq>();
+    let (kube_res_tx, kube_res_rx) = mpsc::channel::<k8s::ResourceResult>();
+    // k8s port-forward: 要求 → 状態イベント
+    let (kube_pf_req_tx, kube_pf_req_rx) =
+        tokio::sync::mpsc::unbounded_channel::<k8s::PortForwardReq>();
+    let (kube_pf_tx, kube_pf_rx) = mpsc::channel::<k8s::PortForwardEvent>();
 
     // 背景で 1 つのランタイムを回し、各ループを同時実行
     let bg_interval = poll_interval.clone();
@@ -89,15 +97,56 @@ fn main() -> eframe::Result<()> {
             .build()
             .expect("tokio runtime");
         rt.block_on(async move {
-            tokio::join!(
-                monitoring::poll_loop(mon_cfg, bg_interval.clone(), sample_tx),
-                query::query_loop(q_cfg, req_rx, res_tx, schema_tx),
-                k8s::monitor_loop(k8s::Config { mock }, bg_interval, kube_metrics_tx),
-                k8s::topology_loop(k8s::Config { mock }, kube_topo_req_rx, kube_topo_tx),
-                k8s::logs_loop(k8s::Config { mock }, kube_log_req_rx, kube_log_tx),
-                k8s::events_loop(k8s::Config { mock }, kube_ev_req_rx, kube_ev_tx),
-                k8s::action_loop(k8s::Config { mock }, kube_action_req_rx, kube_action_tx),
-            );
+            // 各ループは独立タスクで起動する。tokio::join! だと 1 つの
+            // ループがパニックすると block_on 全体が巻き込まれて背景ランタイム
+            // ごと停止し、以後 UI からの送信がすべて静かに失敗する。タスク化
+            // すればパニックは当該タスクに封じ込められ、他のループは生き残る。
+            let handles = vec![
+                tokio::spawn(monitoring::poll_loop(
+                    mon_cfg,
+                    bg_interval.clone(),
+                    sample_tx,
+                )),
+                tokio::spawn(query::query_loop(q_cfg, req_rx, res_tx, schema_tx)),
+                tokio::spawn(k8s::monitor_loop(
+                    k8s::Config { mock },
+                    bg_interval,
+                    kube_metrics_tx,
+                )),
+                tokio::spawn(k8s::topology_loop(
+                    k8s::Config { mock },
+                    kube_topo_req_rx,
+                    kube_topo_tx,
+                )),
+                tokio::spawn(k8s::logs_loop(
+                    k8s::Config { mock },
+                    kube_log_req_rx,
+                    kube_log_tx,
+                )),
+                tokio::spawn(k8s::events_loop(
+                    k8s::Config { mock },
+                    kube_ev_req_rx,
+                    kube_ev_tx,
+                )),
+                tokio::spawn(k8s::action_loop(
+                    k8s::Config { mock },
+                    kube_action_req_rx,
+                    kube_action_tx,
+                )),
+                tokio::spawn(k8s::resource_loop(
+                    k8s::Config { mock },
+                    kube_res_req_rx,
+                    kube_res_tx,
+                )),
+                tokio::spawn(k8s::pf_loop(
+                    k8s::Config { mock },
+                    kube_pf_req_rx,
+                    kube_pf_tx,
+                )),
+            ];
+            for h in handles {
+                let _ = h.await;
+            }
         });
     });
 
@@ -125,6 +174,10 @@ fn main() -> eframe::Result<()> {
                     kube_ev_rx,
                     kube_action_req_tx,
                     kube_action_rx,
+                    kube_res_req_tx,
+                    kube_res_rx,
+                    kube_pf_req_tx,
+                    kube_pf_rx,
                     poll_interval,
                     conn_info,
                 },

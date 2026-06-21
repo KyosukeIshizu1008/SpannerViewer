@@ -154,6 +154,36 @@ pub enum ActionReq {
         kind: String,
         name: String,
     },
+    /// 任意種別の削除（リソースブラウザ用、ns は省略可）。
+    DeleteAny {
+        kind: String,
+        ns: Option<String>,
+        name: String,
+    },
+    /// 任意の scale 可能リソースのスケール。
+    ScaleAny {
+        kind: String,
+        ns: Option<String>,
+        name: String,
+        replicas: i32,
+    },
+    /// 任意の rollout restart 可能リソースの再起動。
+    RestartAny {
+        kind: String,
+        ns: Option<String>,
+        name: String,
+    },
+    /// 編集した YAML を適用する（kubectl apply -f -）。
+    Apply {
+        yaml: String,
+    },
+    /// コンテナ内でコマンドを実行する（kubectl exec -- sh -c）。出力はログ窓へ。
+    Exec {
+        ns: String,
+        pod: String,
+        container: String,
+        command: String,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -177,6 +207,391 @@ pub struct KubeEvent {
 pub struct EventsResult {
     pub events: Vec<KubeEvent>,
     pub error: Option<String>,
+}
+
+// ── 汎用リソースブラウザ ──
+
+/// リソースブラウザへのリクエスト。
+#[derive(Clone, Debug)]
+pub enum ResourceReq {
+    /// 指定種別の一覧。namespace=None は全 namespace（-A）。
+    List {
+        kind: String,
+        namespace: Option<String>,
+    },
+    /// 1 リソースの YAML（-o yaml）。
+    Yaml {
+        kind: String,
+        ns: Option<String>,
+        name: String,
+    },
+    /// 1 リソースの describe。
+    Describe {
+        kind: String,
+        ns: Option<String>,
+        name: String,
+    },
+    /// 編集用の YAML（取得結果は YAML エディタに表示）。
+    YamlForEdit {
+        kind: String,
+        ns: Option<String>,
+        name: String,
+    },
+}
+
+/// 一覧の 1 行。
+#[derive(Clone, Debug, Default)]
+pub struct ResourceRow {
+    pub namespace: String, // 空なら非 namespaced
+    pub name: String,
+    pub cells: Vec<String>, // columns に対応
+}
+
+/// 汎用リソース一覧。
+#[derive(Clone, Debug, Default)]
+pub struct ResourceList {
+    pub kind: String,
+    pub columns: Vec<String>, // NAMESPACE 列は除いた表示用ヘッダ
+    pub rows: Vec<ResourceRow>,
+    pub namespaced: bool,
+    pub error: Option<String>,
+}
+
+/// リソースブラウザの結果。
+#[derive(Clone, Debug)]
+pub enum ResourceResult {
+    List(ResourceList),
+    /// YAML / describe のテキスト（ログ窓に表示）。
+    Text {
+        title: String,
+        body: String,
+    },
+    /// 編集用 YAML（YAML エディタに表示）。
+    EditText {
+        title: String,
+        body: String,
+    },
+}
+
+/// リソースブラウザのループ。
+pub async fn resource_loop(
+    cfg: Config,
+    mut req_rx: UnboundedReceiver<ResourceReq>,
+    tx: std::sync::mpsc::Sender<ResourceResult>,
+) {
+    while let Some(req) = req_rx.recv().await {
+        let r = if cfg.mock {
+            mock_resource(&req)
+        } else {
+            run_resource(req).await
+        };
+        if tx.send(r).is_err() {
+            break;
+        }
+    }
+}
+
+fn ns_args(ns: &Option<String>) -> Vec<String> {
+    match ns {
+        Some(n) if !n.is_empty() => vec!["-n".into(), n.clone()],
+        _ => vec![],
+    }
+}
+
+async fn run_resource(req: ResourceReq) -> ResourceResult {
+    match req {
+        ResourceReq::List { kind, namespace } => {
+            let mut args: Vec<String> = vec!["get".into(), kind.clone()];
+            match &namespace {
+                Some(n) if !n.is_empty() => {
+                    args.push("-n".into());
+                    args.push(n.clone());
+                }
+                _ => args.push("-A".into()),
+            }
+            let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            match run(&argv).await {
+                Ok(out) => {
+                    let (columns, rows, namespaced) = parse_table(&out);
+                    ResourceResult::List(ResourceList {
+                        kind,
+                        columns,
+                        rows,
+                        namespaced,
+                        error: None,
+                    })
+                }
+                Err(e) => ResourceResult::List(ResourceList {
+                    kind,
+                    error: Some(e),
+                    ..Default::default()
+                }),
+            }
+        }
+        ResourceReq::Yaml { kind, ns, name } => {
+            let na = ns_args(&ns);
+            let mut argv: Vec<&str> = vec!["get", &kind, &name];
+            argv.extend(na.iter().map(|s| s.as_str()));
+            argv.extend(["-o", "yaml"]);
+            let title = format!("{kind}/{name} · YAML");
+            text_result(run(&argv).await, title)
+        }
+        ResourceReq::Describe { kind, ns, name } => {
+            let na = ns_args(&ns);
+            let mut argv: Vec<&str> = vec!["describe", &kind, &name];
+            argv.extend(na.iter().map(|s| s.as_str()));
+            let title = format!("{kind}/{name} · describe");
+            text_result(run(&argv).await, title)
+        }
+        ResourceReq::YamlForEdit { kind, ns, name } => {
+            let na = ns_args(&ns);
+            let mut argv: Vec<&str> = vec!["get", &kind, &name];
+            argv.extend(na.iter().map(|s| s.as_str()));
+            argv.extend(["-o", "yaml"]);
+            let title = format!("{kind}/{name} · 編集");
+            match run(&argv).await {
+                Ok(body) => ResourceResult::EditText { title, body },
+                Err(e) => ResourceResult::Text {
+                    title,
+                    body: format!("取得に失敗しました:\n{e}"),
+                },
+            }
+        }
+    }
+}
+
+fn text_result(res: Result<String, String>, title: String) -> ResourceResult {
+    match res {
+        Ok(body) => ResourceResult::Text { title, body },
+        Err(e) => ResourceResult::Text {
+            title,
+            body: format!("取得に失敗しました:\n{e}"),
+        },
+    }
+}
+
+/// `kubectl get` の表形式テキストを汎用パースする。
+/// 戻り値: (表示用カラム, 行, namespaced か)。
+/// 先頭カラムが NAMESPACE のときは namespaced とみなし、その列を行の ns に振り分ける。
+fn parse_table(out: &str) -> (Vec<String>, Vec<ResourceRow>, bool) {
+    let mut lines = out.lines().filter(|l| !l.trim().is_empty());
+    let Some(header) = lines.next() else {
+        return (Vec::new(), Vec::new(), false);
+    };
+    let raw_cols: Vec<String> = header.split_whitespace().map(|s| s.to_string()).collect();
+    let namespaced = raw_cols.first().map(|c| c == "NAMESPACE").unwrap_or(false);
+    // 表示用カラム（NAMESPACE は別管理）と name の列位置
+    let display_cols: Vec<String> = if namespaced {
+        raw_cols[1..].to_vec()
+    } else {
+        raw_cols.clone()
+    };
+    let total = raw_cols.len();
+
+    let mut rows = Vec::new();
+    for line in lines {
+        // 末尾カラムに空白を含む値があり得るので total 個に丸める。
+        let mut parts: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
+        if parts.len() > total && total > 0 {
+            let tail = parts.split_off(total - 1).join(" ");
+            parts.push(tail);
+        }
+        while parts.len() < total {
+            parts.push(String::new());
+        }
+        let (namespace, rest) = if namespaced {
+            (parts[0].clone(), parts[1..].to_vec())
+        } else {
+            (String::new(), parts.clone())
+        };
+        let name = rest.first().cloned().unwrap_or_default();
+        rows.push(ResourceRow {
+            namespace,
+            name,
+            cells: rest,
+        });
+    }
+    (display_cols, rows, namespaced)
+}
+
+fn mock_resource(req: &ResourceReq) -> ResourceResult {
+    match req {
+        ResourceReq::List { kind, .. } => {
+            let columns = vec!["NAME".into(), "STATUS".into(), "AGE".into()];
+            let rows = (0..6)
+                .map(|i| ResourceRow {
+                    namespace: "default".into(),
+                    name: format!("{kind}-mock-{i}"),
+                    cells: vec![
+                        format!("{kind}-mock-{i}"),
+                        if i % 3 == 0 { "Pending" } else { "Active" }.into(),
+                        format!("{}m", i * 7 + 3),
+                    ],
+                })
+                .collect();
+            ResourceResult::List(ResourceList {
+                kind: kind.clone(),
+                columns,
+                rows,
+                namespaced: true,
+                error: None,
+            })
+        }
+        ResourceReq::Yaml { kind, ns, name } => ResourceResult::Text {
+            title: format!("{kind}/{name} · YAML"),
+            body: format!(
+                "apiVersion: v1\nkind: {kind}\nmetadata:\n  name: {name}\n  namespace: {}\n(mock yaml)",
+                ns.as_deref().unwrap_or("")
+            ),
+        },
+        ResourceReq::Describe { kind, ns, name } => ResourceResult::Text {
+            title: format!("{kind}/{name} · describe"),
+            body: format!(
+                "Name: {name}\nNamespace: {}\nKind: {kind}\n(mock describe)",
+                ns.as_deref().unwrap_or("")
+            ),
+        },
+        ResourceReq::YamlForEdit { kind, ns, name } => ResourceResult::EditText {
+            title: format!("{kind}/{name} · 編集"),
+            body: format!(
+                "apiVersion: v1\nkind: {kind}\nmetadata:\n  name: {name}\n  namespace: {}\n  labels:\n    edited: \"true\"\n(mock yaml — 編集してApplyを試せます)",
+                ns.as_deref().unwrap_or("")
+            ),
+        },
+    }
+}
+
+// ── port-forward ──
+
+/// port-forward の開始/停止リクエスト。
+#[derive(Clone, Debug)]
+pub enum PortForwardReq {
+    Start {
+        id: u64,
+        ns: String,
+        target: String, // 例: "pod/foo" / "svc/bar"
+        local: u16,
+        remote: u16,
+    },
+    Stop {
+        id: u64,
+    },
+}
+
+/// port-forward の状態イベント。
+#[derive(Clone, Debug)]
+pub enum PortForwardEvent {
+    Started { id: u64, label: String },
+    Line { id: u64, text: String },
+    Error { id: u64, msg: String },
+    Stopped { id: u64 },
+}
+
+/// port-forward 管理ループ。プロセスを id ごとに保持し、停止要求で abort する。
+pub async fn pf_loop(
+    cfg: Config,
+    mut req_rx: UnboundedReceiver<PortForwardReq>,
+    tx: std::sync::mpsc::Sender<PortForwardEvent>,
+) {
+    let mut running: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
+    while let Some(req) = req_rx.recv().await {
+        match req {
+            PortForwardReq::Start {
+                id,
+                ns,
+                target,
+                local,
+                remote,
+            } => {
+                let label = format!("{target} {local}→{remote} ({ns})");
+                if cfg.mock {
+                    let _ = tx.send(PortForwardEvent::Started { id, label });
+                    let _ = tx.send(PortForwardEvent::Line {
+                        id,
+                        text: format!("(mock) Forwarding from 127.0.0.1:{local} -> {remote}"),
+                    });
+                    continue;
+                }
+                let handle = tokio::spawn(pf_run(id, ns, target, local, remote, label, tx.clone()));
+                running.insert(id, handle);
+            }
+            PortForwardReq::Stop { id } => {
+                if let Some(h) = running.remove(&id) {
+                    h.abort();
+                }
+                let _ = tx.send(PortForwardEvent::Stopped { id });
+            }
+        }
+    }
+    for (_, h) in running {
+        h.abort();
+    }
+}
+
+async fn pf_run(
+    id: u64,
+    ns: String,
+    target: String,
+    local: u16,
+    remote: u16,
+    label: String,
+    tx: std::sync::mpsc::Sender<PortForwardEvent>,
+) {
+    let ports = format!("{local}:{remote}");
+    let mut child = match tokio::process::Command::new("kubectl")
+        .args(context_args())
+        .args(["port-forward", "-n", &ns, &target, &ports])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(PortForwardEvent::Error {
+                id,
+                msg: format!("kubectl 実行失敗: {e}"),
+            });
+            return;
+        }
+    };
+
+    let _ = tx.send(PortForwardEvent::Started { id, label });
+
+    if let Some(out) = child.stdout.take() {
+        let mut lines = tokio::io::BufReader::new(out).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    if tx.send(PortForwardEvent::Line { id, text: line }).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx.send(PortForwardEvent::Error {
+                        id,
+                        msg: e.to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = child.wait().await;
+    if let Some(mut err) = child.stderr.take() {
+        use tokio::io::AsyncReadExt;
+        let mut s = String::new();
+        let _ = err.read_to_string(&mut s).await;
+        if !s.trim().is_empty() {
+            let _ = tx.send(PortForwardEvent::Error {
+                id,
+                msg: s.trim().to_string(),
+            });
+        }
+    }
+    let _ = tx.send(PortForwardEvent::Stopped { id });
 }
 
 /// 監視ループ。間隔は共有 Atomic から都度読む（設定パネルで変更可能）。
@@ -239,18 +654,25 @@ async fn stream_logs(req: LogReq, mock: bool, tx: std::sync::mpsc::Sender<LogEve
         return;
     }
 
+    let mut args: Vec<String> = vec![
+        "logs".into(),
+        "-f".into(),
+        "-n".into(),
+        req.ns.clone(),
+        req.pod.clone(),
+        "--tail=200".into(),
+    ];
+    if req.container.is_empty() {
+        // コンテナ未指定（リソースブラウザからの起動）。全コンテナをまとめて追従。
+        args.push("--all-containers=true".into());
+        args.push("--prefix".into());
+    } else {
+        args.push("-c".into());
+        args.push(req.container.clone());
+    }
     let mut child = match tokio::process::Command::new("kubectl")
         .args(context_args())
-        .args([
-            "logs",
-            "-f",
-            "-n",
-            req.ns.as_str(),
-            req.pod.as_str(),
-            "-c",
-            req.container.as_str(),
-            "--tail=200",
-        ])
+        .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -322,6 +744,16 @@ fn action_label(a: &ActionReq) -> String {
         } => format!("{deploy} を {replicas} にスケール"),
         ActionReq::RolloutRestart { deploy, .. } => format!("{deploy} を再起動"),
         ActionReq::Describe { kind, name, .. } => format!("describe {kind}/{name}"),
+        ActionReq::DeleteAny { kind, name, .. } => format!("{kind}/{name} を削除"),
+        ActionReq::ScaleAny {
+            kind,
+            name,
+            replicas,
+            ..
+        } => format!("{kind}/{name} を {replicas} にスケール"),
+        ActionReq::RestartAny { kind, name, .. } => format!("{kind}/{name} を再起動"),
+        ActionReq::Apply { .. } => "YAML を適用".to_string(),
+        ActionReq::Exec { pod, command, .. } => format!("exec {pod}: {command}"),
     }
 }
 
@@ -330,6 +762,12 @@ fn describe_mock(a: &ActionReq) -> Option<(String, String)> {
         ActionReq::Describe { kind, name, ns } => Some((
             format!("describe {kind}/{name}"),
             format!("Name: {name}\nNamespace: {ns}\nKind: {kind}\n(mock describe)"),
+        )),
+        ActionReq::Exec {
+            ns, pod, command, ..
+        } => Some((
+            format!("{ns}/{pod} · exec"),
+            format!("$ {command}\n(mock) コマンド出力の例\nhello from {pod}"),
         )),
         _ => None,
     }
@@ -368,7 +806,110 @@ async fn run_action(a: ActionReq) -> ActionResult {
                 },
             }
         }
+        ActionReq::DeleteAny { kind, ns, name } => {
+            let na = ns_args(&ns);
+            let mut argv: Vec<&str> = vec!["delete", &kind, &name];
+            argv.extend(na.iter().map(|s| s.as_str()));
+            simple(run(&argv).await, label)
+        }
+        ActionReq::ScaleAny {
+            kind,
+            ns,
+            name,
+            replicas,
+        } => {
+            let na = ns_args(&ns);
+            let rep = format!("--replicas={replicas}");
+            let target = format!("{kind}/{name}");
+            let mut argv: Vec<&str> = vec!["scale", &target, &rep];
+            argv.extend(na.iter().map(|s| s.as_str()));
+            simple(run(&argv).await, label)
+        }
+        ActionReq::RestartAny { kind, ns, name } => {
+            let na = ns_args(&ns);
+            let target = format!("{kind}/{name}");
+            let mut argv: Vec<&str> = vec!["rollout", "restart", &target];
+            argv.extend(na.iter().map(|s| s.as_str()));
+            simple(run(&argv).await, label)
+        }
+        ActionReq::Apply { yaml } => match run_stdin(&["apply", "-f", "-"], &yaml).await {
+            Ok(o) => ActionResult {
+                message: format!("適用しました: {}", o.trim().lines().last().unwrap_or("")),
+                describe: None,
+            },
+            Err(e) => ActionResult {
+                message: format!("apply 失敗: {e}"),
+                describe: None,
+            },
+        },
+        ActionReq::Exec {
+            ns,
+            pod,
+            container,
+            command,
+        } => {
+            let mut argv: Vec<&str> = vec!["exec", "-n", &ns, &pod];
+            if !container.is_empty() {
+                argv.extend(["-c", &container]);
+            }
+            argv.extend(["--", "sh", "-c", &command]);
+            let title = format!("{ns}/{pod} · exec");
+            let body = match run_combined(&argv).await {
+                Ok(o) if o.is_empty() => "(出力なし)".to_string(),
+                Ok(o) => o,
+                Err(e) => format!("exec 失敗:\n{e}"),
+            };
+            ActionResult {
+                message: format!("exec {pod}"),
+                describe: Some((title, body)),
+            }
+        }
     }
+}
+
+/// stdin にデータを渡して kubectl を実行する（apply 用）。
+async fn run_stdin(args: &[&str], input: &str) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new("kubectl")
+        .args(context_args())
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("kubectl 実行失敗: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input.as_bytes()).await;
+        // drop で EOF を送る
+    }
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("kubectl 実行失敗: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(err.trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// stdout/stderr を結合して返す（exec 用、非ゼロ終了でも出力を見せる）。
+async fn run_combined(args: &[&str]) -> Result<String, String> {
+    let out = tokio::process::Command::new("kubectl")
+        .args(context_args())
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("kubectl 実行失敗: {e}"))?;
+    let mut s = String::from_utf8_lossy(&out.stdout).to_string();
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !err.trim().is_empty() {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(err.trim());
+    }
+    Ok(s)
 }
 
 fn simple(res: Result<String, String>, ok_msg: String) -> ActionResult {
@@ -752,7 +1293,7 @@ fn parse_events(json: &str) -> Vec<KubeEvent> {
         })
         .collect();
     // Warning を先頭に
-    events.sort_by(|a, b| b.warning.cmp(&a.warning));
+    events.sort_by_key(|e| std::cmp::Reverse(e.warning));
     events
 }
 
