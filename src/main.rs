@@ -66,14 +66,15 @@ fn main() -> eframe::Result<()> {
     let (schema_tx, schema_rx) = mpsc::channel::<query::SchemaGraph>();
     // k8s 監視: 背景 → UI
     let (kube_metrics_tx, kube_metrics_rx) = mpsc::channel::<k8s::KubeMetrics>();
-    // k8s 構成図: 要求 UI → 背景、結果 背景 → UI
-    let (kube_topo_req_tx, kube_topo_req_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let (kube_topo_tx, kube_topo_rx) = mpsc::channel::<query::SchemaGraph>();
+    // k8s 構成図: 要求 UI → 背景（対象 namespace）、結果 背景 → UI
+    let (kube_topo_req_tx, kube_topo_req_rx) =
+        tokio::sync::mpsc::unbounded_channel::<Option<String>>();
+    let (kube_topo_tx, kube_topo_rx) = mpsc::channel::<k8s::KubeTopology>();
     // k8s ログ追従: 要求 → ストリームイベント
     let (kube_log_req_tx, kube_log_req_rx) = tokio::sync::mpsc::unbounded_channel::<k8s::LogReq>();
     let (kube_log_tx, kube_log_rx) = mpsc::channel::<k8s::LogEvent>();
-    // k8s イベント: 要求 → 結果
-    let (kube_ev_req_tx, kube_ev_req_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    // k8s イベント: 要求（対象 namespace） → 結果
+    let (kube_ev_req_tx, kube_ev_req_rx) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();
     let (kube_ev_tx, kube_ev_rx) = mpsc::channel::<k8s::EventsResult>();
     // k8s 操作: 要求 → 結果
     let (kube_action_req_tx, kube_action_req_rx) =

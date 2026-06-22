@@ -16,6 +16,8 @@ const CPU_COLOR: egui::Color32 = egui::Color32::from_rgb(251, 146, 60); // amber
 const STORAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(56, 189, 248); // sky
 const TEXT: egui::Color32 = egui::Color32::from_rgb(226, 232, 240); // 明るいテキスト
 const MUTED: egui::Color32 = egui::Color32::from_rgb(148, 163, 184); // 補助テキスト
+/// 構成図の通信矢印（Service→Pod）。
+const COMM_COLOR: egui::Color32 = egui::Color32::from_rgb(52, 211, 153); // emerald
 
 /// 背景ワーカーへの送信失敗時に表示するメッセージ。
 const WORKER_GONE: &str = "バックグラウンド処理が停止しています。アプリを再起動してください。";
@@ -190,11 +192,11 @@ pub struct Channels {
     pub res_rx: Receiver<QueryOutcome>,
     pub schema_rx: Receiver<SchemaGraph>,
     pub kube_metrics_rx: Receiver<k8s::KubeMetrics>,
-    pub kube_topo_req_tx: UnboundedSender<()>,
-    pub kube_topo_rx: Receiver<SchemaGraph>,
+    pub kube_topo_req_tx: UnboundedSender<Option<String>>,
+    pub kube_topo_rx: Receiver<k8s::KubeTopology>,
     pub kube_log_req_tx: UnboundedSender<k8s::LogReq>,
     pub kube_log_rx: Receiver<k8s::LogEvent>,
-    pub kube_ev_req_tx: UnboundedSender<()>,
+    pub kube_ev_req_tx: UnboundedSender<Option<String>>,
     pub kube_ev_rx: Receiver<k8s::EventsResult>,
     pub kube_action_req_tx: UnboundedSender<k8s::ActionReq>,
     pub kube_action_rx: Receiver<k8s::ActionResult>,
@@ -238,11 +240,10 @@ pub struct MonitorApp {
     // Kubernetes
     kube_metrics_rx: Receiver<k8s::KubeMetrics>,
     kube_metrics: Option<k8s::KubeMetrics>,
-    kube_req_tx: UnboundedSender<()>,
-    kube_graph_rx: Receiver<SchemaGraph>,
-    kube_graph: Option<SchemaGraph>,
+    kube_req_tx: UnboundedSender<Option<String>>,
+    kube_graph_rx: Receiver<k8s::KubeTopology>,
+    kube_graph: Option<k8s::KubeTopology>,
     kube_pending: bool,
-    kube_positions: HashMap<String, egui::Pos2>,
     kube_selected: Option<String>,
     kube_pan: egui::Vec2,
     kube_zoom: f32,
@@ -259,7 +260,7 @@ pub struct MonitorApp {
     log_filter: bool,   // 一致行のみ表示
 
     // k8s イベント
-    kube_ev_req_tx: UnboundedSender<()>,
+    kube_ev_req_tx: UnboundedSender<Option<String>>,
     kube_ev_rx: Receiver<k8s::EventsResult>,
     kube_events: Option<k8s::EventsResult>,
     kube_ev_pending: bool,
@@ -273,11 +274,13 @@ pub struct MonitorApp {
     kube_res_req_tx: UnboundedSender<k8s::ResourceReq>,
     kube_res_rx: Receiver<k8s::ResourceResult>,
     res_kind: String,   // 表示中の種別（例: "pods"）
-    res_ns: String,     // namespace 絞り込み（空 = 全 namespace）
+    kube_ns: String,    // namespace 絞り込み（空 = 全 namespace）
     res_filter: String, // 名前フィルタ
     res_list: Option<k8s::ResourceList>,
     res_pending: bool,
     res_sort: Option<(usize, bool)>, // (列インデックス, 昇順)
+    kube_namespaces: Vec<String>,    // セレクタ用 namespace 一覧
+    kube_ns_loaded: bool,            // namespace 一覧を取得済みか
 
     // YAML エディタ
     yaml_open: bool,
@@ -350,7 +353,6 @@ impl MonitorApp {
             kube_graph_rx: ch.kube_topo_rx,
             kube_graph: None,
             kube_pending: false,
-            kube_positions: HashMap::new(),
             kube_selected: None,
             kube_pan: egui::vec2(40.0, 40.0),
             kube_zoom: 1.0,
@@ -373,11 +375,13 @@ impl MonitorApp {
             kube_res_req_tx: ch.kube_res_req_tx,
             kube_res_rx: ch.kube_res_rx,
             res_kind: "pods".to_string(),
-            res_ns: String::new(),
+            kube_ns: "default".to_string(),
             res_filter: String::new(),
             res_list: None,
             res_pending: false,
             res_sort: None,
+            kube_namespaces: Vec::new(),
+            kube_ns_loaded: false,
             yaml_open: false,
             yaml_title: String::new(),
             yaml_buf: String::new(),
@@ -526,6 +530,10 @@ impl MonitorApp {
                     self.yaml_buf = body;
                     self.yaml_open = true;
                 }
+                k8s::ResourceResult::Namespaces(list) => {
+                    self.kube_namespaces = list;
+                    self.kube_ns_loaded = true;
+                }
             }
         }
         while let Ok(ev) = self.kube_pf_rx.try_recv() {
@@ -571,21 +579,52 @@ impl MonitorApp {
         }
     }
 
+    /// クラスター(context)切替。kubectl context を変え、namespace 一覧と全ビューを取り直す。
+    fn on_cluster_changed(&mut self, name: String) {
+        k8s::set_context(Some(name.clone()));
+        self.current_context = Some(name);
+        // 新クラスターの namespace を取り直す
+        self.kube_ns_loaded = false;
+        self.kube_namespaces.clear();
+        self.kube_ns = "default".to_string();
+        // 監視は次のポーリングで新 context を反映（context_args を毎回読むため）
+        self.kube_metrics = None;
+        self.on_namespace_changed();
+    }
+
+    /// namespace 変更時に全ビューを取り直す（監視はクライアント側フィルタ）。
+    fn on_namespace_changed(&mut self) {
+        self.kube_graph = None; // 図 → 自動再取得
+        self.kube_events = None; // イベント → 自動再取得
+        self.res_list = None; // リソース → 自動再取得
+        self.res_sort = None;
+    }
+
+    /// 選択中の namespace（空 = 全て → None）。
+    fn ns_opt(&self) -> Option<String> {
+        let n = self.kube_ns.trim();
+        if n.is_empty() {
+            None
+        } else {
+            Some(n.to_string())
+        }
+    }
+
     fn run_kube_topo(&mut self) {
-        if self.kube_req_tx.send(()).is_ok() {
+        if self.kube_req_tx.send(self.ns_opt()).is_ok() {
             self.kube_pending = true;
         }
     }
 
     fn run_kube_events(&mut self) {
-        if self.kube_ev_req_tx.send(()).is_ok() {
+        if self.kube_ev_req_tx.send(self.ns_opt()).is_ok() {
             self.kube_ev_pending = true;
         }
     }
 
     /// 現在の種別・namespace 絞り込みでリソース一覧を取得する。
     fn run_resource_list(&mut self) {
-        let ns = self.res_ns.trim();
+        let ns = self.kube_ns.trim();
         let namespace = if ns.is_empty() {
             None
         } else {
@@ -598,6 +637,12 @@ impl MonitorApp {
         if self.kube_res_req_tx.send(req).is_ok() {
             self.res_pending = true;
         }
+    }
+
+    /// namespace セレクタ用の一覧を取得する。
+    fn run_namespaces(&mut self) {
+        self.kube_ns_loaded = true; // 多重送信防止（結果が来たら一覧を更新）
+        let _ = self.kube_res_req_tx.send(k8s::ResourceReq::Namespaces);
     }
 
     /// 種別を切り替えて即取得する。
@@ -738,6 +783,76 @@ impl eframe::App for MonitorApp {
                         if tab(ui, self.kube_view == KubeView::Events, "イベント") {
                             self.kube_view = KubeView::Events;
                         }
+                        // クラスター(context) → namespace の2段をセクション共通の
+                        // トップレベル選択として右寄せで表示する。
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // namespace（右端）
+                            let ns_label = if self.kube_ns.is_empty() {
+                                "(全 namespace)".to_string()
+                            } else {
+                                self.kube_ns.clone()
+                            };
+                            let mut ns_changed: Option<String> = None;
+                            egui::ComboBox::from_id_salt("kube_ns_global")
+                                .selected_text(ns_label)
+                                .width(170.0)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(self.kube_ns.is_empty(), "(全 namespace)")
+                                        .clicked()
+                                    {
+                                        ns_changed = Some(String::new());
+                                    }
+                                    for ns in &self.kube_namespaces {
+                                        if ui.selectable_label(&self.kube_ns == ns, ns).clicked() {
+                                            ns_changed = Some(ns.clone());
+                                        }
+                                    }
+                                });
+                            if let Some(ns) = ns_changed {
+                                if ns != self.kube_ns {
+                                    self.kube_ns = ns;
+                                    self.on_namespace_changed();
+                                }
+                            }
+                            ui.label(egui::RichText::new("NS:").color(MUTED).small());
+
+                            ui.add_space(8.0);
+
+                            // クラスター(context)（namespace の左）
+                            let cl_label = self
+                                .current_context
+                                .clone()
+                                .unwrap_or_else(|| "(既定)".to_string());
+                            let mut cl_changed: Option<String> = None;
+                            egui::ComboBox::from_id_salt("kube_cluster_global")
+                                .selected_text(cl_label)
+                                .width(180.0)
+                                .show_ui(ui, |ui| {
+                                    if self.contexts.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new("(context なし)").color(MUTED),
+                                        );
+                                    }
+                                    for c in &self.contexts {
+                                        if ui
+                                            .selectable_label(
+                                                self.current_context.as_deref() == Some(c),
+                                                c,
+                                            )
+                                            .clicked()
+                                        {
+                                            cl_changed = Some(c.clone());
+                                        }
+                                    }
+                                });
+                            if let Some(c) = cl_changed {
+                                if self.current_context.as_deref() != Some(c.as_str()) {
+                                    self.on_cluster_changed(c);
+                                }
+                            }
+                            ui.label(egui::RichText::new("クラスタ:").color(MUTED).small());
+                        });
                     }
                 }
             });
@@ -772,6 +887,17 @@ impl eframe::App for MonitorApp {
             && !self.res_pending
         {
             self.run_resource_list();
+        }
+        // クラスター(context)一覧は Kubernetes セクションで一度だけ取得（同期）
+        if self.section == Section::Kube && !self.contexts_loaded {
+            let (list, current) = k8s::list_contexts_blocking();
+            self.contexts = list;
+            self.current_context = current;
+            self.contexts_loaded = true;
+        }
+        // namespace 一覧は Kubernetes セクション全体で使う（トップレベル選択）
+        if self.section == Section::Kube && !self.kube_ns_loaded {
+            self.run_namespaces();
         }
 
         match self.section {
@@ -1203,6 +1329,7 @@ impl MonitorApp {
         let mut log_req: Option<(String, String, String)> = None;
         let mut action_req: Option<k8s::ActionReq> = None;
         let mut confirm_req: Option<(String, k8s::ActionReq)> = None;
+        let ns_sel = self.kube_ns.clone(); // 選択中 namespace（空 = 全て）
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(m) = &self.kube_metrics else {
                 centered_hint(ui, "kubectl から取得中…");
@@ -1215,25 +1342,46 @@ impl MonitorApp {
                 );
                 return;
             }
+            // 選択 namespace で Pod を絞り込む（空なら全て）
+            let pods: Vec<&k8s::PodInfo> = m
+                .pods
+                .iter()
+                .filter(|p| ns_sel.is_empty() || p.ns == ns_sel)
+                .collect();
+            let pod_count = pods.len();
+            let init_count: usize = pods
+                .iter()
+                .map(|p| p.containers.iter().filter(|c| c.init).count())
+                .sum();
+            let container_count: usize = pods
+                .iter()
+                .map(|p| p.containers.iter().filter(|c| !c.init).count())
+                .sum();
+            let running_count = pods.iter().filter(|p| p.phase == "Running").count();
+
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(4.0);
-                // クラスタ全体のサマリ（チップ）
+                // サマリ（チップ）— namespace 選択時はその範囲で集計
                 ui.horizontal(|ui| {
-                    chip(ui, "ノード", &m.nodes.len().to_string(), ACCENT);
-                    chip(ui, "Pod", &m.pod_count.to_string(), ACCENT);
+                    if ns_sel.is_empty() {
+                        chip(ui, "ノード", &m.nodes.len().to_string(), ACCENT);
+                    } else {
+                        chip(ui, "NS", &ns_sel, ACCENT);
+                    }
+                    chip(ui, "Pod", &pod_count.to_string(), ACCENT);
                     chip(
                         ui,
                         "コンテナ",
-                        &(m.container_count + m.init_count).to_string(),
+                        &(container_count + init_count).to_string(),
                         CPU_COLOR,
                     );
-                    chip(ui, "うちinit", &m.init_count.to_string(), MUTED);
-                    chip(ui, "Running", &m.running_count.to_string(), STORAGE_COLOR);
+                    chip(ui, "うちinit", &init_count.to_string(), MUTED);
+                    chip(ui, "Running", &running_count.to_string(), STORAGE_COLOR);
                 });
                 ui.add_space(8.0);
 
-                // namespace 別の集計
-                if !m.namespaces.is_empty() {
+                // namespace 別の集計（全 namespace 表示時のみ）
+                if ns_sel.is_empty() && !m.namespaces.is_empty() {
                     ui.label(egui::RichText::new("Namespace 別").color(ACCENT).strong());
                     egui::Grid::new("kube_ns")
                         .striped(true)
@@ -1277,7 +1425,7 @@ impl MonitorApp {
                         .strong(),
                 );
                 ui.add_space(2.0);
-                for p in &m.pods {
+                for &p in &pods {
                     let id = ui.make_persistent_id(("kpod", p.ns.as_str(), p.name.as_str()));
                     egui::collapsing_header::CollapsingState::load_with_default_open(
                         ui.ctx(),
@@ -1514,24 +1662,17 @@ impl MonitorApp {
                     self.select_kind(k);
                 }
 
-                ui.label(egui::RichText::new("ns:").color(MUTED).small());
-                let ns_resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.res_ns)
-                        .hint_text("全て")
-                        .desired_width(120.0),
-                );
+                // namespace は上部タブ列の共通セレクタで切り替える
                 ui.label(egui::RichText::new("検索:").color(MUTED).small());
                 ui.add(
                     egui::TextEdit::singleline(&mut self.res_filter)
                         .hint_text("名前で絞り込み")
                         .desired_width(160.0),
                 );
-                let refresh = ui
+                if ui
                     .add_enabled(!self.res_pending, egui::Button::new("更新"))
-                    .clicked();
-                let ns_enter =
-                    ns_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if refresh || ns_enter {
+                    .clicked()
+                {
                     self.run_resource_list();
                 }
 
@@ -2204,44 +2345,35 @@ impl MonitorApp {
                     if g.error.is_none() {
                         ui.label(
                             egui::RichText::new(format!(
-                                "{} オブジェクト / {} 関係",
-                                g.nodes.len(),
-                                g.edges.len()
+                                "{} Pod / {} Service",
+                                g.pods.len(),
+                                g.services.len()
                             ))
                             .color(MUTED),
                         );
                     }
                 }
                 ui.separator();
-                legend(ui, CPU_COLOR, "ノード配置");
-                legend(ui, ACCENT, "オーナー");
-                if let Some(note) = &self.copy_note {
-                    ui.label(egui::RichText::new(note).color(ACCENT).small());
-                }
+                legend(ui, COMM_COLOR, "通信 (Service→Pod)");
+                ui.label(
+                    egui::RichText::new("Pod クリックで関連通信を強調")
+                        .color(MUTED)
+                        .small(),
+                );
             });
             ui.add_space(6.0);
         });
 
         let Self {
             kube_graph,
-            kube_positions,
             kube_selected,
             kube_pan,
             kube_zoom,
-            copy_note,
             ..
         } = self;
         let g = kube_graph.as_ref();
         egui::CentralPanel::default().show(ctx, |ui| {
-            Self::draw_graph(
-                ui,
-                g,
-                kube_positions,
-                kube_selected,
-                kube_pan,
-                kube_zoom,
-                copy_note,
-            );
+            draw_topology(ui, g, kube_pan, kube_zoom, kube_selected);
         });
     }
 
@@ -2818,6 +2950,34 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 4.5, color);
 }
 
+/// コンテナの使用率テキスト。limit があれば「CPU 45% Mem 60%」、無ければ絶対値、
+/// どちらも無ければ空文字（metrics-server 無し等）。
+fn usage_text(c: &k8s::ContainerInfo) -> String {
+    let cpu = if c.cpu_limit_milli > 0.0 {
+        Some(format!(
+            "CPU {:.0}%",
+            c.cpu_milli / c.cpu_limit_milli * 100.0
+        ))
+    } else if c.cpu_milli > 0.0 {
+        Some(format!("{:.0}m", c.cpu_milli))
+    } else {
+        None
+    };
+    let mem = if c.mem_limit_mib > 0.0 {
+        Some(format!("Mem {:.0}%", c.mem_mib / c.mem_limit_mib * 100.0))
+    } else if c.mem_mib > 0.0 {
+        Some(format!("{:.0}Mi", c.mem_mib))
+    } else {
+        None
+    };
+    match (cpu, mem) {
+        (Some(a), Some(b)) => format!("{a}  {b}"),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => String::new(),
+    }
+}
+
 fn phase_color(phase: &str) -> egui::Color32 {
     match phase {
         "Running" => egui::Color32::from_rgb(34, 197, 94), // 緑
@@ -3004,6 +3164,330 @@ fn layout_nodes(graph: &SchemaGraph, widths: &HashMap<String, f32>) -> HashMap<S
         y += row_h + V_GAP;
     }
     out
+}
+
+/// クラスタ構成図を入れ子ボックス（Cluster > Node > Pod > コンテナ）で描く。
+/// 矢印は Service → 背後 Pod（通信経路）。パン/ズーム対応。
+fn draw_topology(
+    ui: &mut egui::Ui,
+    topo: Option<&k8s::KubeTopology>,
+    pan: &mut egui::Vec2,
+    zoom: &mut f32,
+    selected: &mut Option<String>,
+) {
+    let Some(topo) = topo else {
+        centered_hint(ui, "読み込み中…");
+        return;
+    };
+    if let Some(e) = &topo.error {
+        ui.colored_label(
+            egui::Color32::from_rgb(248, 113, 113),
+            format!("エラー: {e}"),
+        );
+        return;
+    }
+    if topo.pods.is_empty() {
+        centered_hint(ui, "Pod がありません");
+        return;
+    }
+
+    let rect = ui.available_rect_before_wrap();
+    let bg = ui.interact(rect, ui.id().with("topo_bg"), egui::Sense::click_and_drag());
+    if bg.dragged() {
+        *pan += bg.drag_delta();
+    }
+    if bg.clicked() {
+        *selected = None;
+    }
+    if bg.hovered() {
+        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll != 0.0 {
+            let f = (1.0 + scroll * 0.0015).clamp(0.85, 1.18);
+            *zoom = (*zoom * f).clamp(0.3, 3.0);
+        }
+    }
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, BASE);
+
+    // ── レイアウト定数（ワールド座標） ──
+    let (cw, ch, cgap) = (210.0_f32, 24.0_f32, 6.0_f32); // コンテナ（名前+使用量を表示）
+    let (pod_pad, pod_head, pod_gap) = (8.0_f32, 22.0_f32, 12.0_f32);
+    let (node_pad, node_head, node_gap) = (12.0_f32, 26.0_f32, 18.0_f32);
+    let (cl_pad, cl_head) = (16.0_f32, 34.0_f32);
+    let (svc_w, svc_h, svc_gap) = (160.0_f32, 30.0_f32, 12.0_f32);
+    let budget = 1700.0_f32;
+
+    // Pod を所属ノードでまとめる
+    let mut by_node: std::collections::BTreeMap<String, Vec<&k8s::PodInfo>> = Default::default();
+    for p in &topo.pods {
+        let key = if p.node.is_empty() {
+            "(未スケジュール)".to_string()
+        } else {
+            p.node.clone()
+        };
+        by_node.entry(key).or_default().push(p);
+    }
+
+    let pod_size = |p: &k8s::PodInfo| -> egui::Vec2 {
+        let n = p.containers.len();
+        let inner = if n == 0 {
+            0.0
+        } else {
+            n as f32 * ch + (n as f32 - 1.0) * cgap
+        };
+        egui::vec2(cw + pod_pad * 2.0, pod_head + pod_pad + inner + pod_pad)
+    };
+
+    // 各ノードのサイズ（Pod は横並び）
+    struct NodeLayout<'a> {
+        name: String,
+        pods: Vec<(&'a k8s::PodInfo, egui::Vec2)>,
+        size: egui::Vec2,
+    }
+    let mut nodes: Vec<NodeLayout> = Vec::new();
+    for (nname, pods) in &by_node {
+        let sizes: Vec<(&k8s::PodInfo, egui::Vec2)> =
+            pods.iter().map(|p| (*p, pod_size(p))).collect();
+        let tot: f32 = sizes.iter().map(|(_, s)| s.x).sum();
+        let k = sizes.len().max(1) as f32;
+        let w = node_pad * 2.0 + tot + pod_gap * (k - 1.0);
+        let maxh = sizes.iter().map(|(_, s)| s.y).fold(0.0, f32::max);
+        let h = node_head + node_pad * 2.0 + maxh;
+        nodes.push(NodeLayout {
+            name: nname.clone(),
+            pods: sizes,
+            size: egui::vec2(w, h),
+        });
+    }
+
+    // Service 行を上部に折り返し配置
+    let mut svc_rects: Vec<(usize, egui::Rect)> = Vec::new();
+    let (mut cx, mut cy, mut max_x) = (cl_pad, cl_head, cl_pad);
+    for i in 0..topo.services.len() {
+        if cx > cl_pad && cx + svc_w > cl_pad + budget {
+            cx = cl_pad;
+            cy += svc_h + svc_gap;
+        }
+        svc_rects.push((
+            i,
+            egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(svc_w, svc_h)),
+        ));
+        cx += svc_w + svc_gap;
+        max_x = max_x.max(cx - svc_gap);
+    }
+    let nodes_top = if topo.services.is_empty() {
+        cl_head
+    } else {
+        cy + svc_h + node_gap
+    };
+
+    // ノードを折り返し配置し、各 Pod・コンテナの矩形を確定
+    let mut node_rects: Vec<(String, egui::Rect)> = Vec::new();
+    let mut pod_draw: Vec<(&k8s::PodInfo, egui::Rect)> = Vec::new();
+    let mut pod_rect_by_key: HashMap<(String, String), egui::Rect> = HashMap::new();
+    let (mut nx, mut ny, mut row_h) = (cl_pad, nodes_top, 0.0_f32);
+    for nl in &nodes {
+        let size = nl.size;
+        if nx > cl_pad && nx + size.x > cl_pad + budget {
+            nx = cl_pad;
+            ny += row_h + node_gap;
+            row_h = 0.0;
+        }
+        let nrect = egui::Rect::from_min_size(egui::pos2(nx, ny), size);
+        node_rects.push((nl.name.clone(), nrect));
+        // Pod を横並び
+        let mut px = nx + node_pad;
+        let py = ny + node_head + node_pad;
+        for (p, ps) in &nl.pods {
+            let prect = egui::Rect::from_min_size(egui::pos2(px, py), *ps);
+            pod_draw.push((p, prect));
+            pod_rect_by_key.insert((p.ns.clone(), p.name.clone()), prect);
+            px += ps.x + pod_gap;
+        }
+        nx += size.x + node_gap;
+        row_h = row_h.max(size.y);
+        max_x = max_x.max(nx - node_gap);
+    }
+    let content_bottom = ny + row_h;
+    let cluster = egui::Rect::from_min_size(
+        egui::pos2(0.0, 0.0),
+        egui::vec2(max_x + cl_pad, content_bottom + cl_pad),
+    );
+
+    // ── ワールド→スクリーン変換 ──
+    let z = *zoom;
+    let zt = (z * 8.0).round() / 8.0; // フォントサイズだけ離散化（アトラス再生成抑制）
+    let origin = rect.min + *pan;
+    let tf = |p: egui::Pos2| origin + (p.to_vec2() * z);
+    let tr = |r: egui::Rect| egui::Rect::from_min_max(tf(r.min), tf(r.max));
+    let fs = |s: f32| (s * zt).max(6.0);
+    let round = |r: f32| egui::Rounding::same(r * z);
+
+    // 選択 Pod（"ns/name"）に関係する通信だけ強調するための集合
+    let sel = selected.clone();
+
+    // Cluster
+    let clr = tr(cluster);
+    painter.rect_filled(clr, round(10.0), egui::Color32::from_rgb(24, 33, 48));
+    painter.rect_stroke(clr, round(10.0), egui::Stroke::new(1.5, ACCENT));
+    painter.text(
+        clr.left_top() + egui::vec2(12.0 * z, (cl_head * 0.5) * z),
+        egui::Align2::LEFT_CENTER,
+        "Cluster",
+        egui::FontId::proportional(fs(15.0)),
+        TEXT,
+    );
+
+    // Nodes
+    for (nname, nrect) in &node_rects {
+        let r = tr(*nrect);
+        let pc = painter.with_clip_rect(r.intersect(rect));
+        painter.rect_filled(r, round(8.0), egui::Color32::from_rgb(28, 52, 70));
+        painter.rect_stroke(
+            r,
+            round(8.0),
+            egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.7)),
+        );
+        pc.text(
+            r.left_top() + egui::vec2(10.0 * z, (node_head * 0.5) * z),
+            egui::Align2::LEFT_CENTER,
+            format!("Node · {nname}"),
+            egui::FontId::proportional(fs(13.0)),
+            TEXT,
+        );
+    }
+
+    // Pods + コンテナ（クリックで選択トグル）
+    for (p, prect) in &pod_draw {
+        let r = tr(*prect);
+        if !rect.intersects(r) {
+            continue;
+        }
+        let key = format!("{}/{}", p.ns, p.name);
+        let is_sel = sel.as_deref() == Some(key.as_str());
+        let pc = painter.with_clip_rect(r.intersect(rect));
+        painter.rect_filled(r, round(6.0), egui::Color32::from_rgb(34, 68, 90));
+        let border = if is_sel {
+            egui::Stroke::new(2.0, COMM_COLOR)
+        } else {
+            egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.5))
+        };
+        painter.rect_stroke(r, round(6.0), border);
+        // ヘッダ（Pod 名）＋クリック判定
+        let header = egui::Rect::from_min_max(r.min, egui::pos2(r.max.x, r.min.y + pod_head * z));
+        pc.text(
+            header.left_center() + egui::vec2(8.0 * z, 0.0),
+            egui::Align2::LEFT_CENTER,
+            &p.name,
+            egui::FontId::proportional(fs(12.0)),
+            phase_color(&p.phase),
+        );
+        // Pod 合計の使用率（limit 比。ヘッダ右）
+        let cpu_lim: f64 = p.containers.iter().map(|c| c.cpu_limit_milli).sum();
+        let mem_lim: f64 = p.containers.iter().map(|c| c.mem_limit_mib).sum();
+        let total = match (cpu_lim > 0.0, mem_lim > 0.0) {
+            (true, true) => format!(
+                "Σ CPU {:.0}% Mem {:.0}%",
+                p.cpu_milli / cpu_lim * 100.0,
+                p.mem_mib / mem_lim * 100.0
+            ),
+            _ if p.cpu_milli > 0.0 || p.mem_mib > 0.0 => {
+                format!("Σ {:.0}m {:.0}Mi", p.cpu_milli, p.mem_mib)
+            }
+            _ => String::new(),
+        };
+        if !total.is_empty() {
+            pc.text(
+                header.right_center() - egui::vec2(8.0 * z, 0.0),
+                egui::Align2::RIGHT_CENTER,
+                total,
+                egui::FontId::monospace(fs(10.0)),
+                MUTED,
+            );
+        }
+        let pid = ui.id().with(("topo_pod", key.as_str()));
+        if ui.interact(header, pid, egui::Sense::click()).clicked() {
+            *selected = if is_sel { None } else { Some(key.clone()) };
+        }
+        // コンテナ
+        let mut y = r.min.y + (pod_head + pod_pad) * z;
+        for c in &p.containers {
+            let crect = egui::Rect::from_min_size(
+                egui::pos2(r.min.x + pod_pad * z, y),
+                egui::vec2(cw * z, ch * z),
+            );
+            pc.rect_filled(crect, round(4.0), egui::Color32::from_rgb(226, 232, 240));
+            pc.rect_stroke(crect, round(4.0), egui::Stroke::new(1.0, BORDER));
+            let label = if c.init {
+                format!("{} (init)", c.name)
+            } else {
+                c.name.clone()
+            };
+            pc.text(
+                crect.left_center() + egui::vec2(6.0 * z, 0.0),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::monospace(fs(11.0)),
+                egui::Color32::from_rgb(12, 18, 30),
+            );
+            // CPU / メモリ使用率（limit 比、右寄せ）。limit 未設定や metrics 無しは絶対値/—
+            let usage = usage_text(c);
+            if !usage.is_empty() {
+                pc.text(
+                    crect.right_center() - egui::vec2(6.0 * z, 0.0),
+                    egui::Align2::RIGHT_CENTER,
+                    usage,
+                    egui::FontId::monospace(fs(10.0)),
+                    egui::Color32::from_rgb(71, 85, 105),
+                );
+            }
+            y += (ch + cgap) * z;
+        }
+    }
+
+    // Services + 通信矢印
+    for (i, srect) in &svc_rects {
+        let svc = &topo.services[*i];
+        let r = tr(*srect);
+        // この Service が選択 Pod に関係するか
+        let related = sel
+            .as_deref()
+            .is_none_or(|s| svc.pods.iter().any(|pn| format!("{}/{}", svc.ns, pn) == s));
+        let svc_fill = if related {
+            egui::Color32::from_rgb(20, 60, 50)
+        } else {
+            egui::Color32::from_rgb(20, 60, 50).gamma_multiply(0.4)
+        };
+        painter.rect_filled(r, round(6.0), svc_fill);
+        painter.rect_stroke(r, round(6.0), egui::Stroke::new(1.0, COMM_COLOR));
+        painter.with_clip_rect(r.intersect(rect)).text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("svc/{}", svc.name),
+            egui::FontId::proportional(fs(12.0)),
+            COMM_COLOR,
+        );
+        // 背後 Pod へ矢印
+        let from = egui::pos2(r.center().x, r.bottom());
+        for pn in &svc.pods {
+            let Some(prect) = pod_rect_by_key.get(&(svc.ns.clone(), pn.clone())) else {
+                continue;
+            };
+            let pr = tr(*prect);
+            let to = egui::pos2(pr.center().x, pr.top());
+            let active = sel.as_deref().is_none_or(|s| {
+                s == format!("{}/{}", svc.ns, pn)
+                    || svc.pods.iter().any(|x| format!("{}/{}", svc.ns, x) == s)
+            });
+            let color = if active {
+                COMM_COLOR
+            } else {
+                COMM_COLOR.gamma_multiply(0.18)
+            };
+            let bend_y = (from.y + to.y) * 0.5;
+            draw_arrow(&painter, from, to, bend_y, color, z);
+        }
+    }
 }
 
 /// 直交ルーティングの折れ線矢印を描く（from=子の上端 → to=親の下端）。

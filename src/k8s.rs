@@ -4,7 +4,7 @@
 //!
 //! kubectl 不在・クラスタ未接続でも mock で動作する。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -12,8 +12,6 @@ use chrono::Utc;
 use serde_json::Value;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc::UnboundedReceiver;
-
-use crate::query::{Column, Edge, EdgeKind, SchemaGraph, TableNode};
 
 pub struct Config {
     pub mock: bool,
@@ -79,6 +77,8 @@ pub struct ContainerInfo {
     pub init: bool,
     pub cpu_milli: f64,
     pub mem_mib: f64,
+    pub cpu_limit_milli: f64, // limit（無ければ request）。0 = 未設定
+    pub mem_limit_mib: f64,
 }
 
 /// Pod（展開すると containers が見える）
@@ -107,10 +107,6 @@ pub struct NsAgg {
 pub struct KubeMetrics {
     pub nodes: Vec<NodeUsage>,
     pub pods: Vec<PodInfo>,
-    pub pod_count: usize,
-    pub container_count: usize, // 通常コンテナ
-    pub init_count: usize,      // initContainers
-    pub running_count: usize,
     pub namespaces: Vec<NsAgg>,
     pub error: Option<String>,
 }
@@ -209,6 +205,24 @@ pub struct EventsResult {
     pub error: Option<String>,
 }
 
+// ── クラスタ構成図（入れ子レイアウト用） ──
+
+/// Service とその背後 Pod（通信矢印のソース）。
+#[derive(Clone, Debug, Default)]
+pub struct TopoService {
+    pub ns: String,
+    pub name: String,
+    pub pods: Vec<String>, // Endpoints から得た背後 Pod 名
+}
+
+/// 構成図のデータ。Pod は所属ノード・コンテナを持つ（KubeMetrics の PodInfo を再利用）。
+#[derive(Clone, Debug, Default)]
+pub struct KubeTopology {
+    pub pods: Vec<PodInfo>,
+    pub services: Vec<TopoService>,
+    pub error: Option<String>,
+}
+
 // ── 汎用リソースブラウザ ──
 
 /// リソースブラウザへのリクエスト。
@@ -237,6 +251,8 @@ pub enum ResourceReq {
         ns: Option<String>,
         name: String,
     },
+    /// namespace 一覧（セレクタ用）。
+    Namespaces,
 }
 
 /// 一覧の 1 行。
@@ -271,6 +287,8 @@ pub enum ResourceResult {
         title: String,
         body: String,
     },
+    /// namespace 一覧（セレクタ更新用）。
+    Namespaces(Vec<String>),
 }
 
 /// リソースブラウザのループ。
@@ -356,6 +374,18 @@ async fn run_resource(req: ResourceReq) -> ResourceResult {
                     body: format!("取得に失敗しました:\n{e}"),
                 },
             }
+        }
+        ResourceReq::Namespaces => {
+            let list = run(&["get", "namespaces", "-o", "name"])
+                .await
+                .map(|o| {
+                    o.lines()
+                        .filter_map(|l| l.trim().strip_prefix("namespace/"))
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            ResourceResult::Namespaces(list)
         }
     }
 }
@@ -458,6 +488,12 @@ fn mock_resource(req: &ResourceReq) -> ResourceResult {
                 ns.as_deref().unwrap_or("")
             ),
         },
+        ResourceReq::Namespaces => ResourceResult::Namespaces(vec![
+            "default".into(),
+            "kube-system".into(),
+            "kube-public".into(),
+            "app".into(),
+        ]),
     }
 }
 
@@ -925,20 +961,28 @@ fn simple(res: Result<String, String>, ok_msg: String) -> ActionResult {
     }
 }
 
-/// イベント取得ループ。
+/// namespace スコープの引数。None / 空なら全 namespace（-A）。
+fn scope_args(ns: &Option<String>) -> Vec<String> {
+    match ns {
+        Some(n) if !n.is_empty() => vec!["-n".into(), n.clone()],
+        _ => vec!["-A".into()],
+    }
+}
+
+/// イベント取得ループ。要求は対象 namespace（None = 全て）。
 pub async fn events_loop(
     cfg: Config,
-    mut req_rx: UnboundedReceiver<()>,
+    mut req_rx: UnboundedReceiver<Option<String>>,
     tx: std::sync::mpsc::Sender<EventsResult>,
 ) {
-    while req_rx.recv().await.is_some() {
+    while let Some(ns) = req_rx.recv().await {
         let r = if cfg.mock {
             EventsResult {
                 events: mock_events(),
                 error: None,
             }
         } else {
-            fetch_events().await
+            fetch_events(&ns).await
         };
         if tx.send(r).is_err() {
             break;
@@ -946,17 +990,17 @@ pub async fn events_loop(
     }
 }
 
-/// 構成図ループ。
+/// 構成図ループ。要求は対象 namespace（None = 全て）。
 pub async fn topology_loop(
     cfg: Config,
-    mut req_rx: UnboundedReceiver<()>,
-    tx: std::sync::mpsc::Sender<SchemaGraph>,
+    mut req_rx: UnboundedReceiver<Option<String>>,
+    tx: std::sync::mpsc::Sender<KubeTopology>,
 ) {
-    while req_rx.recv().await.is_some() {
+    while let Some(ns) = req_rx.recv().await {
         let g = if cfg.mock {
             mock_topology()
         } else {
-            fetch_topology().await
+            fetch_topology(&ns).await
         };
         if tx.send(g).is_err() {
             break;
@@ -1015,22 +1059,10 @@ async fn fetch_metrics() -> KubeMetrics {
 
     let pods = parse_pods(&pj, &cusage);
 
-    // 集計
-    let mut pod_count = 0;
-    let mut container_count = 0;
-    let mut init_count = 0;
-    let mut running_count = 0;
+    // 集計（ノード別・namespace 別）。全体サマリは UI 側で算出する。
     let mut per_node: HashMap<String, (usize, usize)> = HashMap::new();
     let mut per_ns: HashMap<String, (usize, usize)> = HashMap::new();
     for p in &pods {
-        pod_count += 1;
-        let regular = p.containers.iter().filter(|c| !c.init).count();
-        let inits = p.containers.len() - regular;
-        container_count += regular;
-        init_count += inits;
-        if p.phase == "Running" {
-            running_count += 1;
-        }
         if !p.node.is_empty() {
             let e = per_node.entry(p.node.clone()).or_insert((0, 0));
             e.0 += 1;
@@ -1059,10 +1091,6 @@ async fn fetch_metrics() -> KubeMetrics {
     KubeMetrics {
         nodes,
         pods,
-        pod_count,
-        container_count,
-        init_count,
-        running_count,
         namespaces,
         error: None,
     }
@@ -1198,6 +1226,16 @@ fn parse_pods(pj: &str, cusage: &HashMap<(String, String, String), (f64, f64)>) 
                     .get(&(ns.clone(), name.clone(), cname.clone()))
                     .copied()
                     .unwrap_or((0.0, 0.0));
+                // limit を優先、無ければ request を上限値に使う
+                let res = &c["resources"];
+                let cpu_str = res["limits"]["cpu"]
+                    .as_str()
+                    .or_else(|| res["requests"]["cpu"].as_str());
+                let mem_str = res["limits"]["memory"]
+                    .as_str()
+                    .or_else(|| res["requests"]["memory"].as_str());
+                let cpu_limit_milli = cpu_str.map(parse_cpu_milli).unwrap_or(0.0);
+                let mem_limit_mib = mem_str.map(parse_mem_mib).unwrap_or(0.0);
                 containers.push(ContainerInfo {
                     name: cname,
                     image,
@@ -1207,6 +1245,8 @@ fn parse_pods(pj: &str, cusage: &HashMap<(String, String, String), (f64, f64)>) 
                     init,
                     cpu_milli,
                     mem_mib,
+                    cpu_limit_milli,
+                    mem_limit_mib,
                 });
             }
         };
@@ -1235,22 +1275,100 @@ fn parse_pods(pj: &str, cusage: &HashMap<(String, String, String), (f64, f64)>) 
 
 // ── 構成図 ──
 
-async fn fetch_topology() -> SchemaGraph {
-    let nodes_json = match run(&["get", "nodes", "-o", "json"]).await {
-        Ok(o) => o,
-        Err(e) => return err_graph(e),
+async fn fetch_topology(ns: &Option<String>) -> KubeTopology {
+    let sc = scope_args(ns);
+    let getj = |kind: &str| {
+        let mut argv: Vec<String> = vec!["get".into(), kind.into()];
+        argv.extend(sc.iter().cloned());
+        argv.push("-o".into());
+        argv.push("json".into());
+        argv
     };
-    let pods_json = match run(&["get", "pods", "-A", "-o", "json"]).await {
+    let pa = getj("pods");
+    let pods_json = match run(&pa.iter().map(|s| s.as_str()).collect::<Vec<_>>()).await {
         Ok(o) => o,
-        Err(e) => return err_graph(e),
+        Err(e) => {
+            return KubeTopology {
+                error: Some(e),
+                ..Default::default()
+            }
+        }
     };
-    build_topology(&nodes_json, &pods_json)
+    // Service / Endpoints は取得失敗しても致命的でない（矢印が出ないだけ）
+    let sa = getj("services");
+    let svc_json = run(&sa.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+        .await
+        .unwrap_or_default();
+    let ea = getj("endpoints");
+    let ep_json = run(&ea.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+        .await
+        .unwrap_or_default();
+    // コンテナ単位の CPU/メモリ使用量（metrics-server 無しなら空 → 0 表示）
+    let mut tp: Vec<String> = vec!["top".into(), "pods".into()];
+    tp.extend(sc.iter().cloned());
+    tp.extend(["--containers".into(), "--no-headers".into()]);
+    let cusage = run(&tp.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+        .await
+        .map(|o| parse_container_usage(&o))
+        .unwrap_or_default();
+    KubeTopology {
+        pods: parse_pods(&pods_json, &cusage),
+        services: parse_services(&svc_json, &ep_json),
+        error: None,
+    }
+}
+
+/// Service と Endpoints を突き合わせ、各 Service の背後 Pod 名を集める。
+fn parse_services(svc_json: &str, ep_json: &str) -> Vec<TopoService> {
+    // Endpoints: (ns, name) → 背後 Pod 名
+    let mut ep: HashMap<(String, String), Vec<String>> = HashMap::new();
+    if let Ok(v) = serde_json::from_str::<Value>(ep_json) {
+        for it in v["items"].as_array().into_iter().flatten() {
+            let ns = it["metadata"]["namespace"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let name = it["metadata"]["name"].as_str().unwrap_or("").to_string();
+            let mut pods = Vec::new();
+            for ss in it["subsets"].as_array().into_iter().flatten() {
+                for a in ss["addresses"].as_array().into_iter().flatten() {
+                    if a["targetRef"]["kind"].as_str() == Some("Pod") {
+                        if let Some(pn) = a["targetRef"]["name"].as_str() {
+                            pods.push(pn.to_string());
+                        }
+                    }
+                }
+            }
+            ep.insert((ns, name), pods);
+        }
+    }
+    let mut out = Vec::new();
+    if let Ok(v) = serde_json::from_str::<Value>(svc_json) {
+        for it in v["items"].as_array().into_iter().flatten() {
+            let ns = it["metadata"]["namespace"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let name = it["metadata"]["name"].as_str().unwrap_or("").to_string();
+            // ヘッドレス/外部などで Endpoints が無い Service は矢印なし
+            let pods = ep
+                .get(&(ns.clone(), name.clone()))
+                .cloned()
+                .unwrap_or_default();
+            out.push(TopoService { ns, name, pods });
+        }
+    }
+    out
 }
 
 // ── イベント ──
 
-async fn fetch_events() -> EventsResult {
-    match run(&["get", "events", "-A", "-o", "json"]).await {
+async fn fetch_events(ns: &Option<String>) -> EventsResult {
+    let sc = scope_args(ns);
+    let mut argv: Vec<&str> = vec!["get", "events"];
+    argv.extend(sc.iter().map(|s| s.as_str()));
+    argv.extend(["-o", "json"]);
+    match run(&argv).await {
         Ok(o) => EventsResult {
             events: parse_events(&o),
             error: None,
@@ -1326,116 +1444,6 @@ fn mock_events() -> Vec<KubeEvent> {
     ]
 }
 
-fn err_graph(e: String) -> SchemaGraph {
-    SchemaGraph {
-        error: Some(e),
-        ..Default::default()
-    }
-}
-
-fn line_col(text: &str) -> Column {
-    Column {
-        name: text.to_string(),
-        ty: String::new(),
-        pk: false,
-    }
-}
-
-fn build_topology(nodes_json: &str, pods_json: &str) -> SchemaGraph {
-    let mut nodes: Vec<TableNode> = Vec::new();
-    let mut edges: Vec<Edge> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-
-    let mut add_node = |nodes: &mut Vec<TableNode>, key: &str, cols: Vec<Column>| {
-        if seen.insert(key.to_string()) {
-            nodes.push(TableNode {
-                name: key.to_string(),
-                columns: cols,
-                indexes: Vec::new(),
-            });
-        }
-    };
-
-    if let Ok(v) = serde_json::from_str::<Value>(nodes_json) {
-        for item in v["items"].as_array().into_iter().flatten() {
-            let name = item["metadata"]["name"].as_str().unwrap_or("?");
-            add_node(
-                &mut nodes,
-                &format!("Node/{name}"),
-                vec![line_col("Kubernetes Node")],
-            );
-        }
-    }
-
-    if let Ok(v) = serde_json::from_str::<Value>(pods_json) {
-        for item in v["items"].as_array().into_iter().flatten() {
-            let name = item["metadata"]["name"].as_str().unwrap_or("?");
-            let ns = item["metadata"]["namespace"].as_str().unwrap_or("default");
-            let phase = item["status"]["phase"].as_str().unwrap_or("");
-            let node_name = item["spec"]["nodeName"].as_str();
-            let owner = item["metadata"]["ownerReferences"]
-                .as_array()
-                .and_then(|a| a.first())
-                .map(|o| {
-                    (
-                        o["kind"].as_str().unwrap_or("").to_string(),
-                        o["name"].as_str().unwrap_or("").to_string(),
-                    )
-                });
-
-            let pod_key = format!("{ns}/{name}");
-            let mut cols = vec![line_col(&format!("Pod · {phase}"))];
-            for c in item["spec"]["containers"].as_array().into_iter().flatten() {
-                if let Some(cn) = c["name"].as_str() {
-                    cols.push(line_col(&format!("- {cn}")));
-                }
-            }
-            for c in item["spec"]["initContainers"]
-                .as_array()
-                .into_iter()
-                .flatten()
-            {
-                if let Some(cn) = c["name"].as_str() {
-                    cols.push(line_col(&format!("- {cn} (init)")));
-                }
-            }
-            if let Some((k, n)) = &owner {
-                cols.push(line_col(&format!("by {k}/{n}")));
-            }
-            add_node(&mut nodes, &pod_key, cols);
-
-            if let Some(nn) = node_name {
-                let nk = format!("Node/{nn}");
-                add_node(&mut nodes, &nk, vec![line_col("Kubernetes Node")]);
-                edges.push(Edge {
-                    from: pod_key.clone(),
-                    to: nk,
-                    kind: EdgeKind::ForeignKey,
-                    label: "node".into(),
-                });
-            }
-            if let Some((k, n)) = owner {
-                if !n.is_empty() {
-                    let ok = format!("{k}/{n}");
-                    add_node(&mut nodes, &ok, vec![line_col(&k)]);
-                    edges.push(Edge {
-                        from: pod_key.clone(),
-                        to: ok,
-                        kind: EdgeKind::Interleave,
-                        label: "owned".into(),
-                    });
-                }
-            }
-        }
-    }
-
-    SchemaGraph {
-        nodes,
-        edges,
-        error: None,
-    }
-}
-
 // ── モック ──
 
 fn mock_metrics() -> KubeMetrics {
@@ -1450,6 +1458,8 @@ fn mock_metrics() -> KubeMetrics {
                 init,
                 cpu_milli: cpu,
                 mem_mib: mem,
+                cpu_limit_milli: 0.0,
+                mem_limit_mib: 0.0,
             }
         };
     let pods = vec![
@@ -1558,10 +1568,6 @@ fn mock_metrics() -> KubeMetrics {
                 containers: 18,
             },
         ],
-        pod_count: pods.len(),
-        container_count: 5,
-        init_count: 1,
-        running_count: 3,
         namespaces: vec![
             NsAgg {
                 name: "default".into(),
@@ -1584,66 +1590,50 @@ fn mock_metrics() -> KubeMetrics {
     }
 }
 
-fn mock_topology() -> SchemaGraph {
-    let n = |key: &str, lines: &[&str]| TableNode {
-        name: key.into(),
-        columns: lines.iter().map(|l| line_col(l)).collect(),
-        indexes: Vec::new(),
+fn mock_topology() -> KubeTopology {
+    let pod = |ns: &str, name: &str, node: &str, ctrs: &[&str]| PodInfo {
+        ns: ns.into(),
+        name: name.into(),
+        phase: "Running".into(),
+        node: node.into(),
+        age: "3d".into(),
+        restarts: 0,
+        cpu_milli: 0.0,
+        mem_mib: 0.0,
+        containers: ctrs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ContainerInfo {
+                name: (*c).into(),
+                state: "Running".into(),
+                ready: true,
+                cpu_milli: 35.0 + (i as f64) * 22.0,
+                mem_mib: 64.0 + (i as f64) * 48.0,
+                cpu_limit_milli: 200.0,
+                mem_limit_mib: 256.0,
+                ..Default::default()
+            })
+            .collect(),
     };
-    let e = |from: &str, to: &str, kind: EdgeKind, label: &str| Edge {
-        from: from.into(),
-        to: to.into(),
-        kind,
-        label: label.into(),
-    };
-    SchemaGraph {
-        nodes: vec![
-            n("Node/node-1", &["Kubernetes Node"]),
-            n("Node/node-2", &["Kubernetes Node"]),
-            n("Deployment/api", &["Deployment"]),
-            n(
-                "default/api-7c9-abc",
-                &[
-                    "Pod · Running",
-                    "- api",
-                    "- sidecar",
-                    "- init-migrate (init)",
-                ],
-            ),
-            n("default/web-5d-xyz", &["Pod · Running", "- web"]),
-            n("kube-system/coredns-xyz", &["Pod · Running", "- coredns"]),
+    KubeTopology {
+        pods: vec![
+            pod("default", "api-7c9-abc", "node-1", &["api", "sidecar"]),
+            pod("default", "api-7c9-def", "node-1", &["api", "sidecar"]),
+            pod("default", "web-5d-xyz", "node-2", &["web"]),
+            pod("default", "worker-1", "node-2", &["worker", "agent"]),
+            pod("kube-system", "coredns-xyz", "node-1", &["coredns"]),
         ],
-        edges: vec![
-            e(
-                "default/api-7c9-abc",
-                "Node/node-1",
-                EdgeKind::ForeignKey,
-                "node",
-            ),
-            e(
-                "default/web-5d-xyz",
-                "Node/node-2",
-                EdgeKind::ForeignKey,
-                "node",
-            ),
-            e(
-                "kube-system/coredns-xyz",
-                "Node/node-1",
-                EdgeKind::ForeignKey,
-                "node",
-            ),
-            e(
-                "default/api-7c9-abc",
-                "Deployment/api",
-                EdgeKind::Interleave,
-                "owned",
-            ),
-            e(
-                "default/web-5d-xyz",
-                "Deployment/api",
-                EdgeKind::Interleave,
-                "owned",
-            ),
+        services: vec![
+            TopoService {
+                ns: "default".into(),
+                name: "api".into(),
+                pods: vec!["api-7c9-abc".into(), "api-7c9-def".into()],
+            },
+            TopoService {
+                ns: "default".into(),
+                name: "web".into(),
+                pods: vec!["web-5d-xyz".into()],
+            },
         ],
         error: None,
     }
