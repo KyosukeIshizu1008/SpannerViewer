@@ -1079,7 +1079,7 @@ async fn run_streaming_import(
     // 1 リクエストに詰める行数（セル予算 ÷ 列数）。
     let per_request = (BATCH_CELLS_PER_REQUEST / req.columns.len().max(1)).max(1);
 
-    let (mut source, bytes_total) = match open_source(&req.source).await {
+    let (mut source, bytes_total, src_identity) = match open_source(&req.source).await {
         Ok(s) => s,
         Err(e) => {
             return ImportOutcome {
@@ -1121,8 +1121,14 @@ async fn run_streaming_import(
         return dry_run_import(req, &mut source, per_request, bytes_total, progress).await;
     }
 
-    // チェックポイント（再開）準備。
-    let sig = import_signature(req, per_request);
+    // チェックポイント（再開）準備。GCS は URI だけでは中身の同一性を担保できない
+    // （同一 URI で中身が差し替わる運用がある）ため、世代/サイズを署名に含める。
+    // これにより中身が変われば署名が変わり、古いチェックポイントで誤ってスキップして
+    // 新データを取りこぼす（サイレントなデータ欠損）ことを防ぐ。
+    let mut sig = import_signature(req, per_request);
+    if let Some(id) = &src_identity {
+        sig.push_str(&format!("\tsrcid={id}"));
+    }
     let ckpt_path = checkpoint_path(&sig);
     let committed: HashSet<usize> = if req.fresh {
         HashSet::new()
@@ -1313,12 +1319,18 @@ async fn run_streaming_import(
                         });
                     }
                     Err(status) => {
-                        set_first_error(
-                            &first_error,
-                            format!("BatchWrite に失敗（{attempt} 回リトライ後）: {status}"),
-                        )
-                        .await;
-                        abort.store(true, Ordering::Relaxed);
+                        let msg = format!("BatchWrite に失敗（{attempt} 回リトライ後）: {status}");
+                        if skip {
+                            // skip モードでは中断せず、この バッチをリジェクト記録して続行。
+                            for row in kept.iter() {
+                                reject.reject(&msg, row);
+                                skipped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            ckpt.mark(batch_idx);
+                        } else {
+                            set_first_error(&first_error, msg).await;
+                            abort.store(true, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -1621,19 +1633,30 @@ enum ByteSource {
     Gcs(reqwest::Response),
 }
 
-/// インポートソースを開く。戻り値は (ソース, 全体バイト数)。
+/// インポートソースを開く。戻り値は (ソース, 全体バイト数, 内容識別子)。
 /// 全体バイト数が分かれば進捗の割合表示に使う（不明なら None）。
-async fn open_source(src: &ImportSource) -> anyhow::Result<(ByteSource, Option<u64>)> {
+/// 内容識別子は再開チェックポイントの同一性検証用。File は署名側で len+mtime を
+/// 使うため None。GCS は世代(x-goog-generation)とサイズを返す。
+async fn open_source(
+    src: &ImportSource,
+) -> anyhow::Result<(ByteSource, Option<u64>, Option<String>)> {
     match src {
         ImportSource::File(p) => {
             let f = tokio::fs::File::open(p).await?;
             let total = f.metadata().await.ok().map(|m| m.len());
-            Ok((ByteSource::File(f), total))
+            Ok((ByteSource::File(f), total, None))
         }
         ImportSource::Gcs(uri) => {
             let resp = gcs_get_stream(uri).await?;
             let total = resp.content_length();
-            Ok((ByteSource::Gcs(resp), total))
+            let generation = resp
+                .headers()
+                .get("x-goog-generation")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let identity = format!("gen={generation}:len={}", total.unwrap_or(0));
+            Ok((ByteSource::Gcs(resp), total, Some(identity)))
         }
     }
 }
@@ -1895,13 +1918,19 @@ async fn write_groups(
     let mut ok: HashSet<usize> = HashSet::new();
     let mut group_err = None;
     while let Some(r) = stream.message().await? {
-        let is_ok = r.status.as_ref().map(|s| s.code == 0).unwrap_or(false);
-        if is_ok {
+        let code = r.status.as_ref().map(|s| s.code).unwrap_or(0);
+        if code == 0 {
             ok.extend(r.indexes.iter().map(|i| *i as usize));
+        } else if is_retryable_code(code) {
+            // 一過性のグループ失敗（ABORTED 等）は、RPC エラーとして返して
+            // 既存の全体リトライ（冪等な上書き再送）に載せる。黙って捨てない。
+            let msg = r.status.map(|s| s.message).unwrap_or_default();
+            return Err(google_cloud_gax::grpc::Status::new(
+                google_cloud_gax::grpc::Code::from(code),
+                msg,
+            ));
         } else if group_err.is_none() {
-            if let Some(s) = &r.status {
-                group_err = Some(format!("group 失敗: {}", s.message));
-            }
+            group_err = r.status.map(|s| format!("group 失敗: {}", s.message));
         }
     }
     Ok((ok, group_err))
@@ -1914,6 +1943,13 @@ fn is_retryable(status: &google_cloud_gax::grpc::Status) -> bool {
         status.code(),
         Code::Unavailable | Code::Aborted | Code::DeadlineExceeded | Code::ResourceExhausted
     )
+}
+
+/// 一過性（リトライ可）の gRPC コード（数値）か。BatchWrite のグループ別 status は
+/// google.rpc.Status の i32 コードで返るため、こちらで判定する。
+/// DEADLINE_EXCEEDED=4, RESOURCE_EXHAUSTED=8, ABORTED=10, UNAVAILABLE=14。
+fn is_retryable_code(code: i32) -> bool {
+    matches!(code, 4 | 8 | 10 | 14)
 }
 
 /// リトライ回数の上限と、attempt(1始まり)・ワーカー名からのバックオフ待ち時間。
@@ -2740,6 +2776,23 @@ mod tests {
             Code::FailedPrecondition,
         ] {
             assert!(!is_retryable(&Status::new(c, "x")), "{c:?} must not retry");
+        }
+        // グループ別 status の i32 コード判定が、Status 版と一致すること。
+        for c in [
+            Code::Unavailable,
+            Code::Aborted,
+            Code::DeadlineExceeded,
+            Code::ResourceExhausted,
+            Code::InvalidArgument,
+            Code::NotFound,
+            Code::AlreadyExists,
+        ] {
+            let code_i32 = Status::new(c, "x").code() as i32;
+            assert_eq!(
+                is_retryable_code(code_i32),
+                is_retryable(&Status::new(c, "x")),
+                "{c:?} の i32 判定が一致するべき"
+            );
         }
     }
 
