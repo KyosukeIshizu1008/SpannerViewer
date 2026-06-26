@@ -3951,7 +3951,6 @@ impl MonitorApp {
         // カスケード選択の操作（借用解消後に適用）
         let mut do_load_projects = false;
         let mut do_load_instances: Option<String> = None;
-        let mut do_load_databases: Option<(String, String)> = None;
         let mut do_apply_pick = false;
         egui::Window::new("設定")
             .open(&mut open)
@@ -4004,53 +4003,14 @@ impl MonitorApp {
                             }
                         }
                     });
-                // ② インスタンス
-                ui.add_enabled_ui(!self.pick_project.is_empty(), |ui| {
-                    egui::ComboBox::from_id_salt("pick_instance")
-                        .selected_text(if self.pick_instance.is_empty() {
-                            "インスタンス…".to_string()
-                        } else {
-                            self.pick_instance.clone()
-                        })
-                        .width(260.0)
-                        .show_ui(ui, |ui| {
-                            let proj = self.pick_project.clone();
-                            for inst in &self.pick_instances {
-                                if ui
-                                    .selectable_value(&mut self.pick_instance, inst.clone(), inst)
-                                    .clicked()
-                                {
-                                    self.pick_database.clear();
-                                    self.pick_databases.clear();
-                                    do_load_databases = Some((proj.clone(), inst.clone()));
-                                }
-                            }
-                        });
-                });
-                // ③ データベース
-                ui.add_enabled_ui(!self.pick_instance.is_empty(), |ui| {
-                    egui::ComboBox::from_id_salt("pick_database")
-                        .selected_text(if self.pick_database.is_empty() {
-                            "データベース…".to_string()
-                        } else {
-                            self.pick_database.clone()
-                        })
-                        .width(260.0)
-                        .show_ui(ui, |ui| {
-                            for db in &self.pick_databases {
-                                ui.selectable_value(&mut self.pick_database, db.clone(), db);
-                            }
-                        });
-                });
-                let ready = !self.pick_project.is_empty()
-                    && !self.pick_instance.is_empty()
-                    && !self.pick_database.is_empty();
-                if ui
-                    .add_enabled(ready, egui::Button::new("この接続に切り替える"))
-                    .clicked()
-                {
-                    do_apply_pick = true;
-                }
+                // インスタンス／DB はトップバーで切り替える（ここでは選ばない）。
+                ui.label(
+                    egui::RichText::new(
+                        "インスタンスとデータベースは、上のツールバーで切り替えます。",
+                    )
+                    .color(MUTED)
+                    .small(),
+                );
                 if let Some(e) = &self.pick_error {
                     ui.colored_label(egui::Color32::from_rgb(248, 113, 113), e);
                 }
@@ -4258,9 +4218,6 @@ impl MonitorApp {
         }
         if let Some(project) = do_load_instances {
             self.load_instances(ctx, project);
-        }
-        if let Some((project, instance)) = do_load_databases {
-            self.load_databases(ctx, project, instance);
         }
         if do_apply_pick {
             self.apply_picked_connection();
