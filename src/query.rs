@@ -1173,6 +1173,8 @@ async fn run_streaming_import(
 
     // 共有状態。
     let written = Arc::new(AtomicUsize::new(0));
+    // CSV の期待列数（ヘッダ幅 / 先頭データ行）。プロデューサが設定しワーカーが参照する。
+    let expected_cols = Arc::new(AtomicUsize::new(0));
     let bytes_done = Arc::new(AtomicU64::new(0)); // 読み出した累積バイト数（進捗用）
     let abort = Arc::new(AtomicBool::new(false));
     let first_error: Arc<tokio::sync::Mutex<Option<String>>> =
@@ -1202,6 +1204,7 @@ async fn run_streaming_import(
         let ckpt = ckpt.clone();
         let reject = reject.clone();
         let skipped = skipped.clone();
+        let expected_cols = expected_cols.clone();
         workers.push(tokio::spawn(async move {
             loop {
                 let item = { rx.lock().await.recv().await };
@@ -1215,8 +1218,9 @@ async fn run_streaming_import(
                 let mut groups = Vec::with_capacity(rows.len());
                 let mut kept: Vec<&Vec<String>> = Vec::with_capacity(rows.len());
                 let mut conv_err = None;
+                let exp = expected_cols.load(Ordering::Relaxed);
                 for (off, row) in rows.iter().enumerate() {
-                    match build_mutation(&req, row) {
+                    match check_row_width(row, exp).and_then(|_| build_mutation(&req, row)) {
                         Ok(m) => {
                             groups.push(MutationGroup { mutations: vec![m] });
                             kept.push(row);
@@ -1373,8 +1377,12 @@ async fn run_streaming_import(
         for rec in recs.drain(..) {
             if !header_skipped {
                 header_skipped = true;
+                expected_cols.store(rec.len(), Ordering::Relaxed);
                 continue;
             }
+            // ヘッダ無しのときは先頭データ行の列数を期待値にする（既定値 0 のときだけ）。
+            let _ =
+                expected_cols.compare_exchange(0, rec.len(), Ordering::Relaxed, Ordering::Relaxed);
             if batch.is_empty() {
                 start_line = next_line;
             }
@@ -1406,8 +1414,12 @@ async fn run_streaming_import(
         for rec in recs.drain(..) {
             if !header_skipped {
                 header_skipped = true;
+                expected_cols.store(rec.len(), Ordering::Relaxed);
                 continue;
             }
+            // ヘッダ無しのときは先頭データ行の列数を期待値にする（既定値 0 のときだけ）。
+            let _ =
+                expected_cols.compare_exchange(0, rec.len(), Ordering::Relaxed, Ordering::Relaxed);
             if batch.is_empty() {
                 start_line = next_line;
             }
@@ -1482,6 +1494,7 @@ async fn dry_run_import(
     let mut total = 0usize; // データ行数
     let mut valid = 0usize; // 書き込めると判定した行数
     let mut skipped = 0usize; // 型エラー行数
+    let mut expected_cols = 0usize; // 期待列数（ヘッダ幅 / 先頭データ行）
     let mut bytes_done: u64 = 0;
     let mut first_chunk = true;
     let mut error: Option<String> = None;
@@ -1518,10 +1531,14 @@ async fn dry_run_import(
         for rec in recs.drain(..) {
             if !header_skipped {
                 header_skipped = true;
+                expected_cols = rec.len();
                 continue;
             }
+            if expected_cols == 0 {
+                expected_cols = rec.len();
+            }
             total += 1;
-            match build_mutation(req, &rec) {
+            match check_row_width(&rec, expected_cols).and_then(|_| build_mutation(req, &rec)) {
                 Ok(_) => valid += 1,
                 Err(e) => {
                     skipped += 1;
@@ -1540,10 +1557,14 @@ async fn dry_run_import(
         for rec in recs.drain(..) {
             if !header_skipped {
                 header_skipped = true;
+                expected_cols = rec.len();
                 continue;
             }
+            if expected_cols == 0 {
+                expected_cols = rec.len();
+            }
             total += 1;
-            match build_mutation(req, &rec) {
+            match check_row_width(&rec, expected_cols).and_then(|_| build_mutation(req, &rec)) {
                 Ok(_) => valid += 1,
                 Err(e) => {
                     skipped += 1;
@@ -1927,6 +1948,21 @@ async fn delete_session(
 }
 
 /// CSV の 1 行を、列の型に合わせた 1 ミューテーションに変換する（req.mode を使う）。
+/// 行の列数が期待値（ヘッダ幅 / 先頭データ行の列数）と一致するか検証する。
+/// expected==0（未確定）なら検査しない。区切り/引用符のズレで列がずれた壊れた行を
+/// 黙って NULL 埋め・切り捨てせずに弾くためのもの。
+fn check_row_width(rec: &[String], expected: usize) -> Result<(), String> {
+    if expected != 0 && rec.len() != expected {
+        Err(format!(
+            "列数が一致しません（期待 {} 列, 実際 {} 列）。区切り文字や引用符のズレの可能性があります",
+            expected,
+            rec.len()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn build_mutation(
     req: &ImportRequest,
     row: &[String],
@@ -3089,24 +3125,23 @@ mod tests {
         assert_eq!(rows, vec![vec!["1", "alice"], vec!["2", "bob"]]);
     }
 
-    /// 【観察用】CSV の列数がマッピング列数より少ない（短い）行を strict モードで
-    /// 取り込んだとき、現状どう振る舞うかを実測する（emulator 前提）。
+    /// strict（skip_bad_rows=false）では、列数が一致しない行でエラーになり
+    /// 書き込まれない（黙って NULL 埋めしない）（emulator 前提）。
     #[tokio::test]
-    async fn observe_short_row_behavior() {
+    async fn streaming_import_rejects_mismatched_cols_strict() {
         let Some(_) = emulator_db() else {
             eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
             return;
         };
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let _g = EMU_LOCK.lock().await;
-        let table = "ImportShortRow";
+        let table = "ImportMismatchStrict";
         create_import_table_named(table).await;
         let client = client().await;
 
-        // 3 列（Id,Name,Score）にマップ。2 行目はフィールドが 1 個しかない短い行。
-        // 3 行目はフィールドが多すぎる行。strict（skip_bad_rows=false）で実行。
-        let csv = "Id,Name,Score\n1,alice,9.5\n2\n3,carol,7.0,EXTRA,XX\n";
-        let path = write_temp_csv("shortrow", csv);
+        // 3 列（Id,Name,Score）にマップ。2 行目はフィールドが 1 個だけの短い行。
+        let csv = "Id,Name,Score\n1,alice,9.5\n2\n";
+        let path = write_temp_csv("mismatch_strict", csv);
         let req = ImportRequest {
             table: table.into(),
             columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)"), ("Score", "FLOAT64")]),
@@ -3124,17 +3159,59 @@ mod tests {
         };
         let (ptx, _prx) = std::sync::mpsc::channel::<ImportProgress>();
         let out = run_streaming_import(&test_env(), &req, false, &ptx).await;
-        eprintln!(
-            "[observe] written={} total={} skipped={} error={:?}",
-            out.written, out.total, out.skipped, out.error
+        assert!(
+            out.error.as_deref().is_some_and(|e| e.contains("列数")),
+            "列数不一致でエラーになるべき: {:?}",
+            out.error
         );
-        let (_, rows, _) = try_query(
-            &client,
-            &format!("SELECT Id, Name, Name IS NULL, Score FROM {table} ORDER BY Id"),
-        )
-        .await
-        .unwrap();
-        eprintln!("[observe] rows in DB = {rows:?}");
+        // 不正行を含むバッチは書かれない（黙って NULL 埋めしない）。
+        let (_, rows, _) = try_query(&client, &format!("SELECT Id FROM {table} ORDER BY Id"))
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "不正バッチは書き込まれないはず: {rows:?}");
+    }
+
+    /// skip_bad_rows=true では、列数が一致しない行（短い/長い）はスキップされ、
+    /// 正しい行だけが書き込まれる（emulator 前提）。
+    #[tokio::test]
+    async fn streaming_import_skips_mismatched_cols() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _g = EMU_LOCK.lock().await;
+        let table = "ImportMismatchSkip";
+        create_import_table_named(table).await;
+        let client = client().await;
+
+        // 行2=短い, 行3=長すぎる, 行1/行4=正しい。
+        let csv = "Id,Name,Score\n1,alice,9.5\n2\n3,carol,7.0,EXTRA\n4,dave,8.0\n";
+        let path = write_temp_csv("mismatch_skip", csv);
+        let req = ImportRequest {
+            table: table.into(),
+            columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)"), ("Score", "FLOAT64")]),
+            source: ImportSource::File(path),
+            has_header: true,
+            mode: ImportMode::Insert,
+            empty_as_null: true,
+            fresh: false,
+            encoding: Encoding::Utf8,
+            delimiter: b',',
+            skip_bad_rows: true,
+            dry_run: false,
+            null_token: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (ptx, _prx) = std::sync::mpsc::channel::<ImportProgress>();
+        let out = run_streaming_import(&test_env(), &req, false, &ptx).await;
+        assert_eq!(out.error, None, "skip なのでエラーにしない: {:?}", out.error);
+        assert_eq!(out.written, 2, "正しい 2 行だけ書き込む");
+        assert_eq!(out.skipped, 2, "不正な 2 行はスキップ");
+        let (_, rows, _) = try_query(&client, &format!("SELECT Id FROM {table} ORDER BY Id"))
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![vec!["1"], vec!["4"]], "正しい行のみ残る");
     }
 
     /// 空欄を NULL にしない設定では空文字列として書き込む（emulator 前提）。

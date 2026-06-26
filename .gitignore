@@ -1,3 +1,4 @@
 /target
 .env
 schema_layout.json
+.claude/worktrees/
