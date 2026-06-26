@@ -1400,7 +1400,9 @@ impl MonitorApp {
 }
 
 impl eframe::App for MonitorApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx_owned = ui.ctx().clone();
+        let ctx = &ctx_owned;
         self.drain();
         self.drain_screenshot(ctx);
         self.check_login_state(ctx);
@@ -1412,15 +1414,15 @@ impl eframe::App for MonitorApp {
         }
 
         // VS Code 風の左アクティビティバー
-        egui::SidePanel::left("activity")
-            .exact_width(54.0)
+        egui::Panel::left("activity")
+            .exact_size(54.0)
             .resizable(false)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(BASE)
                     .stroke(egui::Stroke::new(1.0, BORDER)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 self.activity_bar(ui);
             });
 
@@ -1430,7 +1432,7 @@ impl eframe::App for MonitorApp {
         let mut tb_load_instances: Option<String> = None;
         let mut tb_load_databases: Option<(String, String)> = None;
         let mut tb_apply = false;
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+        egui::Panel::top("tabs").show(ui, |ui| {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.add_space(4.0);
@@ -1689,16 +1691,16 @@ impl eframe::App for MonitorApp {
 
         match self.section {
             Section::Spanner => match self.view {
-                View::Schema => self.schema_view(ctx),
-                View::Monitor => self.monitor_view(ctx),
-                View::Data => self.data_view(ctx),
-                View::Import => self.import_view(ctx),
+                View::Schema => self.schema_view(ui),
+                View::Monitor => self.monitor_view(ui),
+                View::Data => self.data_view(ui),
+                View::Import => self.import_view(ui),
             },
             Section::Kube => match self.kube_view {
-                KubeView::Monitor => self.kube_monitor_view(ctx),
-                KubeView::Resources => self.kube_resource_view(ctx),
-                KubeView::Diagram => self.kube_diagram_view(ctx),
-                KubeView::Events => self.kube_events_view(ctx),
+                KubeView::Monitor => self.kube_monitor_view(ui),
+                KubeView::Resources => self.kube_resource_view(ui),
+                KubeView::Diagram => self.kube_diagram_view(ui),
+                KubeView::Events => self.kube_events_view(ui),
             },
         }
 
@@ -1743,8 +1745,8 @@ impl MonitorApp {
         });
     }
 
-    fn monitor_view(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("status").show(ctx, |ui| {
+    fn monitor_view(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("status").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if let Some(s) = self.latest_ok() {
@@ -1780,7 +1782,7 @@ impl MonitorApp {
             ui.add_space(6.0);
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default_margins().show(ui, |ui| {
             let t0 = self
                 .samples
                 .iter()
@@ -1810,8 +1812,7 @@ impl MonitorApp {
                 .allow_boxed_zoom(false)
                 .show(ui, |pui| {
                     pui.line(
-                        Line::new(cpu)
-                            .name("CPU %")
+                        Line::new("CPU %", cpu)
                             .color(CPU_COLOR)
                             .width(1.8)
                             .fill(0.0),
@@ -1842,8 +1843,7 @@ impl MonitorApp {
                 .allow_boxed_zoom(false)
                 .show(ui, |pui| {
                     pui.line(
-                        Line::new(storage_pct)
-                            .name("Storage %")
+                        Line::new("Storage %", storage_pct)
                             .color(STORAGE_COLOR)
                             .width(1.8)
                             .fill(0.0),
@@ -1852,7 +1852,7 @@ impl MonitorApp {
         });
     }
 
-    fn data_view(&mut self, ctx: &egui::Context) {
+    fn data_view(&mut self, ui: &mut egui::Ui) {
         // 実行したい SQL（ツリー/履歴クリックで設定し、借用解消後に実行）
         let mut load_run: Option<String> = None;
         let mut ddl_copy: Option<String> = None;
@@ -1861,10 +1861,10 @@ impl MonitorApp {
         let mut gcs_open: Option<TableNode> = None;
 
         // 左: オブジェクトツリー
-        egui::SidePanel::left("db_objects")
-            .default_width(240.0)
-            .width_range(160.0..=420.0)
-            .show(ctx, |ui| {
+        egui::Panel::left("db_objects")
+            .default_size(240.0)
+            .size_range(160.0..=420.0)
+            .show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("データベース").strong());
@@ -1938,23 +1938,23 @@ impl MonitorApp {
                                 if ui.button("SELECT * を実行").clicked() {
                                     load_run =
                                         Some(format!("SELECT * FROM `{}` LIMIT 100", node.name));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui.button("CSV をインポート…").clicked() {
                                     import_open = Some(node.clone());
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui.button("GCS から CSV をインポート…").clicked() {
                                     gcs_open = Some(node.clone());
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui.button("テーブル名をコピー").clicked() {
                                     ui.ctx().copy_text(node.name.clone());
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui.button("DDL をコピー").clicked() {
                                     ddl_copy = Some(build_ddl(node));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             });
                             if expanded {
@@ -2001,7 +2001,7 @@ impl MonitorApp {
             });
 
         // 上: SQL エディタ + 実行 / 選択実行 / 履歴
-        egui::TopBottomPanel::top("query_bar").show(ctx, |ui| {
+        egui::Panel::top("query_bar").show(ui, |ui| {
             ui.add_space(6.0);
             let output = egui::TextEdit::multiline(&mut self.sql)
                 .desired_rows(3)
@@ -2010,10 +2010,9 @@ impl MonitorApp {
                 .show(ui);
             // 選択範囲（あれば）を取り出す
             let selected: Option<String> = output.cursor_range.and_then(|cr| {
-                let [a, b] = cr.sorted_cursors();
-                let (s, e) = (a.ccursor.index, b.ccursor.index);
-                if e > s {
-                    Some(self.sql.chars().skip(s).take(e - s).collect())
+                let s = cr.slice_str(&self.sql);
+                if !s.is_empty() {
+                    Some(s.to_string())
                 } else {
                     None
                 }
@@ -2058,7 +2057,7 @@ impl MonitorApp {
         // 中央: 強化グリッド
         let mut new_sort: Option<Option<(usize, bool)>> = None;
         let mut save_msg: Option<String> = None;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default_margins().show(ui, |ui| {
             let Some(result) = &self.data_result else {
                 centered_hint(ui, "SQL を入力して「実行」を押してください");
                 return;
@@ -2120,7 +2119,7 @@ impl MonitorApp {
             self.copy_note = Some(m);
         }
         if let Some(ddl) = ddl_copy {
-            ctx.copy_text(ddl);
+            ui.ctx().copy_text(ddl);
             self.copy_note = Some("DDL をコピーしました".into());
         }
         if let Some(node) = import_open {
@@ -2530,7 +2529,7 @@ impl MonitorApp {
     }
 
     /// 専用「インポート」タブ。テーブル選択 → ソース選択 → マッピング/進捗をインライン表示。
-    fn import_view(&mut self, ctx: &egui::Context) {
+    fn import_view(&mut self, ui: &mut egui::Ui) {
         let mut open_local: Option<TableNode> = None;
         let mut open_gcs: Option<TableNode> = None;
         // ジョブ一覧の操作（借用解消後に適用）。
@@ -2546,7 +2545,7 @@ impl MonitorApp {
             .map(|g| g.nodes.clone())
             .unwrap_or_default();
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default_margins().show(ui, |ui| {
             // マッピング/取込中は本体をインライン描画。
             if self.import_dialog.is_some() {
                 self.import_dialog_body(ui);
@@ -2650,10 +2649,10 @@ impl MonitorApp {
                                     ("中断", egui::Color32::from_rgb(251, 191, 36))
                                 }
                             };
-                            egui::Frame::none()
+                            egui::Frame::NONE
                                 .fill(ELEVATED)
-                                .rounding(egui::Rounding::same(6.0))
-                                .inner_margin(egui::Margin::same(8.0))
+                                .corner_radius(egui::CornerRadius::same(6))
+                                .inner_margin(egui::Margin::same(8))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.label(egui::RichText::new(badge).color(color).strong());
@@ -2778,7 +2777,7 @@ impl MonitorApp {
             self.import_jobs.retain(|j| j.is_active());
         }
         if do_report {
-            self.export_import_report(ctx);
+            self.export_import_report(ui.ctx());
         }
     }
 
@@ -2811,7 +2810,7 @@ impl MonitorApp {
         let _ = std::fs::write(dir.join("report.csv"), csv);
         // スクショは次フレームで Event::Screenshot として届く。届いたら同フォルダへ保存。
         self.pending_report_dir = Some(dir.clone());
-        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         self.copy_note = Some(format!("レポートを出力中…: {}", dir.display()));
     }
 
@@ -3100,8 +3099,8 @@ impl MonitorApp {
 
     // ── Kubernetes ビュー ──
 
-    fn kube_monitor_view(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("kube_status").show(ctx, |ui| {
+    fn kube_monitor_view(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("kube_status").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Kubernetes 監視").strong());
@@ -3134,7 +3133,7 @@ impl MonitorApp {
         let mut action_req: Option<k8s::ActionReq> = None;
         let mut confirm_req: Option<(String, k8s::ActionReq)> = None;
         let ns_sel = self.kube_ns.clone(); // 選択中 namespace（空 = 全て）
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default_margins().show(ui, |ui| {
             let Some(m) = &self.kube_metrics else {
                 centered_hint(ui, "kubectl から取得中…");
                 return;
@@ -3366,8 +3365,8 @@ impl MonitorApp {
         }
     }
 
-    fn kube_events_view(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("kube_ev_bar").show(ctx, |ui| {
+    fn kube_events_view(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("kube_ev_bar").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("クラスタイベント").strong());
@@ -3395,7 +3394,7 @@ impl MonitorApp {
             ui.add_space(6.0);
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default_margins().show(ui, |ui| {
             let Some(r) = &self.kube_events else {
                 centered_hint(ui, "取得中…");
                 return;
@@ -3437,9 +3436,9 @@ impl MonitorApp {
     }
 
     /// 汎用リソースブラウザ。種別を選んで一覧 → 行ごとに YAML/describe/削除/scale/restart/ログ。
-    fn kube_resource_view(&mut self, ctx: &egui::Context) {
+    fn kube_resource_view(&mut self, ui: &mut egui::Ui) {
         // 上部コントロール（種別・namespace・検索・更新）
-        egui::TopBottomPanel::top("kube_res_bar").show(ctx, |ui| {
+        egui::Panel::top("kube_res_bar").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("リソース").strong());
@@ -3500,7 +3499,7 @@ impl MonitorApp {
         let mut action: Option<RowAction> = None;
         let red = egui::Color32::from_rgb(248, 113, 113);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default_margins().show(ui, |ui| {
             let Some(list) = &self.res_list else {
                 centered_hint(ui, "取得中…");
                 return;
@@ -3607,24 +3606,24 @@ impl MonitorApp {
                                     if ui.button("YAML を表示").clicked() {
                                         action =
                                             Some(RowAction::Yaml(ns_opt.clone(), name.clone()));
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                     if ui.button("describe").clicked() {
                                         action =
                                             Some(RowAction::Describe(ns_opt.clone(), name.clone()));
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                     if ui.button("YAML を編集").clicked() {
                                         action =
                                             Some(RowAction::EditYaml(ns_opt.clone(), name.clone()));
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                     if kind == "pods" && ui.button("ログを追従").clicked() {
                                         action = Some(RowAction::Logs(
                                             row.namespace.clone(),
                                             name.clone(),
                                         ));
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                     if kind == "pods" && ui.button("コマンド実行 (exec)").clicked()
                                     {
@@ -3632,7 +3631,7 @@ impl MonitorApp {
                                             row.namespace.clone(),
                                             name.clone(),
                                         ));
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                     if matches!(kind.as_str(), "pods" | "services")
                                         && ui.button("port-forward").clicked()
@@ -3642,14 +3641,14 @@ impl MonitorApp {
                                             row.namespace.clone(),
                                             format!("{prefix}/{name}"),
                                         ));
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                     if is_restartable(&kind)
                                         && ui.button("再起動 (rollout restart)").clicked()
                                     {
                                         action =
                                             Some(RowAction::Restart(ns_opt.clone(), name.clone()));
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                     if is_scalable(&kind) {
                                         ui.menu_button("スケール", |ui| {
@@ -3661,7 +3660,7 @@ impl MonitorApp {
                                                         name.clone(),
                                                         n,
                                                     ));
-                                                    ui.close_menu();
+                                                    ui.close();
                                                 }
                                             }
                                         });
@@ -3671,7 +3670,7 @@ impl MonitorApp {
                                     {
                                         action =
                                             Some(RowAction::Delete(ns_opt.clone(), name.clone()));
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                 });
                                 if resp.clicked() {
@@ -4353,10 +4352,11 @@ impl MonitorApp {
                 };
                 let mut text = shown;
 
-                let mut highlighter = |ui: &egui::Ui, s: &str, wrap_width: f32| {
-                    let job = highlight_job(s, &query, wrap_width);
-                    ui.fonts(|f| f.layout_job(job))
-                };
+                let mut highlighter =
+                    |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                        let job = highlight_job(buf.as_str(), &query, wrap_width);
+                        ui.fonts_mut(|f| f.layout_job(job))
+                    };
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .stick_to_bottom(self.kube_log_following && query.is_empty())
@@ -4373,8 +4373,8 @@ impl MonitorApp {
         self.kube_log_open = open;
     }
 
-    fn kube_diagram_view(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("kube_topo_bar").show(ctx, |ui| {
+    fn kube_diagram_view(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("kube_topo_bar").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("クラスタ構成図").strong());
@@ -4422,13 +4422,13 @@ impl MonitorApp {
             ..
         } = self;
         let g = kube_graph.as_ref();
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default_margins().show(ui, |ui| {
             draw_topology(ui, g, kube_pan, kube_zoom, kube_selected);
         });
     }
 
-    fn schema_view(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("schema_bar").show(ctx, |ui| {
+    fn schema_view(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("schema_bar").show(ui, |ui| {
             ui.add_space(6.0);
             // 1行目: 操作ボタン
             ui.horizontal(|ui| {
@@ -4505,7 +4505,7 @@ impl MonitorApp {
             ..
         } = self;
         let g = schema_graph.as_ref();
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default_margins().show(ui, |ui| {
             Self::draw_graph(
                 ui,
                 g,
@@ -4560,7 +4560,7 @@ impl MonitorApp {
             *selected = None;
         }
         if bg.hovered() {
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll != 0.0 {
                 let factor = (1.0 + scroll * 0.0015).clamp(0.85, 1.18);
                 *diagram_zoom = (*diagram_zoom * factor).clamp(0.3, 3.0);
@@ -4577,7 +4577,7 @@ impl MonitorApp {
             } else {
                 egui::FontId::proportional(size)
             };
-            ui.fonts(|f| {
+            ui.fonts_mut(|f| {
                 f.layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE)
                     .size()
                     .x
@@ -4716,14 +4716,14 @@ impl MonitorApp {
             let pc = painter.with_clip_rect(screen.intersect(rect));
 
             // 背景 + 枠（角丸なしのシャープな矩形。ER 図らしい見た目）
-            let rounding = egui::Rounding::ZERO;
+            let rounding = egui::CornerRadius::ZERO;
             painter.rect_filled(screen, rounding, dim(ELEVATED));
             let border = if is_sel {
                 egui::Stroke::new(2.0, ACCENT)
             } else {
                 egui::Stroke::new(1.0, dim(BORDER))
             };
-            painter.rect_stroke(screen, rounding, border);
+            painter.rect_stroke(screen, rounding, border, egui::StrokeKind::Middle);
 
             // ヘッダ（ドラッグハンドル + 選択 + 右クリックメニュー）
             let header = egui::Rect::from_min_max(
@@ -4769,18 +4769,18 @@ impl MonitorApp {
                 if ui.button("テーブル名をコピー").clicked() {
                     ui.ctx().copy_text(name.clone());
                     *copy_note = Some(copied(&name));
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("カラム一覧をコピー").clicked() {
                     ui.ctx().copy_text(cols_joined.clone());
                     *copy_note = Some(format!("コピー: {name} のカラム"));
-                    ui.close_menu();
+                    ui.close();
                 }
                 if !idx_joined.is_empty() && ui.button("インデックス一覧をコピー").clicked()
                 {
                     ui.ctx().copy_text(idx_joined.clone());
                     *copy_note = Some(format!("コピー: {name} のインデックス"));
-                    ui.close_menu();
+                    ui.close();
                 }
             });
 
@@ -5412,7 +5412,7 @@ fn draw_topology(
         *selected = None;
     }
     if bg.hovered() {
-        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll != 0.0 {
             let f = (1.0 + scroll * 0.0015).clamp(0.85, 1.18);
             *zoom = (*zoom * f).clamp(0.3, 3.0);
@@ -5533,7 +5533,7 @@ fn draw_topology(
     let tf = |p: egui::Pos2| origin + (p.to_vec2() * z);
     let tr = |r: egui::Rect| egui::Rect::from_min_max(tf(r.min), tf(r.max));
     let fs = |s: f32| (s * zt).max(6.0);
-    let round = |r: f32| egui::Rounding::same(r * z);
+    let round = |r: f32| egui::CornerRadius::same((r * z) as u8);
 
     // 選択 Pod（"ns/name"）に関係する通信だけ強調するための集合
     let sel = selected.clone();
@@ -5541,7 +5541,7 @@ fn draw_topology(
     // Cluster
     let clr = tr(cluster);
     painter.rect_filled(clr, round(10.0), egui::Color32::from_rgb(24, 33, 48));
-    painter.rect_stroke(clr, round(10.0), egui::Stroke::new(1.5, ACCENT));
+    painter.rect_stroke(clr, round(10.0), egui::Stroke::new(1.5, ACCENT), egui::StrokeKind::Middle);
     painter.text(
         clr.left_top() + egui::vec2(12.0 * z, (cl_head * 0.5) * z),
         egui::Align2::LEFT_CENTER,
@@ -5559,6 +5559,7 @@ fn draw_topology(
             r,
             round(8.0),
             egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.7)),
+            egui::StrokeKind::Middle,
         );
         pc.text(
             r.left_top() + egui::vec2(10.0 * z, (node_head * 0.5) * z),
@@ -5584,7 +5585,7 @@ fn draw_topology(
         } else {
             egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.5))
         };
-        painter.rect_stroke(r, round(6.0), border);
+        painter.rect_stroke(r, round(6.0), border, egui::StrokeKind::Middle);
         // ヘッダ（Pod 名）＋クリック判定
         let header = egui::Rect::from_min_max(r.min, egui::pos2(r.max.x, r.min.y + pod_head * z));
         pc.text(
@@ -5629,7 +5630,7 @@ fn draw_topology(
                 egui::vec2(cw * z, ch * z),
             );
             pc.rect_filled(crect, round(4.0), egui::Color32::from_rgb(226, 232, 240));
-            pc.rect_stroke(crect, round(4.0), egui::Stroke::new(1.0, BORDER));
+            pc.rect_stroke(crect, round(4.0), egui::Stroke::new(1.0, BORDER), egui::StrokeKind::Middle);
             let label = if c.init {
                 format!("{} (init)", c.name)
             } else {
@@ -5671,7 +5672,7 @@ fn draw_topology(
             egui::Color32::from_rgb(20, 60, 50).gamma_multiply(0.4)
         };
         painter.rect_filled(r, round(6.0), svc_fill);
-        painter.rect_stroke(r, round(6.0), egui::Stroke::new(1.0, COMM_COLOR));
+        painter.rect_stroke(r, round(6.0), egui::Stroke::new(1.0, COMM_COLOR), egui::StrokeKind::Middle);
         painter.with_clip_rect(r.intersect(rect)).text(
             r.center(),
             egui::Align2::CENTER_CENTER,
@@ -5838,7 +5839,7 @@ fn data_result_grid(
                         resp.context_menu(|ui| {
                             if ui.button("列名をコピー").clicked() {
                                 ui.ctx().copy_text(result.columns[col_idx].clone());
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.button("列の値をコピー").clicked() {
                                 let vals: Vec<String> = order
@@ -5848,7 +5849,7 @@ fn data_result_grid(
                                     })
                                     .collect();
                                 ui.ctx().copy_text(vals.join("\n"));
-                                ui.close_menu();
+                                ui.close();
                             }
                         });
                     }
@@ -5878,11 +5879,11 @@ fn data_result_grid(
                             resp.context_menu(|ui| {
                                 if ui.button("セルをコピー").clicked() {
                                     ui.ctx().copy_text(cell.clone());
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui.button("行をコピー (TSV)").clicked() {
                                     ui.ctx().copy_text(row.join("\t"));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             });
                         }
@@ -6049,7 +6050,7 @@ const ROW_ALT: egui::Color32 = egui::Color32::from_rgb(27, 30, 37); // 縞模様
 
 fn setup_style(ctx: &egui::Context) {
     use egui::FontFamily::{Monospace, Proportional};
-    use egui::{FontId, Rounding, Stroke, TextStyle};
+    use egui::{CornerRadius, FontId, Stroke, TextStyle};
 
     let mut v = egui::Visuals::dark();
     v.override_text_color = Some(TEXT);
@@ -6064,61 +6065,61 @@ fn setup_style(ctx: &egui::Context) {
     v.selection.stroke = Stroke::new(1.0, ACCENT);
 
     // 角丸・影
-    v.window_rounding = Rounding::same(10.0);
-    v.menu_rounding = Rounding::same(8.0);
+    v.window_corner_radius = CornerRadius::same(10);
+    v.menu_corner_radius = CornerRadius::same(8);
     v.window_shadow = egui::epaint::Shadow {
-        offset: egui::vec2(0.0, 6.0),
-        blur: 24.0,
-        spread: 0.0,
+        offset: [0, 6],
+        blur: 24,
+        spread: 0,
         color: egui::Color32::from_black_alpha(110),
     };
     v.popup_shadow = egui::epaint::Shadow {
-        offset: egui::vec2(0.0, 3.0),
-        blur: 14.0,
-        spread: 0.0,
+        offset: [0, 3],
+        blur: 14,
+        spread: 0,
         color: egui::Color32::from_black_alpha(90),
     };
 
     // ウィジェット状態（フラットで控えめなボーダー、ホバーで浮く）
-    let round = Rounding::same(6.0);
+    let round = CornerRadius::same(6);
     let w = &mut v.widgets;
-    w.noninteractive.rounding = round;
+    w.noninteractive.corner_radius = round;
     w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
     w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
 
-    w.inactive.rounding = round;
+    w.inactive.corner_radius = round;
     w.inactive.weak_bg_fill = egui::Color32::from_rgb(34, 38, 46);
     w.inactive.bg_fill = egui::Color32::from_rgb(34, 38, 46);
     w.inactive.bg_stroke = Stroke::new(1.0, BORDER);
     w.inactive.fg_stroke = Stroke::new(1.0, egui::Color32::from_rgb(205, 211, 222));
 
-    w.hovered.rounding = round;
+    w.hovered.corner_radius = round;
     w.hovered.weak_bg_fill = HOVER;
     w.hovered.bg_fill = HOVER;
     w.hovered.bg_stroke = Stroke::new(1.0, ACCENT.gamma_multiply(0.7));
     w.hovered.fg_stroke = Stroke::new(1.0, TEXT);
     w.hovered.expansion = 1.0;
 
-    w.active.rounding = round;
+    w.active.corner_radius = round;
     w.active.weak_bg_fill = ACCENT.gamma_multiply(0.35);
     w.active.bg_fill = ACCENT.gamma_multiply(0.35);
     w.active.bg_stroke = Stroke::new(1.0, ACCENT);
     w.active.fg_stroke = Stroke::new(1.0, egui::Color32::WHITE);
     w.active.expansion = 1.0;
 
-    w.open.rounding = round;
+    w.open.corner_radius = round;
     w.open.weak_bg_fill = HOVER;
     w.open.bg_stroke = Stroke::new(1.0, BORDER);
 
     ctx.set_visuals(v);
 
-    ctx.style_mut(|s| {
+    ctx.all_styles_mut(|s| {
         // フォントを少し小さく＋余白も合わせて詰める。
         s.spacing.item_spacing = egui::vec2(7.0, 6.0);
         s.spacing.button_padding = egui::vec2(10.0, 6.0);
         s.spacing.interact_size.y = 25.0;
-        s.spacing.window_margin = egui::Margin::same(11.0);
-        s.spacing.menu_margin = egui::Margin::same(8.0);
+        s.spacing.window_margin = egui::Margin::same(11);
+        s.spacing.menu_margin = egui::Margin::same(8);
         s.spacing.scroll.bar_width = 10.0;
         s.spacing.scroll.floating = false;
         s.text_styles = [
@@ -6150,7 +6151,7 @@ fn install_japanese_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts
         .font_data
-        .insert("jp".to_owned(), egui::FontData::from_owned(bytes));
+        .insert("jp".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
     // 既定（英数）フォントの後ろに足すことで、未収録の和文だけ JP フォントが埋める
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts
@@ -6164,10 +6165,10 @@ fn install_japanese_font(ctx: &egui::Context) {
 
 /// ステータスバー用の小さなカラーチップ（ラベル + 値）。
 fn chip(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(ELEVATED)
-        .rounding(egui::Rounding::same(7.0))
-        .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+        .corner_radius(egui::CornerRadius::same(7))
+        .inner_margin(egui::Margin::symmetric(10, 4))
         .show(ui, |ui| {
             ui.label(egui::RichText::new(label).color(MUTED).small());
             ui.label(egui::RichText::new(value).color(color).strong());
@@ -6587,9 +6588,8 @@ mod tests {
         assert!(!cascade::ready("", "", ""));
     }
 
-    /// egui 0.29 標準の Context でヘッドレスにクリックを再現し、project_list_ui が
-    /// クリックされた項目を返すことを確認する（egui_kittest は egui>=0.30 必須で
-    /// 本プロジェクトの 0.29 では使えないため、その代替となる操作テスト）。
+    /// 標準の Context（run_ui）でヘッドレスにクリックを再現し、project_list_ui が
+    /// クリックされた項目を返すことを確認する（egui_kittest を使う版は別テスト）。
     #[test]
     fn project_list_ui_click_returns_item() {
         use egui::{Event, PointerButton, Pos2, Rect};
@@ -6609,8 +6609,8 @@ mod tests {
 
         // パス0: レイアウトして "beta" の矩形（クリック座標）を得る。
         let beta_rect = std::cell::Cell::new(None);
-        let _ = ctx.run(base_input(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(base_input(), |ui| {
+            egui::CentralPanel::default_margins().show(ui, |ui| {
                 for p in &projects {
                     let r = ui.selectable_label(false, p);
                     if p == "beta" {
@@ -6630,8 +6630,8 @@ mod tests {
             pressed: true,
             modifiers: Default::default(),
         });
-        let _ = ctx.run(down, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(down, |ui| {
+            egui::CentralPanel::default_margins().show(ui, |ui| {
                 let _ = project_list_ui(ui, &projects, &selected);
             });
         });
@@ -6645,8 +6645,8 @@ mod tests {
             pressed: false,
             modifiers: Default::default(),
         });
-        let _ = ctx.run(up, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(up, |ui| {
+            egui::CentralPanel::default_margins().show(ui, |ui| {
                 if let Some(p) = project_list_ui(ui, &projects, &selected) {
                     *clicked.borrow_mut() = Some(p);
                 }
@@ -6658,6 +6658,33 @@ mod tests {
             Some("beta"),
             "クリックした項目が返るべき"
         );
+    }
+
+    /// egui_kittest でヘッドレスに描画し、ラベル "beta" をクリックして
+    /// project_list_ui がその項目を返すことを確認する。
+    #[test]
+    fn project_list_ui_kittest_click() {
+        use egui_kittest::kittest::Queryable;
+        use egui_kittest::Harness;
+
+        let projects = vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+        ];
+        let selected = String::new();
+        let clicked: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+
+        let mut harness = Harness::new_ui(|ui| {
+            if let Some(p) = project_list_ui(ui, &projects, &selected) {
+                *clicked.borrow_mut() = Some(p);
+            }
+        });
+
+        harness.get_by_label("beta").click();
+        harness.run();
+
+        assert_eq!(clicked.borrow().as_deref(), Some("beta"));
     }
 
     /// 行数の 3 桁区切り表示。
