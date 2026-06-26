@@ -140,6 +140,9 @@ impl ImportJob {
 struct BulkSpec {
     /// 雛形リクエスト（source を各オブジェクトに差し替えて使う）。
     template: query::ImportRequest,
+    /// 一括投入の対象フォルダ（この一覧応答だけを取り込む。無関係な
+    /// ブラウズ一覧を誤って一括投入しないよう照合に使う）。
+    folder: String,
 }
 
 impl ImportDialog {
@@ -530,6 +533,10 @@ pub struct MonitorApp {
     pick_instance: String,
     pick_database: String,
     pick_error: Option<String>,
+    // 「この親に対して一覧を取得済み」を表すセンチネル。空一覧でも取得済みなら
+    // 再取得ループに入らないようにする（instance/DB が 0 件のプロジェクト対策）。
+    instances_loaded_for: Option<String>,
+    databases_loaded_for: Option<(String, String)>,
     // プロジェクトが大量にある組織向けの絞り込み入力（兼: 一覧に出ない ID の手動指定）。
     pick_project_filter: String,
     // 列挙権限が無く一覧に出ないとき用の手動入力（instance / database）。
@@ -692,6 +699,8 @@ impl MonitorApp {
             pick_instance: init_i,
             pick_database: init_d,
             pick_error: None,
+            instances_loaded_for: None,
+            databases_loaded_for: None,
             section: Section::Spanner,
             view: View::Monitor,
         }
@@ -937,10 +946,14 @@ impl MonitorApp {
             PickMsg::Instances(Ok(v)) => {
                 self.pick_instances = v;
                 self.pick_error = None;
+                // 現在のプロジェクトに対して取得済みと記録（空でも再取得しない）。
+                self.instances_loaded_for = Some(self.pick_project.clone());
             }
             PickMsg::Databases(Ok(v)) => {
                 self.pick_databases = v;
                 self.pick_error = None;
+                self.databases_loaded_for =
+                    Some((self.pick_project.clone(), self.pick_instance.clone()));
             }
             PickMsg::Projects(Err(e))
             | PickMsg::Instances(Err(e))
@@ -1039,7 +1052,14 @@ impl MonitorApp {
                     }
                 },
                 query::GcsResponse::Listed(out) => {
-                    if let Some(bulk) = self.pending_bulk.take() {
+                    // この一覧が一括投入の対象フォルダのものか照合する（無関係な
+                    // ブラウズ一覧を誤って一括投入しないため）。
+                    let listed_loc = format!("gs://{}/{}", out.bucket, out.prefix);
+                    let is_bulk = self
+                        .pending_bulk
+                        .as_ref()
+                        .is_some_and(|b| b.folder == listed_loc);
+                    if let Some(bulk) = if is_bulk { self.pending_bulk.take() } else { None } {
                         // フォルダ一括投入: 直下の *.csv をそれぞれジョブ化。
                         if let Some(e) = out.error {
                             self.copy_note = Some(format!("フォルダ一覧に失敗: {e}"));
@@ -1463,15 +1483,15 @@ impl eframe::App for MonitorApp {
                                 .selected_text(combo_text(&self.pick_database, "DB"))
                                 .width(150.0)
                                 .show_ui(ui, |ui| {
+                                    let db_key =
+                                        (self.pick_project.clone(), self.pick_instance.clone());
                                     if self.pick_databases.is_empty()
                                         && !busy
                                         && !self.pick_project.is_empty()
                                         && !self.pick_instance.is_empty()
+                                        && self.databases_loaded_for.as_ref() != Some(&db_key)
                                     {
-                                        tb_load_databases = Some((
-                                            self.pick_project.clone(),
-                                            self.pick_instance.clone(),
-                                        ));
+                                        tb_load_databases = Some(db_key);
                                         ui.label(
                                             egui::RichText::new("取得中…").color(MUTED).small(),
                                         );
@@ -1492,7 +1512,11 @@ impl eframe::App for MonitorApp {
                                 .width(160.0)
                                 .show_ui(ui, |ui| {
                                     let proj = self.pick_project.clone();
-                                    if self.pick_instances.is_empty() && !busy && !proj.is_empty() {
+                                    if self.pick_instances.is_empty()
+                                        && !busy
+                                        && !proj.is_empty()
+                                        && self.instances_loaded_for.as_deref() != Some(proj.as_str())
+                                    {
                                         tb_load_instances = Some(proj.clone());
                                         ui.label(
                                             egui::RichText::new("取得中…").color(MUTED).small(),
@@ -2335,7 +2359,10 @@ impl MonitorApp {
             Some(i) => uri[..=i].to_string(),
             None => uri.clone(),
         };
-        self.pending_bulk = Some(BulkSpec { template: req });
+        self.pending_bulk = Some(BulkSpec {
+            template: req,
+            folder: folder.clone(),
+        });
         self.import_dialog = None;
         // 同フォルダを一覧する（応答で各 CSV を enqueue）。
         let _ = self.gcs_req_tx.send(query::GcsRequest::List(folder));
@@ -4064,6 +4091,12 @@ impl MonitorApp {
                         self.pick_project = self.pick_project_filter.trim().to_string();
                         self.pick_instance = self.pick_instance_manual.trim().to_string();
                         self.pick_database = self.pick_database_manual.trim().to_string();
+                        // 手動で project/instance を変えたので、トップバーの一覧は
+                        // 古いプロジェクトのものになっている。クリアして取り直させる。
+                        self.pick_instances.clear();
+                        self.pick_databases.clear();
+                        self.instances_loaded_for = None;
+                        self.databases_loaded_for = None;
                         do_apply_pick = true;
                     }
                 });
