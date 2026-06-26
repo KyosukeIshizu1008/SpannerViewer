@@ -113,10 +113,15 @@ pub struct KubeMetrics {
 
 /// ログ取得リクエスト
 #[derive(Clone, Debug)]
-pub struct LogReq {
-    pub ns: String,
-    pub pod: String,
-    pub container: String,
+pub enum LogReq {
+    /// 追従開始。直前のストリームが動いていれば中断してから開始する。
+    Follow {
+        ns: String,
+        pod: String,
+        container: String,
+    },
+    /// 追従停止。in-flight の `kubectl logs -f` を中断する（新規ストリームは開始しない）。
+    Stop,
 }
 
 /// ログのストリーミングイベント。
@@ -594,13 +599,30 @@ async fn pf_run(
 
     let _ = tx.send(PortForwardEvent::Started { id, label });
 
+    // stderr を別タスクで並行排出。長時間転送で stderr のパイプバッファが埋まると
+    // 子プロセスが書き込みでブロックし、stdout 読み出しがハングするのを防ぐ。
+    let stderr_task = child.stderr.take().map(|err| {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(err).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if tx.send(PortForwardEvent::Error { id, msg: line }).is_err() {
+                    break;
+                }
+            }
+        })
+    });
+
     if let Some(out) = child.stdout.take() {
         let mut lines = tokio::io::BufReader::new(out).lines();
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
                     if tx.send(PortForwardEvent::Line { id, text: line }).is_err() {
-                        return;
+                        break;
                     }
                 }
                 Ok(None) => break,
@@ -615,17 +637,10 @@ async fn pf_run(
         }
     }
 
+    // 子プロセス終了を待つ。stderr タスクは子の終了で EOF に達して自然に終わる。
     let _ = child.wait().await;
-    if let Some(mut err) = child.stderr.take() {
-        use tokio::io::AsyncReadExt;
-        let mut s = String::new();
-        let _ = err.read_to_string(&mut s).await;
-        if !s.trim().is_empty() {
-            let _ = tx.send(PortForwardEvent::Error {
-                id,
-                msg: s.trim().to_string(),
-            });
-        }
+    if let Some(h) = stderr_task {
+        let _ = h.await;
     }
     let _ = tx.send(PortForwardEvent::Stopped { id });
 }
@@ -658,18 +673,37 @@ pub async fn logs_loop(
 ) {
     let mut handle: Option<tokio::task::JoinHandle<()>> = None;
     while let Some(req) = req_rx.recv().await {
+        // 新規リクエストでもStopでも、まず直前の kubectl logs -f を停止（kill_on_drop）
         if let Some(h) = handle.take() {
-            h.abort(); // 直前の kubectl logs -f を停止（kill_on_drop）
+            h.abort();
         }
-        handle = Some(tokio::spawn(stream_logs(req, cfg.mock, tx.clone())));
+        match req {
+            LogReq::Follow { ns, pod, container } => {
+                handle = Some(tokio::spawn(stream_logs(
+                    ns,
+                    pod,
+                    container,
+                    cfg.mock,
+                    tx.clone(),
+                )));
+            }
+            // 停止のみ。新規ストリームは開始しない。
+            LogReq::Stop => {}
+        }
     }
     if let Some(h) = handle.take() {
         h.abort();
     }
 }
 
-async fn stream_logs(req: LogReq, mock: bool, tx: std::sync::mpsc::Sender<LogEvent>) {
-    let title = format!("{}/{} · {}", req.ns, req.pod, req.container);
+async fn stream_logs(
+    ns: String,
+    pod: String,
+    container: String,
+    mock: bool,
+    tx: std::sync::mpsc::Sender<LogEvent>,
+) {
+    let title = format!("{ns}/{pod} · {container}");
     if tx.send(LogEvent::Start(title)).is_err() {
         return;
     }
@@ -679,7 +713,7 @@ async fn stream_logs(req: LogReq, mock: bool, tx: std::sync::mpsc::Sender<LogEve
             let line = format!(
                 "2026-06-19T10:00:{:02}Z INFO  {} log line {}",
                 i % 60,
-                req.container,
+                container,
                 i
             );
             if tx.send(LogEvent::Line(line)).is_err() {
@@ -694,17 +728,17 @@ async fn stream_logs(req: LogReq, mock: bool, tx: std::sync::mpsc::Sender<LogEve
         "logs".into(),
         "-f".into(),
         "-n".into(),
-        req.ns.clone(),
-        req.pod.clone(),
+        ns.clone(),
+        pod.clone(),
         "--tail=200".into(),
     ];
-    if req.container.is_empty() {
+    if container.is_empty() {
         // コンテナ未指定（リソースブラウザからの起動）。全コンテナをまとめて追従。
         args.push("--all-containers=true".into());
         args.push("--prefix".into());
     } else {
         args.push("-c".into());
-        args.push(req.container.clone());
+        args.push(container.clone());
     }
     let mut child = match tokio::process::Command::new("kubectl")
         .args(context_args())
@@ -721,13 +755,31 @@ async fn stream_logs(req: LogReq, mock: bool, tx: std::sync::mpsc::Sender<LogEve
         }
     };
 
+    // stderr を別タスクで並行して読み出す。長時間追従で stderr の OS パイプバッファ
+    // (~64KB) が埋まると子プロセスが書き込みでブロックし、stdout の供給も止まって
+    // こちらの読み出しがハングするため、必ず stdout と同時に排出する。
+    let stderr_task = child.stderr.take().map(|err| {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(err).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if tx.send(LogEvent::Error(line)).is_err() {
+                    break;
+                }
+            }
+        })
+    });
+
     if let Some(out) = child.stdout.take() {
         let mut lines = tokio::io::BufReader::new(out).lines();
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
                     if tx.send(LogEvent::Line(line)).is_err() {
-                        return;
+                        break;
                     }
                 }
                 Ok(None) => break,
@@ -739,15 +791,10 @@ async fn stream_logs(req: LogReq, mock: bool, tx: std::sync::mpsc::Sender<LogEve
         }
     }
 
-    // 失敗時は stderr を回収して通知
+    // 子プロセス終了を待つ。stderr タスクは子の終了で EOF に達して自然に終わる。
     let _ = child.wait().await;
-    if let Some(mut err) = child.stderr.take() {
-        use tokio::io::AsyncReadExt;
-        let mut s = String::new();
-        let _ = err.read_to_string(&mut s).await;
-        if !s.trim().is_empty() {
-            let _ = tx.send(LogEvent::Error(s.trim().to_string()));
-        }
+    if let Some(h) = stderr_task {
+        let _ = h.await;
     }
 }
 

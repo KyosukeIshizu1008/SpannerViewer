@@ -1362,7 +1362,7 @@ impl MonitorApp {
     }
 
     fn open_logs(&mut self, ns: &str, pod: &str, container: &str) {
-        let req = k8s::LogReq {
+        let req = k8s::LogReq::Follow {
             ns: ns.to_string(),
             pod: pod.to_string(),
             container: container.to_string(),
@@ -1371,6 +1371,14 @@ impl MonitorApp {
             self.kube_log_open = true;
             self.kube_log_following = true;
             self.kube_log_buf.clear();
+        }
+    }
+
+    /// ログ追従を停止する（kubectl logs -f プロセスを終わらせ、リークを防ぐ）。
+    fn stop_logs(&mut self) {
+        if self.kube_log_following {
+            let _ = self.kube_log_req_tx.send(k8s::LogReq::Stop);
+            self.kube_log_following = false;
         }
     }
 
@@ -1750,6 +1758,8 @@ impl MonitorApp {
             draw_db_icon,
             "Spanner",
         ) {
+            // Kube から離れるのでログ追従を止める（プロセスを残さない）。
+            self.stop_logs();
             self.section = Section::Spanner;
         }
         if activity_item(
@@ -4401,6 +4411,10 @@ impl MonitorApp {
                         ui.add_sized(ui.available_size(), te);
                     });
             });
+        // ウィンドウを閉じたら追従も止める（kubectl logs -f を残さない）。
+        if !open {
+            self.stop_logs();
+        }
         self.kube_log_open = open;
     }
 
