@@ -530,8 +530,11 @@ pub struct MonitorApp {
     pick_instance: String,
     pick_database: String,
     pick_error: Option<String>,
-    // プロジェクトが大量にある組織向けの絞り込み入力。
+    // プロジェクトが大量にある組織向けの絞り込み入力（兼: 一覧に出ない ID の手動指定）。
     pick_project_filter: String,
+    // 列挙権限が無く一覧に出ないとき用の手動入力（instance / database）。
+    pick_instance_manual: String,
+    pick_database_manual: String,
 
     section: Section,
     view: View,
@@ -680,6 +683,8 @@ impl MonitorApp {
             pick_busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pick_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pick_project_filter: String::new(),
+            pick_instance_manual: String::new(),
+            pick_database_manual: String::new(),
             pick_projects: Vec::new(),
             pick_instances: Vec::new(),
             pick_databases: Vec::new(),
@@ -1479,6 +1484,32 @@ impl eframe::App for MonitorApp {
                                             tb_apply = true;
                                         }
                                     }
+                                    // 一覧に出ないとき用の手動入力。
+                                    if !self.pick_project.is_empty()
+                                        && !self.pick_instance.is_empty()
+                                    {
+                                        ui.add(
+                                            egui::TextEdit::singleline(
+                                                &mut self.pick_database_manual,
+                                            )
+                                            .hint_text("ID直接入力")
+                                            .desired_width(138.0),
+                                        );
+                                        let typed = self.pick_database_manual.trim().to_string();
+                                        let exact = self.pick_databases.contains(&typed);
+                                        if !typed.is_empty()
+                                            && !exact
+                                            && ui
+                                                .selectable_label(
+                                                    false,
+                                                    format!("「{typed}」を直接指定"),
+                                                )
+                                                .clicked()
+                                        {
+                                            self.pick_database = typed;
+                                            tb_apply = true;
+                                        }
+                                    }
                                 });
                             // ② インスタンス。開いたとき空なら自動取得。
                             egui::ComboBox::from_id_salt("tb_inst")
@@ -1503,6 +1534,32 @@ impl eframe::App for MonitorApp {
                                             tb_load_databases = Some((proj.clone(), inst.clone()));
                                         }
                                     }
+                                    // 一覧に出ないとき用の手動入力。
+                                    if !proj.is_empty() {
+                                        ui.add(
+                                            egui::TextEdit::singleline(
+                                                &mut self.pick_instance_manual,
+                                            )
+                                            .hint_text("ID直接入力")
+                                            .desired_width(148.0),
+                                        );
+                                        let typed = self.pick_instance_manual.trim().to_string();
+                                        let exact = self.pick_instances.contains(&typed);
+                                        if !typed.is_empty()
+                                            && !exact
+                                            && ui
+                                                .selectable_label(
+                                                    false,
+                                                    format!("「{typed}」を直接指定"),
+                                                )
+                                                .clicked()
+                                        {
+                                            self.pick_instance = typed.clone();
+                                            self.pick_database.clear();
+                                            self.pick_databases.clear();
+                                            tb_load_databases = Some((proj.clone(), typed));
+                                        }
+                                    }
                                 });
                             // ① プロジェクト。開いたとき空なら自動取得。
                             let resp = egui::ComboBox::from_id_salt("tb_proj")
@@ -1517,14 +1574,32 @@ impl eframe::App for MonitorApp {
                                             egui::RichText::new("取得中…").color(MUTED).small(),
                                         );
                                     }
-                                    if self.pick_projects.len() > 8 {
-                                        ui.add(
-                                            egui::TextEdit::singleline(
-                                                &mut self.pick_project_filter,
+                                    // 絞り込み兼・手動入力（列挙権限が無く一覧に出ない
+                                    // プロジェクトIDを直接打てるよう常時表示）。
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.pick_project_filter,
+                                        )
+                                        .hint_text("絞り込み / ID直接入力")
+                                        .desired_width(168.0),
+                                    );
+                                    let typed = self.pick_project_filter.trim().to_string();
+                                    let exact = self.pick_projects.iter().any(|p| p == &typed);
+                                    if !typed.is_empty()
+                                        && !exact
+                                        && ui
+                                            .selectable_label(
+                                                false,
+                                                format!("「{typed}」を直接指定"),
                                             )
-                                            .hint_text("絞り込み")
-                                            .desired_width(168.0),
-                                        );
+                                            .clicked()
+                                    {
+                                        self.pick_project = typed.clone();
+                                        self.pick_instance.clear();
+                                        self.pick_database.clear();
+                                        self.pick_instances.clear();
+                                        self.pick_databases.clear();
+                                        tb_load_instances = Some(typed.clone());
                                     }
                                     let f = self.pick_project_filter.to_lowercase();
                                     let mut shown = 0usize;
@@ -4126,6 +4201,56 @@ impl MonitorApp {
                 if let Some(e) = &self.pick_error {
                     ui.colored_label(egui::Color32::from_rgb(248, 113, 113), e);
                 }
+
+                // 列挙権限が無く一覧に出ない場合の手動入力フォールバック。
+                // （Spanner のリソース単位でのみ権限がある場合など）
+                ui.collapsing("一覧に出ない場合は手動で入力", |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "プロジェクトの列挙権限が無くても、ID を直接指定すれば接続できます。",
+                        )
+                        .color(MUTED)
+                        .small(),
+                    );
+                    egui::Grid::new("manual_conn").num_columns(2).show(ui, |ui| {
+                        ui.label("プロジェクト");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.pick_project_filter)
+                                .hint_text("my-project-id")
+                                .desired_width(260.0),
+                        );
+                        ui.end_row();
+                        ui.label("インスタンス");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.pick_instance_manual)
+                                .hint_text("my-instance")
+                                .desired_width(260.0),
+                        );
+                        ui.end_row();
+                        ui.label("データベース");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.pick_database_manual)
+                                .hint_text("my-database")
+                                .desired_width(260.0),
+                        );
+                        ui.end_row();
+                    });
+                    let manual_ready = !self.pick_project_filter.trim().is_empty()
+                        && !self.pick_instance_manual.trim().is_empty()
+                        && !self.pick_database_manual.trim().is_empty();
+                    if ui
+                        .add_enabled(
+                            manual_ready,
+                            egui::Button::new("この内容で接続"),
+                        )
+                        .clicked()
+                    {
+                        self.pick_project = self.pick_project_filter.trim().to_string();
+                        self.pick_instance = self.pick_instance_manual.trim().to_string();
+                        self.pick_database = self.pick_database_manual.trim().to_string();
+                        do_apply_pick = true;
+                    }
+                });
                 ui.separator();
 
                 // 登録済み環境の一覧（選択・削除）
