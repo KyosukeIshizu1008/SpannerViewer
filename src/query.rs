@@ -587,7 +587,11 @@ pub async fn list_projects() -> anyhow::Result<Vec<String>> {
     let mut out = Vec::new();
     let mut page = String::new();
     loop {
-        let mut q = vec![("pageSize", "1000".to_string())];
+        // state:ACTIVE で削除済み/保留中を除外（余計なものを出さない）。
+        let mut q = vec![
+            ("pageSize", "1000".to_string()),
+            ("query", "state:ACTIVE".to_string()),
+        ];
         if !page.is_empty() {
             q.push(("pageToken", page.clone()));
         }

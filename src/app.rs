@@ -530,6 +530,8 @@ pub struct MonitorApp {
     pick_instance: String,
     pick_database: String,
     pick_error: Option<String>,
+    // プロジェクトが大量にある組織向けの絞り込み入力。
+    pick_project_filter: String,
 
     section: Section,
     view: View,
@@ -677,6 +679,7 @@ impl MonitorApp {
             discover_project: String::new(),
             pick_busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pick_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            pick_project_filter: String::new(),
             pick_projects: Vec::new(),
             pick_instances: Vec::new(),
             pick_databases: Vec::new(),
@@ -1514,9 +1517,36 @@ impl eframe::App for MonitorApp {
                                             egui::RichText::new("取得中…").color(MUTED).small(),
                                         );
                                     }
-                                    for p in &self.pick_projects {
+                                    if self.pick_projects.len() > 8 {
+                                        ui.add(
+                                            egui::TextEdit::singleline(
+                                                &mut self.pick_project_filter,
+                                            )
+                                            .hint_text("絞り込み")
+                                            .desired_width(168.0),
+                                        );
+                                    }
+                                    let f = self.pick_project_filter.to_lowercase();
+                                    let mut shown = 0usize;
+                                    let total = self.pick_projects.len();
+                                    for p in self.pick_projects.clone() {
+                                        if !f.is_empty() && !p.to_lowercase().contains(&f) {
+                                            continue;
+                                        }
+                                        if shown >= 50 {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "他 {} 件… 絞り込んでください",
+                                                    total - shown
+                                                ))
+                                                .color(MUTED)
+                                                .small(),
+                                            );
+                                            break;
+                                        }
+                                        shown += 1;
                                         if ui
-                                            .selectable_label(&self.pick_project == p, p)
+                                            .selectable_label(self.pick_project == p, &p)
                                             .clicked()
                                         {
                                             self.pick_project = p.clone();
@@ -4007,9 +4037,34 @@ impl MonitorApp {
                     })
                     .width(260.0)
                     .show_ui(ui, |ui| {
-                        for p in &self.pick_projects {
+                        if self.pick_projects.len() > 8 {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.pick_project_filter)
+                                    .hint_text("絞り込み")
+                                    .desired_width(248.0),
+                            );
+                        }
+                        let f = self.pick_project_filter.to_lowercase();
+                        let mut shown = 0usize;
+                        let total = self.pick_projects.len();
+                        for p in self.pick_projects.clone() {
+                            if !f.is_empty() && !p.to_lowercase().contains(&f) {
+                                continue;
+                            }
+                            if shown >= 50 {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "他 {} 件… 絞り込んでください",
+                                        total - shown
+                                    ))
+                                    .color(MUTED)
+                                    .small(),
+                                );
+                                break;
+                            }
+                            shown += 1;
                             if ui
-                                .selectable_value(&mut self.pick_project, p.clone(), p)
+                                .selectable_value(&mut self.pick_project, p.clone(), &p)
                                 .clicked()
                             {
                                 // プロジェクト変更 → 下位をリセットして再取得。
