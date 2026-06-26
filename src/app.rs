@@ -1427,7 +1427,6 @@ impl eframe::App for MonitorApp {
         // ビュー切替タブ（セクションごとに内容が変わる）
         // 接続切替の操作はクロージャ内で借用中なので、解放後に適用する。
         // トップのカスケード選択（借用解消後に適用）。
-        let mut tb_load_projects = false;
         let mut tb_load_instances: Option<String> = None;
         let mut tb_load_databases: Option<(String, String)> = None;
         let mut tb_apply = false;
@@ -1484,32 +1483,6 @@ impl eframe::App for MonitorApp {
                                             tb_apply = true;
                                         }
                                     }
-                                    // 一覧に出ないとき用の手動入力。
-                                    if !self.pick_project.is_empty()
-                                        && !self.pick_instance.is_empty()
-                                    {
-                                        ui.add(
-                                            egui::TextEdit::singleline(
-                                                &mut self.pick_database_manual,
-                                            )
-                                            .hint_text("ID直接入力")
-                                            .desired_width(138.0),
-                                        );
-                                        let typed = self.pick_database_manual.trim().to_string();
-                                        let exact = self.pick_databases.contains(&typed);
-                                        if !typed.is_empty()
-                                            && !exact
-                                            && ui
-                                                .selectable_label(
-                                                    false,
-                                                    format!("「{typed}」を直接指定"),
-                                                )
-                                                .clicked()
-                                        {
-                                            self.pick_database = typed;
-                                            tb_apply = true;
-                                        }
-                                    }
                                 });
                             // ② インスタンス。開いたとき空なら自動取得。
                             egui::ComboBox::from_id_salt("tb_inst")
@@ -1534,109 +1507,17 @@ impl eframe::App for MonitorApp {
                                             tb_load_databases = Some((proj.clone(), inst.clone()));
                                         }
                                     }
-                                    // 一覧に出ないとき用の手動入力。
-                                    if !proj.is_empty() {
-                                        ui.add(
-                                            egui::TextEdit::singleline(
-                                                &mut self.pick_instance_manual,
-                                            )
-                                            .hint_text("ID直接入力")
-                                            .desired_width(148.0),
-                                        );
-                                        let typed = self.pick_instance_manual.trim().to_string();
-                                        let exact = self.pick_instances.contains(&typed);
-                                        if !typed.is_empty()
-                                            && !exact
-                                            && ui
-                                                .selectable_label(
-                                                    false,
-                                                    format!("「{typed}」を直接指定"),
-                                                )
-                                                .clicked()
-                                        {
-                                            self.pick_instance = typed.clone();
-                                            self.pick_database.clear();
-                                            self.pick_databases.clear();
-                                            tb_load_databases = Some((proj.clone(), typed));
-                                        }
-                                    }
                                 });
-                            // ① プロジェクト。開いたとき空なら自動取得。
-                            let resp = egui::ComboBox::from_id_salt("tb_proj")
-                                .selected_text(combo_text(&self.pick_project, "プロジェクト"))
-                                .width(180.0)
-                                .show_ui(ui, |ui| {
-                                    if self.pick_projects.is_empty() && !busy {
-                                        tb_load_projects = true;
-                                    }
-                                    if busy && self.pick_projects.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new("取得中…").color(MUTED).small(),
-                                        );
-                                    }
-                                    // 絞り込み兼・手動入力（列挙権限が無く一覧に出ない
-                                    // プロジェクトIDを直接打てるよう常時表示）。
-                                    ui.add(
-                                        egui::TextEdit::singleline(
-                                            &mut self.pick_project_filter,
-                                        )
-                                        .hint_text("絞り込み / ID直接入力")
-                                        .desired_width(168.0),
-                                    );
-                                    let typed = self.pick_project_filter.trim().to_string();
-                                    let exact = self.pick_projects.iter().any(|p| p == &typed);
-                                    if !typed.is_empty()
-                                        && !exact
-                                        && ui
-                                            .selectable_label(
-                                                false,
-                                                format!("「{typed}」を直接指定"),
-                                            )
-                                            .clicked()
-                                    {
-                                        self.pick_project = typed.clone();
-                                        self.pick_instance.clear();
-                                        self.pick_database.clear();
-                                        self.pick_instances.clear();
-                                        self.pick_databases.clear();
-                                        tb_load_instances = Some(typed.clone());
-                                    }
-                                    let f = self.pick_project_filter.to_lowercase();
-                                    let mut shown = 0usize;
-                                    let total = self.pick_projects.len();
-                                    for p in self.pick_projects.clone() {
-                                        if !f.is_empty() && !p.to_lowercase().contains(&f) {
-                                            continue;
-                                        }
-                                        if shown >= 50 {
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "他 {} 件… 絞り込んでください",
-                                                    total - shown
-                                                ))
-                                                .color(MUTED)
-                                                .small(),
-                                            );
-                                            break;
-                                        }
-                                        shown += 1;
-                                        if ui
-                                            .selectable_label(self.pick_project == p, &p)
-                                            .clicked()
-                                        {
-                                            self.pick_project = p.clone();
-                                            self.pick_instance.clear();
-                                            self.pick_database.clear();
-                                            self.pick_instances.clear();
-                                            self.pick_databases.clear();
-                                            tb_load_instances = Some(p.clone());
-                                        }
-                                    }
-                                });
-                            // プロジェクトの再取得ボタン。
-                            if resp.response.secondary_clicked() {
-                                tb_load_projects = true;
-                            }
+                            // プロジェクトは設定画面で選ぶ。ここでは現在値の表示のみ。
+                            let proj_text = if self.pick_project.is_empty() {
+                                "プロジェクト未設定".to_string()
+                            } else {
+                                self.pick_project.clone()
+                            };
+                            ui.label(egui::RichText::new(proj_text).color(MUTED).small())
+                                .on_hover_text(
+                                    "プロジェクトの変更は「設定 → 接続先を選択（ADC）」から",
+                                );
                             if busy {
                                 ui.spinner();
                             }
@@ -1750,9 +1631,6 @@ impl eframe::App for MonitorApp {
             ui.add_space(8.0);
         });
         // トップのカスケード選択（借用解消後）。
-        if tb_load_projects {
-            self.load_projects(ctx);
-        }
         if let Some(p) = tb_load_instances {
             self.load_instances(ctx, p);
         }
@@ -4112,32 +3990,7 @@ impl MonitorApp {
                     })
                     .width(260.0)
                     .show_ui(ui, |ui| {
-                        if self.pick_projects.len() > 8 {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.pick_project_filter)
-                                    .hint_text("絞り込み")
-                                    .desired_width(248.0),
-                            );
-                        }
-                        let f = self.pick_project_filter.to_lowercase();
-                        let mut shown = 0usize;
-                        let total = self.pick_projects.len();
                         for p in self.pick_projects.clone() {
-                            if !f.is_empty() && !p.to_lowercase().contains(&f) {
-                                continue;
-                            }
-                            if shown >= 50 {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "他 {} 件… 絞り込んでください",
-                                        total - shown
-                                    ))
-                                    .color(MUTED)
-                                    .small(),
-                                );
-                                break;
-                            }
-                            shown += 1;
                             if ui
                                 .selectable_value(&mut self.pick_project, p.clone(), &p)
                                 .clicked()
