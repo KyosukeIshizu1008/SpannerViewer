@@ -3089,6 +3089,54 @@ mod tests {
         assert_eq!(rows, vec![vec!["1", "alice"], vec!["2", "bob"]]);
     }
 
+    /// 【観察用】CSV の列数がマッピング列数より少ない（短い）行を strict モードで
+    /// 取り込んだとき、現状どう振る舞うかを実測する（emulator 前提）。
+    #[tokio::test]
+    async fn observe_short_row_behavior() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _g = EMU_LOCK.lock().await;
+        let table = "ImportShortRow";
+        create_import_table_named(table).await;
+        let client = client().await;
+
+        // 3 列（Id,Name,Score）にマップ。2 行目はフィールドが 1 個しかない短い行。
+        // 3 行目はフィールドが多すぎる行。strict（skip_bad_rows=false）で実行。
+        let csv = "Id,Name,Score\n1,alice,9.5\n2\n3,carol,7.0,EXTRA,XX\n";
+        let path = write_temp_csv("shortrow", csv);
+        let req = ImportRequest {
+            table: table.into(),
+            columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)"), ("Score", "FLOAT64")]),
+            source: ImportSource::File(path),
+            has_header: true,
+            mode: ImportMode::Insert,
+            empty_as_null: true,
+            fresh: false,
+            encoding: Encoding::Utf8,
+            delimiter: b',',
+            skip_bad_rows: false,
+            dry_run: false,
+            null_token: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (ptx, _prx) = std::sync::mpsc::channel::<ImportProgress>();
+        let out = run_streaming_import(&test_env(), &req, false, &ptx).await;
+        eprintln!(
+            "[observe] written={} total={} skipped={} error={:?}",
+            out.written, out.total, out.skipped, out.error
+        );
+        let (_, rows, _) = try_query(
+            &client,
+            &format!("SELECT Id, Name, Name IS NULL, Score FROM {table} ORDER BY Id"),
+        )
+        .await
+        .unwrap();
+        eprintln!("[observe] rows in DB = {rows:?}");
+    }
+
     /// 空欄を NULL にしない設定では空文字列として書き込む（emulator 前提）。
     #[tokio::test]
     async fn streaming_import_empty_as_string() {

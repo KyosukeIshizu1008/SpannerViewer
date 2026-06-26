@@ -6687,6 +6687,125 @@ mod tests {
         assert_eq!(clicked.borrow().as_deref(), Some("beta"));
     }
 
+    /// テスト用に Channels を作る（背景ループは無いので送受信端は捨てる）。
+    fn make_test_channels() -> Channels {
+        use std::sync::mpsc::channel;
+        use tokio::sync::mpsc::unbounded_channel;
+        let (_a, sample_rx) = channel();
+        let (req_tx, _b) = unbounded_channel();
+        let (_c, res_rx) = channel();
+        let (import_req_tx, _d) = unbounded_channel();
+        let (_e, import_res_rx) = channel();
+        let (gcs_req_tx, _f) = unbounded_channel();
+        let (_g, gcs_res_rx) = channel();
+        let (_h, schema_rx) = channel();
+        let (_i, kube_metrics_rx) = channel();
+        let (kube_topo_req_tx, _j) = unbounded_channel();
+        let (_k, kube_topo_rx) = channel();
+        let (kube_log_req_tx, _l) = unbounded_channel();
+        let (_m, kube_log_rx) = channel();
+        let (kube_ev_req_tx, _n) = unbounded_channel();
+        let (_o, kube_ev_rx) = channel();
+        let (kube_action_req_tx, _p) = unbounded_channel();
+        let (_q, kube_action_rx) = channel();
+        let (kube_res_req_tx, _r) = unbounded_channel();
+        let (_s, kube_res_rx) = channel();
+        let (kube_pf_req_tx, _t) = unbounded_channel();
+        let (_u, kube_pf_rx) = channel();
+        // 受信端を握り続けて切断扱いを避ける（描画に影響しないよう leak）。
+        for far in [
+            Box::new(_a) as Box<dyn std::any::Any>,
+            Box::new(_b),
+            Box::new(_c),
+            Box::new(_d),
+            Box::new(_e),
+            Box::new(_f),
+            Box::new(_g),
+            Box::new(_h),
+            Box::new(_i),
+            Box::new(_j),
+            Box::new(_k),
+            Box::new(_l),
+            Box::new(_m),
+            Box::new(_n),
+            Box::new(_o),
+            Box::new(_p),
+            Box::new(_q),
+            Box::new(_r),
+            Box::new(_s),
+            Box::new(_t),
+            Box::new(_u),
+        ] {
+            Box::leak(far);
+        }
+        Channels {
+            sample_rx,
+            req_tx,
+            res_rx,
+            import_req_tx,
+            import_res_rx,
+            gcs_req_tx,
+            gcs_res_rx,
+            schema_rx,
+            kube_metrics_rx,
+            kube_topo_req_tx,
+            kube_topo_rx,
+            kube_log_req_tx,
+            kube_log_rx,
+            kube_ev_req_tx,
+            kube_ev_rx,
+            kube_action_req_tx,
+            kube_action_rx,
+            kube_res_req_tx,
+            kube_res_rx,
+            kube_pf_req_tx,
+            kube_pf_rx,
+            poll_interval: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(30)),
+            conn_info: "test-project/test-instance/test-db".into(),
+        }
+    }
+
+    /// 実アプリの各画面を wgpu でヘッドレス描画し PNG に保存する（視覚確認用）。
+    /// 画像は target/ui_shots/*.png に出る。スナップショット比較ではなく目視用。
+    /// GPU アダプタが要るので既定では実行せず、`cargo test -- --ignored render_app_screens_to_png`
+    /// で明示的に走らせる。
+    #[ignore = "wgpu アダプタが必要。視覚確認時のみ手動実行する"]
+    #[test]
+    fn render_app_screens_to_png() {
+        use egui_kittest::Harness;
+        // 背景スレッド（ADC チェック）が rustls プロバイダを要求するため入れておく。
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dir = std::path::Path::new("target/ui_shots");
+        std::fs::create_dir_all(dir).unwrap();
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 780.0))
+            .build_eframe(|cc| MonitorApp::new(make_test_channels(), cc));
+
+        let shots = [
+            (Section::Spanner, View::Monitor, false, "01_monitor"),
+            (Section::Spanner, View::Data, false, "02_data"),
+            (Section::Spanner, View::Schema, false, "03_schema"),
+            (Section::Spanner, View::Import, false, "04_import"),
+            (Section::Spanner, View::Monitor, true, "05_settings"),
+            (Section::Kube, View::Monitor, false, "06_kube"),
+        ];
+        for (sec, view, settings, name) in shots {
+            {
+                let app = harness.state_mut();
+                app.section = sec;
+                app.view = view;
+                app.settings_open = settings;
+            }
+            harness.run();
+            match harness.render() {
+                Ok(img) => img.save(dir.join(format!("{name}.png"))).unwrap(),
+                Err(e) => eprintln!("[render] {name} 失敗（wgpu アダプタ無し?）: {e}"),
+            }
+        }
+        eprintln!("[render] PNG 出力先: {}", dir.display());
+    }
+
     /// 行数の 3 桁区切り表示。
     #[test]
     fn fmt_count_groups_thousands() {
