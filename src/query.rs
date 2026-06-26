@@ -234,6 +234,11 @@ pub struct ImportOutcome {
     pub reject_path: Option<String>,
     pub elapsed_ms: u128,
     pub error: Option<String>,
+    /// 取込前のテーブル行数（COUNT(*)。取得できなければ None）。
+    pub before_count: Option<i64>,
+    /// 取込後のテーブル行数（COUNT(*)。取得できなければ None）。
+    /// 新規挿入 ≈ after-before、更新 ≈ written-(after-before)（upsert の近似）。
+    pub after_count: Option<i64>,
 }
 
 /// インポート中に背景 → UI へ流すイベント（進捗 / 完了）。
@@ -1177,6 +1182,9 @@ async fn run_streaming_import(
     };
     let session_names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
 
+    // 証跡レポート用に取込前の行数を控える（ベストエフォート）。
+    let before_count = count_rows(env, &req.table).await;
+
     // 共有状態。
     let written = Arc::new(AtomicUsize::new(0));
     // CSV の期待列数（ヘッダ幅 / 先頭データ行）。プロデューサが設定しワーカーが参照する。
@@ -1474,6 +1482,8 @@ async fn run_streaming_import(
     if error.is_none() && !aborted && !cancelled {
         let _ = std::fs::remove_file(&ckpt_path);
     }
+    // 取込後の行数（ベストエフォート）。新規挿入 ≈ after-before。
+    let after_count = count_rows(env, &req.table).await;
     let skipped_n = skipped.load(Ordering::Relaxed);
     ImportOutcome {
         written: written.load(Ordering::Relaxed),
@@ -1487,6 +1497,8 @@ async fn run_streaming_import(
             None
         },
         error,
+        before_count,
+        after_count,
         ..Default::default()
     }
 }
@@ -2227,6 +2239,16 @@ async fn try_fetch_schema(client: &Client) -> anyhow::Result<SchemaGraph> {
         edges,
         error: None,
     })
+}
+
+/// テーブルの行数を COUNT(*) で取得する（証跡レポートの「元件数/新規/更新」用、
+/// ベストエフォート。権限不足や接続失敗なら None）。
+async fn count_rows(env: &SpannerEnv, table: &str) -> Option<i64> {
+    let client = build_client(env).await.ok()?;
+    let (_, rows, _) = try_query(&client, &format!("SELECT COUNT(*) FROM `{table}`"))
+        .await
+        .ok()?;
+    rows.first()?.first()?.parse::<i64>().ok()
 }
 
 async fn build_client(env: &SpannerEnv) -> anyhow::Result<Client> {
@@ -3176,6 +3198,54 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows, vec![vec!["1", "alice"], vec!["2", "bob"]]);
+    }
+
+    /// 証跡レポート用の取込前後 COUNT(*) が記録され、新規挿入/更新の推定に使える
+    /// （emulator 前提）。
+    #[tokio::test]
+    async fn import_records_before_after_counts() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _g = EMU_LOCK.lock().await;
+        let table = "ImportCounts";
+        create_import_table_named(table).await; // 既存行は掃除される
+
+        let run = |csv: &str, tag: &str| {
+            let path = write_temp_csv(tag, csv);
+            ImportRequest {
+                table: table.into(),
+                columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)")]),
+                source: ImportSource::File(path),
+                has_header: true,
+                mode: ImportMode::InsertOrUpdate,
+                empty_as_null: true,
+                fresh: false,
+                encoding: Encoding::Utf8,
+                delimiter: b',',
+                skip_bad_rows: false,
+                dry_run: false,
+                null_token: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+            }
+        };
+        let (ptx, _prx) = std::sync::mpsc::channel::<ImportProgress>();
+
+        // 1 回目: 空テーブルに 3 行（全部新規）。
+        let out1 = run_streaming_import(&test_env(), &run("Id,Name\n1,a\n2,b\n3,c\n", "cnt1"), false, &ptx).await;
+        assert_eq!(out1.before_count, Some(0));
+        assert_eq!(out1.after_count, Some(3));
+
+        // 2 回目: id 2,3 を更新 + id 4 を新規。
+        let out2 = run_streaming_import(&test_env(), &run("Id,Name\n2,b2\n3,c2\n4,d\n", "cnt2"), false, &ptx).await;
+        assert_eq!(out2.before_count, Some(3), "取込前は 3 行");
+        assert_eq!(out2.after_count, Some(4), "取込後は 4 行（新規 1）");
+        // 新規 = after-before = 1、更新 = written-新規 = 3-1 = 2。
+        let inserted = out2.after_count.unwrap() - out2.before_count.unwrap();
+        assert_eq!(inserted, 1);
+        assert_eq!(out2.written as i64 - inserted, 2);
     }
 
     /// strict（skip_bad_rows=false）では、列数が一致しない行でエラーになり

@@ -2805,9 +2805,7 @@ impl MonitorApp {
             return;
         }
         let md = report_markdown(&self.import_jobs, &ts);
-        let csv = report_csv(&self.import_jobs);
         let _ = std::fs::write(dir.join("report.md"), md);
-        let _ = std::fs::write(dir.join("report.csv"), csv);
         // スクショは次フレームで Event::Screenshot として届く。届いたら同フォルダへ保存。
         self.pending_report_dir = Some(dir.clone());
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
@@ -6265,16 +6263,6 @@ fn csv_object_uris(bucket: &str, objects: &[String]) -> Vec<(String, String)> {
 }
 
 /// ジョブの状態を日本語ラベルにする。
-fn job_status_label(s: JobStatus) -> &'static str {
-    match s {
-        JobStatus::Queued => "待機",
-        JobStatus::Running => "実行中",
-        JobStatus::Done => "完了",
-        JobStatus::Failed => "失敗",
-        JobStatus::Cancelled => "中断",
-    }
-}
-
 /// 方式ラベル（挿入のみ / 上書き挿入）。
 fn mode_label(mode: query::ImportMode) -> &'static str {
     match mode {
@@ -6283,100 +6271,66 @@ fn mode_label(mode: query::ImportMode) -> &'static str {
     }
 }
 
-/// ジョブの取得元の表示文字列。
-fn job_source(req: &query::ImportRequest) -> String {
-    match &req.source {
-        query::ImportSource::File(p) => p.display().to_string(),
-        query::ImportSource::Gcs(u) => u.clone(),
-    }
-}
-
 /// 証跡レポート（Markdown）を組み立てる。
 fn report_markdown(jobs: &[ImportJob], ts: &chrono::DateTime<chrono::Local>) -> String {
     let mut s = String::new();
     s.push_str("# インポート証跡レポート\n\n");
     s.push_str(&format!("生成日時: {}\n\n", ts.format("%Y-%m-%d %H:%M:%S")));
+    // 完了したジョブだけを対象にする（待機中/失敗中の 0 行行を混ぜない）。
+    let done: Vec<&ImportJob> = jobs
+        .iter()
+        .filter(|j| j.status == JobStatus::Done && j.outcome.is_some())
+        .collect();
     s.push_str(
-        "| テーブル | 方式 | 状態 | 書込行数 | 総行数 | スキップ | 再開スキップ | 所要(ms) | リジェクト | エラー | ソース |\n",
+        "| テーブル | 方式 | CSV行数 | 取込前 | 取込後 | 新規挿入 | 更新(推定) | スキップ | エラー |\n",
     );
-    s.push_str("|---|---|---|--:|--:|--:|--:|--:|---|---|---|\n");
+    s.push_str("|---|---|--:|--:|--:|--:|--:|--:|---|\n");
     let mut total_written = 0usize;
-    for j in jobs {
-        let o = j.outcome.as_ref();
-        let written = o.map(|o| o.written).unwrap_or(0);
-        total_written += written;
-        let mode = if o.map(|o| o.dry_run).unwrap_or(false) {
+    for j in &done {
+        let o = j.outcome.as_ref().unwrap();
+        total_written += o.written;
+        let mode = if o.dry_run {
             "検証(ドライラン)".to_string()
         } else {
             mode_label(j.req.mode).to_string()
         };
+        // before/after が取れていれば 新規挿入=after-before、更新=書込-新規（>=0）。
+        let (inserted, updated) = match (o.before_count, o.after_count) {
+            (Some(b), Some(a)) => {
+                let ins = (a - b).max(0);
+                let upd = (o.written as i64 - ins).max(0);
+                (fmt_count(ins as usize), fmt_count(upd as usize))
+            }
+            _ => ("-".to_string(), "-".to_string()),
+        };
+        let cell = |v: Option<i64>| v.map(|n| fmt_count(n as usize)).unwrap_or_else(|| "-".into());
         s.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             j.req.table,
             mode,
-            job_status_label(j.status),
-            fmt_count(written),
-            fmt_count(o.map(|o| o.total).unwrap_or(0)),
-            fmt_count(o.map(|o| o.skipped).unwrap_or(0)),
-            fmt_count(o.map(|o| o.resumed).unwrap_or(0)),
-            o.map(|o| o.elapsed_ms).unwrap_or(0),
-            o.and_then(|o| o.reject_path.clone()).unwrap_or_else(|| "-".into()),
-            o.and_then(|o| o.error.clone()).unwrap_or_else(|| "-".into()),
-            job_source(&j.req),
+            fmt_count(o.total),
+            cell(o.before_count),
+            cell(o.after_count),
+            inserted,
+            updated,
+            fmt_count(o.skipped),
+            o.error.clone().unwrap_or_else(|| "-".into()),
         ));
     }
     s.push_str(&format!(
-        "\n合計: {} ジョブ / 書込 {} 行\n",
-        jobs.len(),
+        "\n対象: 完了 {} ジョブ / 書込 {} 行\n",
+        done.len(),
         fmt_count(total_written)
     ));
     s.push_str(
-        "\n※ 書込行数は BatchWrite で適用に成功した行数です。Spanner は行ごとの\n\
-         「新規挿入/更新」内訳を返さないため、本レポートには内訳は含みません。\n",
+        "\n※ CSV行数=入力データ行数、書込=BatchWrite 成功行数。\n\
+         「新規挿入/更新」は取込前後の COUNT(*) 差分からの推定です\n\
+         （同時書き込みや CSV 内の重複キーがあると正確でない場合があります）。\n",
     );
     s
 }
 
 /// 証跡レポート（CSV）を組み立てる。
-fn report_csv(jobs: &[ImportJob]) -> String {
-    let esc = |s: &str| {
-        if s.contains(',') || s.contains('"') || s.contains('\n') {
-            format!("\"{}\"", s.replace('"', "\"\""))
-        } else {
-            s.to_string()
-        }
-    };
-    let mut out = String::from(
-        "table,mode,status,written,total,skipped,resumed,elapsed_ms,reject_path,error,source\n",
-    );
-    for j in jobs {
-        let o = j.outcome.as_ref();
-        let mode = if o.map(|o| o.dry_run).unwrap_or(false) {
-            "dry_run"
-        } else {
-            match j.req.mode {
-                query::ImportMode::Insert => "insert",
-                query::ImportMode::InsertOrUpdate => "insert_or_update",
-            }
-        };
-        out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{}\n",
-            esc(&j.req.table),
-            mode,
-            job_status_label(j.status),
-            o.map(|o| o.written).unwrap_or(0),
-            o.map(|o| o.total).unwrap_or(0),
-            o.map(|o| o.skipped).unwrap_or(0),
-            o.map(|o| o.resumed).unwrap_or(0),
-            o.map(|o| o.elapsed_ms).unwrap_or(0),
-            esc(&o.and_then(|o| o.reject_path.clone()).unwrap_or_default()),
-            esc(&o.and_then(|o| o.error.clone()).unwrap_or_default()),
-            esc(&job_source(&j.req)),
-        ));
-    }
-    out
-}
-
 /// egui のスクリーンショット（ColorImage）を PNG として保存する。
 fn save_screenshot_png(
     path: &std::path::Path,
@@ -6883,17 +6837,22 @@ mod tests {
         );
     }
 
-    /// 証跡レポート CSV: ヘッダ＋各ジョブの行（件数・方式・状態）。
+    /// 証跡レポート Markdown: 完了ジョブのみ・元件数/新規挿入/更新の推定・
+    /// 未完了ジョブは除外。
     #[test]
-    fn report_csv_rows() {
-        fn job(table: &str, mode: query::ImportMode, written: usize, total: usize) -> ImportJob {
+    fn report_markdown_counts_and_filters() {
+        fn job(
+            table: &str,
+            status: JobStatus,
+            outcome: Option<query::ImportOutcome>,
+        ) -> ImportJob {
             ImportJob {
                 req: query::ImportRequest {
                     table: table.into(),
                     columns: vec![],
                     source: query::ImportSource::File("/tmp/x.csv".into()),
                     has_header: true,
-                    mode,
+                    mode: query::ImportMode::InsertOrUpdate,
                     empty_as_null: true,
                     fresh: false,
                     encoding: query::Encoding::Utf8,
@@ -6905,27 +6864,34 @@ mod tests {
                 },
                 source_name: "x.csv".into(),
                 sent: true,
-                status: JobStatus::Done,
+                status,
                 started: None,
                 progress: None,
                 result: None,
-                outcome: Some(query::ImportOutcome {
-                    written,
-                    total,
-                    elapsed_ms: 10,
-                    ..Default::default()
-                }),
+                outcome,
             }
         }
-        let jobs = vec![
-            job("A", query::ImportMode::Insert, 100, 100),
-            job("B", query::ImportMode::InsertOrUpdate, 50, 60),
-        ];
-        let csv = report_csv(&jobs);
-        let lines: Vec<&str> = csv.lines().collect();
-        assert!(lines[0].starts_with("table,mode,status,written,total"));
-        assert_eq!(lines[1], "A,insert,完了,100,100,0,0,10,,,/tmp/x.csv");
-        assert_eq!(lines[2], "B,insert_or_update,完了,50,60,0,0,10,,,/tmp/x.csv");
+        // 完了: CSV100行, 取込前10→取込後80 → 新規70, 更新=written(100)-70=30。
+        let done = job(
+            "A",
+            JobStatus::Done,
+            Some(query::ImportOutcome {
+                written: 100,
+                total: 100,
+                before_count: Some(10),
+                after_count: Some(80),
+                ..Default::default()
+            }),
+        );
+        // 待機中（outcome なし）は除外されるべき。
+        let queued = job("B", JobStatus::Queued, None);
+        let ts = chrono::Local::now();
+        let md = report_markdown(&[done, queued], &ts);
+        assert!(md.contains("| A |"), "完了ジョブは載る");
+        assert!(!md.contains("| B |"), "未完了ジョブは載らない");
+        // 新規挿入 70 / 更新 30 が出る。
+        assert!(md.contains("| 70 | 30 |"), "新規/更新の推定: {md}");
+        assert!(md.contains("対象: 完了 1 ジョブ"), "完了のみ集計");
     }
 
     /// 結果メッセージ: 成功/ドライラン/中断/部分適用/失敗 と注記。
