@@ -488,7 +488,7 @@ const GCS_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_only";
 const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
 /// Resource Manager の projects 応答 1 ページを (projectId 群, nextPageToken) に解析する。
-/// 削除予約中（DELETE_REQUESTED）は除外する。
+/// v1(`lifecycleState`)・v3(`state`) の両方に対応し、削除予約中（DELETE_REQUESTED）は除外。
 fn parse_projects_page(body: &str) -> anyhow::Result<(Vec<String>, Option<String>)> {
     #[derive(serde::Deserialize, Default)]
     struct Resp {
@@ -501,22 +501,27 @@ fn parse_projects_page(body: &str) -> anyhow::Result<(Vec<String>, Option<String
     struct Proj {
         #[serde(rename = "projectId")]
         project_id: String,
-        #[serde(rename = "lifecycleState")]
+        #[serde(default, rename = "lifecycleState")]
         lifecycle_state: Option<String>,
+        #[serde(default)]
+        state: Option<String>,
     }
     let r: Resp = serde_json::from_str(body)?;
     let ids = r
         .projects
         .into_iter()
-        .filter(|p| p.lifecycle_state.as_deref() != Some("DELETE_REQUESTED"))
+        .filter(|p| {
+            p.lifecycle_state.as_deref() != Some("DELETE_REQUESTED")
+                && p.state.as_deref() != Some("DELETE_REQUESTED")
+        })
         .map(|p| p.project_id)
         .collect();
     Ok((ids, r.next_page_token))
 }
 
-/// `{ <field>: [ { name: "projects/.../X" }, ... ] }` から末尾セグメント X 群を取り出す
-/// （Spanner instances/databases 応答。ソート済み）。
-fn parse_resource_names(body: &str, field: &str) -> anyhow::Result<Vec<String>> {
+/// `{ <field>: [ { name: "projects/.../X" }, ... ], "nextPageToken": "..." }` から
+/// 末尾セグメント X 群と次ページトークンを取り出す（Spanner instances/databases 応答）。
+fn parse_resource_names(body: &str, field: &str) -> anyhow::Result<(Vec<String>, Option<String>)> {
     let v: serde_json::Value = serde_json::from_str(body)?;
     let mut out: Vec<String> = Vec::new();
     if let Some(arr) = v.get(field).and_then(|x| x.as_array()) {
@@ -528,6 +533,32 @@ fn parse_resource_names(body: &str, field: &str) -> anyhow::Result<Vec<String>> 
                     }
                 }
             }
+        }
+    }
+    let next = v
+        .get("nextPageToken")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty())
+        .map(String::from);
+    Ok((out, next))
+}
+
+/// ページングしながら指定フィールドの末尾セグメントを全て集める。
+async fn list_paged(base_url: &str, field: &str) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut page = String::new();
+    loop {
+        let url = if page.is_empty() {
+            format!("{base_url}?pageSize=500")
+        } else {
+            format!("{base_url}?pageSize=500&pageToken={page}")
+        };
+        let body = fetch_text(&url).await?;
+        let (ids, next) = parse_resource_names(&body, field)?;
+        out.extend(ids);
+        match next {
+            Some(t) if out.len() < 5000 => page = t,
+            _ => break,
         }
     }
     out.sort();
@@ -547,19 +578,21 @@ pub async fn check_adc() -> anyhow::Result<()> {
     cloud_token().await.map(|_| ())
 }
 
-/// ADC で利用可能なプロジェクト ID を一覧する（Cloud Resource Manager）。
+/// ADC で利用可能なプロジェクト ID を一覧する。
+/// v3 `projects:search` を使う（フォルダ/組織経由でアクセスできるものも含めて返す。
+/// v1 `projects.list` は直接 IAM 付与されたものしか返さず取りこぼすため）。
 pub async fn list_projects() -> anyhow::Result<Vec<String>> {
     let token = cloud_token().await?;
     let client = reqwest::Client::new();
     let mut out = Vec::new();
     let mut page = String::new();
     loop {
-        let mut q = vec![("pageSize", "500".to_string())];
+        let mut q = vec![("pageSize", "1000".to_string())];
         if !page.is_empty() {
             q.push(("pageToken", page.clone()));
         }
         let body = client
-            .get("https://cloudresourcemanager.googleapis.com/v1/projects")
+            .get("https://cloudresourcemanager.googleapis.com/v3/projects:search")
             .bearer_auth(&token)
             .query(&q)
             .send()
@@ -578,22 +611,24 @@ pub async fn list_projects() -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
-/// 指定プロジェクトの Spanner インスタンス ID を一覧する。
+/// 指定プロジェクトの Spanner インスタンス ID を一覧する（全ページ）。
 pub async fn list_instances(project: &str) -> anyhow::Result<Vec<String>> {
-    let body = fetch_text(&format!(
-        "https://spanner.googleapis.com/v1/projects/{project}/instances"
-    ))
-    .await?;
-    parse_resource_names(&body, "instances")
+    list_paged(
+        &format!("https://spanner.googleapis.com/v1/projects/{project}/instances"),
+        "instances",
+    )
+    .await
 }
 
-/// 指定インスタンスの Spanner データベース ID を一覧する。
+/// 指定インスタンスの Spanner データベース ID を一覧する（全ページ）。
 pub async fn list_databases(project: &str, instance: &str) -> anyhow::Result<Vec<String>> {
-    let body = fetch_text(&format!(
-        "https://spanner.googleapis.com/v1/projects/{project}/instances/{instance}/databases"
-    ))
-    .await?;
-    parse_resource_names(&body, "databases")
+    list_paged(
+        &format!(
+            "https://spanner.googleapis.com/v1/projects/{project}/instances/{instance}/databases"
+        ),
+        "databases",
+    )
+    .await
 }
 
 /// ADC 認証付き GET の本文を取得する。
@@ -2617,6 +2652,13 @@ mod tests {
         let (ids, next) = parse_projects_page(body).unwrap();
         assert_eq!(ids, vec!["alpha", "beta"]); // gone は除外
         assert_eq!(next.as_deref(), Some("tok2"));
+        // v3 形式（state フィールド）も解釈する。
+        let v3 = r#"{"projects": [
+            {"projectId": "p1", "state": "ACTIVE"},
+            {"projectId": "p2", "state": "DELETE_REQUESTED"}
+        ]}"#;
+        let (ids, _) = parse_projects_page(v3).unwrap();
+        assert_eq!(ids, vec!["p1"]); // DELETE_REQUESTED は除外
         // 空応答。
         let (ids, next) = parse_projects_page("{}").unwrap();
         assert!(ids.is_empty() && next.is_none());
@@ -2628,14 +2670,15 @@ mod tests {
         let body = r#"{"instances": [
             {"name": "projects/p/instances/zeta"},
             {"name": "projects/p/instances/alpha"}
-        ]}"#;
-        assert_eq!(
-            parse_resource_names(body, "instances").unwrap(),
-            vec!["alpha", "zeta"]
-        );
-        // フィールド不一致・空は空ベクタ。
-        assert!(parse_resource_names(body, "databases").unwrap().is_empty());
-        assert!(parse_resource_names("{}", "instances").unwrap().is_empty());
+        ], "nextPageToken": "tok"}"#;
+        // parse は文書順（ソートは list_paged 側で全ページ集約後に行う）。
+        let (names, next) = parse_resource_names(body, "instances").unwrap();
+        assert_eq!(names, vec!["zeta", "alpha"]);
+        assert_eq!(next.as_deref(), Some("tok"));
+        // フィールド不一致・空は空ベクタ・トークン無し。
+        assert!(parse_resource_names(body, "databases").unwrap().0.is_empty());
+        let (n2, t2) = parse_resource_names("{}", "instances").unwrap();
+        assert!(n2.is_empty() && t2.is_none());
     }
 
     /// リトライ対象の判定: 一過性コードだけ true、恒久エラーは false。

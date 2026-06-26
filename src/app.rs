@@ -1449,11 +1449,24 @@ impl eframe::App for MonitorApp {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let emu = std::env::var("SPANNER_EMULATOR_HOST").is_ok();
                             let busy = self.pick_busy.load(std::sync::atomic::Ordering::Relaxed);
-                            // ③ DB（右端）。選んだら接続適用。
+                            // ③ DB（右端）。開いたとき空なら自動取得。選んだら接続適用。
                             egui::ComboBox::from_id_salt("tb_db")
                                 .selected_text(combo_text(&self.pick_database, "DB"))
                                 .width(150.0)
                                 .show_ui(ui, |ui| {
+                                    if self.pick_databases.is_empty()
+                                        && !busy
+                                        && !self.pick_project.is_empty()
+                                        && !self.pick_instance.is_empty()
+                                    {
+                                        tb_load_databases = Some((
+                                            self.pick_project.clone(),
+                                            self.pick_instance.clone(),
+                                        ));
+                                        ui.label(
+                                            egui::RichText::new("取得中…").color(MUTED).small(),
+                                        );
+                                    }
                                     for db in &self.pick_databases {
                                         if ui
                                             .selectable_label(&self.pick_database == db, db)
@@ -1464,12 +1477,18 @@ impl eframe::App for MonitorApp {
                                         }
                                     }
                                 });
-                            // ② インスタンス。
+                            // ② インスタンス。開いたとき空なら自動取得。
                             egui::ComboBox::from_id_salt("tb_inst")
                                 .selected_text(combo_text(&self.pick_instance, "インスタンス"))
                                 .width(160.0)
                                 .show_ui(ui, |ui| {
                                     let proj = self.pick_project.clone();
+                                    if self.pick_instances.is_empty() && !busy && !proj.is_empty() {
+                                        tb_load_instances = Some(proj.clone());
+                                        ui.label(
+                                            egui::RichText::new("取得中…").color(MUTED).small(),
+                                        );
+                                    }
                                     for inst in &self.pick_instances {
                                         if ui
                                             .selectable_label(&self.pick_instance == inst, inst)
