@@ -10,18 +10,17 @@ use serde::Deserialize;
 const SCOPE: &str = "https://www.googleapis.com/auth/monitoring.read";
 
 pub struct Config {
-    pub project: String,
-    pub instance: String,
     pub mock: bool,
 }
 
 /// UI に渡す 1 サンプル
 #[derive(Clone, Debug)]
 pub struct Sample {
-    pub t: f64,             // unix 秒
-    pub cpu_percent: f64,   // 0..100
-    pub storage_used: f64,  // bytes
-    pub storage_limit: f64, // bytes（0 のときは未取得）
+    pub t: f64,                // unix 秒
+    pub cpu_percent: f64,      // 0..100
+    pub storage_used: f64,     // bytes
+    pub storage_limit: f64,    // bytes（0 のときは未取得）
+    pub processing_units: f64, // インスタンス容量（PU。0 のときは未取得）
     pub error: Option<String>,
 }
 
@@ -32,6 +31,7 @@ impl Sample {
             cpu_percent: f64::NAN,
             storage_used: f64::NAN,
             storage_limit: 0.0,
+            processing_units: 0.0,
             error: Some(msg),
         }
     }
@@ -88,12 +88,25 @@ pub async fn poll_loop(
         return;
     }
 
+    // エミュレータには Cloud Monitoring が無く、認証情報も通常は無い。
+    // 実 API に繋ぎにいくと「認証初期化に失敗」になるため、明示的に無効化する。
+    if std::env::var("SPANNER_EMULATOR_HOST")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        let _ = tx.send(Sample::error_at(
+            now_unix(),
+            "エミュレータでは Cloud Monitoring は利用できません（CPU/ストレージ監視は無効）".to_string(),
+        ));
+        return;
+    }
+
     let provider = match gcp_auth::provider().await {
         Ok(p) => p,
         Err(e) => {
             let _ = tx.send(Sample::error_at(
                 now_unix(),
-                format!("認証初期化に失敗: {e}"),
+                format!("認証初期化に失敗: {e}（gcloud auth application-default login などで認証してください）"),
             ));
             return;
         }
@@ -101,7 +114,13 @@ pub async fn poll_loop(
     let client = reqwest::Client::new();
 
     loop {
-        let sample = poll_once(&provider, &client, &cfg).await;
+        // 接続先は設定画面で切り替えられるので毎回読む
+        let env = crate::query::current_spanner_env();
+        let sample = if env.configured() {
+            poll_once(&provider, &client, &env.project, &env.instance).await
+        } else {
+            Sample::error_at(now_unix(), "Spanner 環境が未設定です".to_string())
+        };
         if tx.send(sample).is_err() {
             break; // UI が閉じられた
         }
@@ -131,6 +150,7 @@ async fn mock_loop(interval: std::sync::Arc<std::sync::atomic::AtomicU64>, tx: S
             cpu_percent: cpu,
             storage_used: used,
             storage_limit: LIMIT,
+            processing_units: 1000.0,
             error: None,
         };
         if tx.send(sample).is_err() {
@@ -155,15 +175,17 @@ fn pseudo_noise(tick: u64) -> f64 {
 async fn poll_once(
     provider: &Arc<dyn TokenProvider>,
     client: &reqwest::Client,
-    cfg: &Config,
+    project: &str,
+    instance: &str,
 ) -> Sample {
     let t = now_unix();
-    match try_poll(provider, client, cfg).await {
-        Ok((cpu, used, limit)) => Sample {
+    match try_poll(provider, client, project, instance).await {
+        Ok((cpu, used, limit, pu)) => Sample {
             t,
             cpu_percent: cpu * 100.0,
             storage_used: used,
             storage_limit: limit,
+            processing_units: pu,
             error: None,
         },
         Err(e) => Sample::error_at(t, e.to_string()),
@@ -173,17 +195,18 @@ async fn poll_once(
 async fn try_poll(
     provider: &Arc<dyn TokenProvider>,
     client: &reqwest::Client,
-    cfg: &Config,
-) -> anyhow::Result<(f64, f64, f64)> {
+    project: &str,
+    instance: &str,
+) -> anyhow::Result<(f64, f64, f64, f64)> {
     let token = provider.token(&[SCOPE]).await?;
     let bearer = token.as_str();
 
     let cpu = fetch_latest(
         client,
         bearer,
-        &cfg.project,
+        project,
         "spanner.googleapis.com/instance/cpu/utilization",
-        &cfg.instance,
+        instance,
         "ALIGN_MEAN",
     )
     .await?;
@@ -191,9 +214,9 @@ async fn try_poll(
     let used = fetch_latest(
         client,
         bearer,
-        &cfg.project,
+        project,
         "spanner.googleapis.com/instance/storage/used_bytes",
-        &cfg.instance,
+        instance,
         "ALIGN_MEAN",
     )
     .await?;
@@ -201,15 +224,27 @@ async fn try_poll(
     let limit = fetch_latest(
         client,
         bearer,
-        &cfg.project,
+        project,
         "spanner.googleapis.com/instance/storage/limit_bytes",
-        &cfg.instance,
+        instance,
         "ALIGN_MEAN",
     )
     .await
     .unwrap_or(0.0);
 
-    Ok((cpu, used, limit))
+    // インスタンス容量（処理ユニット）。取得失敗しても致命的でないので 0。
+    let pu = fetch_latest(
+        client,
+        bearer,
+        project,
+        "spanner.googleapis.com/instance/processing_units",
+        instance,
+        "ALIGN_MEAN",
+    )
+    .await
+    .unwrap_or(0.0);
+
+    Ok((cpu, used, limit, pu))
 }
 
 /// 指定メトリクスの直近値を取得。

@@ -8,7 +8,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::k8s;
 use crate::monitoring::Sample;
-use crate::query::{EdgeKind, QueryOutcome, SchemaGraph, TableNode, Target};
+use crate::query::{self, EdgeKind, QueryOutcome, SchemaGraph, TableNode, Target};
 
 // ── カラーパレット（モダンダーク） ──
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(56, 189, 248); // sky
@@ -33,6 +33,7 @@ enum View {
     Monitor,
     Data,
     Schema,
+    Import,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -49,6 +50,170 @@ struct PfEntry {
     label: String,
     status: String,
     active: bool,
+}
+
+/// CSV インポートダイアログの状態。テーブルの「CSV をインポート」から開く。
+struct ImportDialog {
+    /// インポート先テーブル名。
+    table: String,
+    /// テーブルのカラム（名前・型・PK）。マッピング表示と型変換に使う。
+    table_columns: Vec<query::Column>,
+    /// 取得元（ファイル/GCS）。インポート時はここからストリーミングする。
+    source: query::ImportSource,
+    /// 表示用のソース名（ファイル名 / gs:// パス）。
+    file_name: String,
+    /// プレビュー用の生バイト（文字コード/区切り変更時に再パースする。先頭のみ）。
+    preview_bytes: Vec<u8>,
+    /// マッピング表示用のプレビュー行（先頭の数行のみ。全行は溜めない）。
+    records: Vec<Vec<String>>,
+    /// 文字コード。
+    encoding: query::Encoding,
+    /// 区切り文字。
+    delimiter: u8,
+    /// 不正行をスキップして続行するか。
+    skip_bad_rows: bool,
+    /// NULL として扱う文字列（空なら無効）。
+    null_token: String,
+    /// 先頭行をヘッダとして扱うか。
+    has_header: bool,
+    /// CSV 側の列見出し（has_header に応じて算出）。
+    csv_headers: Vec<String>,
+    /// テーブル各カラムに割り当てる CSV 列インデックス（None = スキップ）。
+    /// `table_columns` と同じ並び・長さ。
+    mapping: Vec<Option<usize>>,
+    mode: query::ImportMode,
+    empty_as_null: bool,
+    /// 前回の途中（チェックポイント）を無視して最初からやり直すか。
+    fresh: bool,
+    /// パース時の注記（プレビュー打ち切りなど）。
+    note: Option<String>,
+    /// 設定エラー（マッピング未指定など）の即時表示。
+    config_msg: Option<String>,
+}
+
+/// 取込中の進捗スナップショット（リアルタイム表示用）。
+struct ImportProg {
+    /// 進捗割合 0.0..1.0（ソース全体サイズが不明なら None＝不確定表示）。
+    frac: Option<f32>,
+    /// これまでに書き込めた行数。
+    written: usize,
+    /// 読み出した累積バイト数。
+    bytes_done: u64,
+    /// ソース全体のバイト数（不明なら None）。
+    bytes_total: Option<u64>,
+}
+
+/// インポートジョブの状態。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobStatus {
+    Queued,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+/// 順次キューの 1 ジョブ。複数テーブルを並べて投入できる。
+struct ImportJob {
+    /// 正規リクエスト（送信時はこれを clone する。cancel は送信クローンと共有）。
+    req: query::ImportRequest,
+    /// 表示用のソース名。
+    source_name: String,
+    /// 背景へ送信済みか。
+    sent: bool,
+    status: JobStatus,
+    /// 実行開始時刻（ETA/速度の算出用）。
+    started: Option<std::time::Instant>,
+    progress: Option<ImportProg>,
+    result: Option<String>,
+    /// 完了時の結果（レポート用の件数など）。
+    outcome: Option<query::ImportOutcome>,
+}
+
+impl ImportJob {
+    fn is_active(&self) -> bool {
+        matches!(self.status, JobStatus::Queued | JobStatus::Running)
+    }
+}
+
+/// GCS フォルダ一括投入の保留状態。List 応答で各 CSV を enqueue するための雛形。
+struct BulkSpec {
+    /// 雛形リクエスト（source を各オブジェクトに差し替えて使う）。
+    template: query::ImportRequest,
+}
+
+impl ImportDialog {
+    /// has_header に応じて CSV 見出しと自動マッピングを作り直す。
+    fn recompute(&mut self) {
+        let ncols = self.records.iter().map(|r| r.len()).max().unwrap_or(0);
+        self.csv_headers = if self.has_header {
+            let head = self.records.first().cloned().unwrap_or_default();
+            (0..ncols)
+                .map(|i| {
+                    head.get(i)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| format!("列{}", i + 1))
+                })
+                .collect()
+        } else {
+            (0..ncols).map(|i| format!("列{}", i + 1)).collect()
+        };
+        // テーブル列名 → CSV 見出し（大文字小文字・前後空白を無視）で自動対応付け。
+        let lower: Vec<String> = self
+            .csv_headers
+            .iter()
+            .map(|h| h.trim().to_lowercase())
+            .collect();
+        self.mapping = self
+            .table_columns
+            .iter()
+            .map(|c| {
+                let name = c.name.trim().to_lowercase();
+                lower.iter().position(|h| *h == name)
+            })
+            .collect();
+    }
+
+    /// 文字コード/区切りを変えたとき、プレビューを生バイトから再パースして
+    /// 見出し・マッピングを作り直す。
+    fn reparse_preview(&mut self) {
+        self.records =
+            query::parse_preview(&self.preview_bytes, self.encoding, self.delimiter, PREVIEW_ROWS + 1);
+        self.recompute();
+    }
+
+    /// ヘッダを除いたデータ行。
+    fn data_rows(&self) -> &[Vec<String>] {
+        if self.has_header && !self.records.is_empty() {
+            &self.records[1..]
+        } else {
+            &self.records
+        }
+    }
+
+    fn data_rows_count(&self) -> usize {
+        self.data_rows().len()
+    }
+}
+
+/// GCS から CSV を取り込むための入力ダイアログ。
+/// URI を入力 → 背景で取得 → 成功したら ImportDialog（マッピング画面）へ引き継ぐ。
+struct GcsDialog {
+    /// インポート先テーブル（取得成功後に ImportDialog へ渡す）。
+    target: TableNode,
+    /// 入力中の `gs://bucket/path.csv`。
+    uri: String,
+    /// 進捗・エラー表示。
+    status: Option<String>,
+    /// 一覧したバケット名（folders/objects から URI を組み立てるのに使う）。
+    bucket: String,
+    /// 一覧結果: 直下の擬似フォルダ（末尾 / 付きフルパス）。
+    folders: Vec<String>,
+    /// 一覧結果: 直下のオブジェクト（フルパス）。
+    objects: Vec<String>,
+    /// 現在一覧している `gs://bucket/prefix`（ブラウズ位置の見出し）。
+    listed_at: Option<String>,
 }
 
 /// リソースブラウザの行操作（描画中に収集し、借用解消後に実行する）。
@@ -190,6 +355,10 @@ pub struct Channels {
     pub sample_rx: Receiver<Sample>,
     pub req_tx: UnboundedSender<(Target, String)>,
     pub res_rx: Receiver<QueryOutcome>,
+    pub import_req_tx: UnboundedSender<query::ImportRequest>,
+    pub import_res_rx: Receiver<query::ImportProgress>,
+    pub gcs_req_tx: UnboundedSender<query::GcsRequest>,
+    pub gcs_res_rx: Receiver<query::GcsResponse>,
     pub schema_rx: Receiver<SchemaGraph>,
     pub kube_metrics_rx: Receiver<k8s::KubeMetrics>,
     pub kube_topo_req_tx: UnboundedSender<Option<String>>,
@@ -219,6 +388,24 @@ pub struct MonitorApp {
     req_tx: UnboundedSender<(Target, String)>,
     res_rx: Receiver<QueryOutcome>,
     schema_rx: Receiver<SchemaGraph>,
+    // CSV インポート
+    import_req_tx: UnboundedSender<query::ImportRequest>,
+    import_res_rx: Receiver<query::ImportProgress>,
+    import_dialog: Option<ImportDialog>,
+    import_pending: bool,
+    /// 順次インポートキュー（複数テーブルを順番に処理）。
+    import_jobs: Vec<ImportJob>,
+    /// 証跡レポートの保存先（スクショ受信待ち。受信したら PNG を書いて Finder で開く）。
+    pending_report_dir: Option<std::path::PathBuf>,
+    /// GCS フォルダ一括投入の保留（List 応答待ち）。
+    pending_bulk: Option<BulkSpec>,
+    /// インポートタブで選択中の取り込み先テーブル名。
+    import_table_pick: String,
+    // GCS インポート（CSV 取得 → ImportDialog へ）
+    gcs_req_tx: UnboundedSender<query::GcsRequest>,
+    gcs_res_rx: Receiver<query::GcsResponse>,
+    gcs_dialog: Option<GcsDialog>,
+    gcs_pending: bool,
     sql: String,
     data_result: Option<QueryOutcome>,
     data_pending: bool,
@@ -309,6 +496,10 @@ pub struct MonitorApp {
     poll_interval: std::sync::Arc<std::sync::atomic::AtomicU64>,
     conn_info: String,
     settings_open: bool,
+    // Spanner 接続環境（複数登録・切替）
+    env_profiles: Vec<EnvProfile>,
+    active_env: Option<String>,
+    env_form: EnvProfile,
     contexts: Vec<String>,
     current_context: Option<String>,
     contexts_loaded: bool,
@@ -316,15 +507,69 @@ pub struct MonitorApp {
     // GCP 認証（gcloud ADC ログイン）
     auth_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     auth_status: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    // 起動時 ADC ログイン確認とログイン誘導ダイアログ
+    auth_ok: std::sync::Arc<std::sync::Mutex<Option<bool>>>, // None=確認中
+    auth_check_started: bool,
+    auth_was_running: bool,
+    login_dialog: bool,
+    login_dismissed: bool,
+
+    // 環境の自動検出（gcloud で instance/database を列挙）
+    discover_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[allow(clippy::type_complexity)]
+    discover_result: std::sync::Arc<std::sync::Mutex<Option<Result<Vec<EnvProfile>, String>>>>,
+    discover_project: String,
+
+    // ADC で project/instance/database をカスケード選択（REST + 1 回のログイン）
+    pick_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pick_result: std::sync::Arc<std::sync::Mutex<Option<PickMsg>>>,
+    pick_projects: Vec<String>,
+    pick_instances: Vec<String>,
+    pick_databases: Vec<String>,
+    pick_project: String,
+    pick_instance: String,
+    pick_database: String,
+    pick_error: Option<String>,
 
     section: Section,
     view: View,
+}
+
+/// project/instance/database カスケード選択の背景取得結果。
+enum PickMsg {
+    Projects(Result<Vec<String>, String>),
+    Instances(Result<Vec<String>, String>),
+    Databases(Result<Vec<String>, String>),
 }
 
 impl MonitorApp {
     pub fn new(ch: Channels, cc: &eframe::CreationContext<'_>) -> Self {
         install_japanese_font(&cc.egui_ctx);
         setup_style(&cc.egui_ctx);
+
+        // 登録済みの接続環境を読み込み、選択中があれば適用する
+        let store = load_envs();
+        let mut conn_info = ch.conn_info;
+        // トップのカスケード選択の初期値（active プロファイル or 起動時 env）。
+        let (mut init_p, mut init_i, mut init_d) = (
+            std::env::var("SPANNER_PROJECT").unwrap_or_default(),
+            std::env::var("SPANNER_INSTANCE").unwrap_or_default(),
+            std::env::var("SPANNER_DATABASE").unwrap_or_default(),
+        );
+        if let Some(active) = &store.active {
+            if let Some(p) = store.profiles.iter().find(|p| &p.name == active) {
+                crate::query::set_spanner_env(crate::query::SpannerEnv {
+                    project: p.project.clone(),
+                    instance: p.instance.clone(),
+                    database: p.database.clone(),
+                });
+                conn_info = format!("{} · {}/{}/{}", p.name, p.project, p.instance, p.database);
+                init_p = p.project.clone();
+                init_i = p.instance.clone();
+                init_d = p.database.clone();
+            }
+        }
+
         Self {
             sample_rx: ch.sample_rx,
             samples: VecDeque::new(),
@@ -333,6 +578,18 @@ impl MonitorApp {
             req_tx: ch.req_tx,
             res_rx: ch.res_rx,
             schema_rx: ch.schema_rx,
+            import_req_tx: ch.import_req_tx,
+            import_res_rx: ch.import_res_rx,
+            import_dialog: None,
+            import_pending: false,
+            import_jobs: Vec::new(),
+            pending_report_dir: None,
+            pending_bulk: None,
+            import_table_pick: String::new(),
+            gcs_req_tx: ch.gcs_req_tx,
+            gcs_res_rx: ch.gcs_res_rx,
+            gcs_dialog: None,
+            gcs_pending: false,
             sql: "SELECT * FROM LoadTest LIMIT 100".to_string(),
             data_result: None,
             data_pending: false,
@@ -400,13 +657,33 @@ impl MonitorApp {
             pf_local: String::new(),
             pf_remote: String::new(),
             poll_interval: ch.poll_interval,
-            conn_info: ch.conn_info,
+            conn_info,
             settings_open: false,
+            env_profiles: store.profiles,
+            active_env: store.active,
+            env_form: EnvProfile::default(),
             contexts: Vec::new(),
             current_context: None,
             contexts_loaded: false,
             auth_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             auth_status: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            auth_ok: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            auth_check_started: false,
+            auth_was_running: false,
+            login_dialog: false,
+            login_dismissed: false,
+            discover_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            discover_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            discover_project: String::new(),
+            pick_busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pick_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            pick_projects: Vec::new(),
+            pick_instances: Vec::new(),
+            pick_databases: Vec::new(),
+            pick_project: init_p,
+            pick_instance: init_i,
+            pick_database: init_d,
+            pick_error: None,
             section: Section::Spanner,
             view: View::Monitor,
         }
@@ -424,26 +701,251 @@ impl MonitorApp {
         let running = self.auth_running.clone();
         let status = self.auth_status.clone();
         std::thread::spawn(move || {
-            let out = std::process::Command::new("gcloud")
+            let out = std::process::Command::new(gcloud_bin())
                 .args(["auth", "application-default", "login"])
                 .output();
             let msg = match out {
                 Ok(o) if o.status.success() => {
-                    "ログイン成功（ADC 設定済み）。監視は再起動後に反映されます。".to_string()
+                    "ログイン成功（ADC 設定済み）。接続先を選び直すか再起動で反映されます。".to_string()
                 }
                 Ok(o) => {
                     let err = String::from_utf8_lossy(&o.stderr);
                     format!("失敗: {}", err.lines().last().unwrap_or("").trim())
                 }
-                Err(e) => format!("gcloud 実行失敗: {e}（gcloud がインストールされていますか）"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => GCLOUD_MISSING.to_string(),
+                Err(e) => format!("gcloud 実行失敗: {e}"),
             };
             *status.lock().unwrap() = Some(msg);
             running.store(false, Ordering::Relaxed);
         });
     }
 
+    /// 起動時/ログイン後に ADC ログイン状態を確認し、未ログインならダイアログを出す。
+    fn check_login_state(&mut self, ctx: &egui::Context) {
+        // エミュレータ接続時は認証不要。
+        if std::env::var("SPANNER_EMULATOR_HOST").is_ok() {
+            return;
+        }
+        // 起動直後に 1 回チェック。
+        if !self.auth_check_started {
+            self.auth_check_started = true;
+            self.start_adc_check(ctx);
+        }
+        // ログイン処理が終わった瞬間に再チェック（成功していればダイアログが消える）。
+        let running = self
+            .auth_running
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if self.auth_was_running && !running {
+            self.start_adc_check(ctx);
+        }
+        self.auth_was_running = running;
+        // チェック結果を評価。
+        let result = *self.auth_ok.lock().unwrap();
+        if let Some(ok) = result {
+            if ok {
+                self.login_dialog = false;
+            } else if !self.login_dismissed {
+                self.login_dialog = true;
+            }
+        }
+        self.login_window(ctx);
+    }
+
+    /// ADC（ログイン状態）を背景で確認する。結果は auth_ok に入る。
+    fn start_adc_check(&self, ctx: &egui::Context) {
+        *self.auth_ok.lock().unwrap() = None; // 確認中
+        let slot = self.auth_ok.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let ok = run_blocking(query::check_adc()).is_ok();
+            *slot.lock().unwrap() = Some(ok);
+            ctx.request_repaint();
+        });
+    }
+
+    /// 未ログイン時のログイン誘導ダイアログ。
+    fn login_window(&mut self, ctx: &egui::Context) {
+        if !self.login_dialog {
+            return;
+        }
+        let running = self
+            .auth_running
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let status = self.auth_status.lock().unwrap().clone();
+        let mut login = false;
+        let mut dismiss = false;
+        egui::Window::new("GCP ログイン")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("GCP にログインしていません（ADC 認証情報が見つかりません）。")
+                        .strong(),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Spanner への接続・監視・プロジェクト/DB の一覧にはログインが必要です。",
+                    )
+                    .color(MUTED)
+                    .small(),
+                );
+                // gcloud が無い場合はインストール先を先に案内。
+                if !gcloud_found() {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(251, 191, 36),
+                        "gcloud が未インストールです。先に Google Cloud SDK が必要です:",
+                    );
+                    ui.hyperlink("https://cloud.google.com/sdk/docs/install");
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!running, egui::Button::new("ログイン（gcloud ADC）"))
+                        .on_hover_text("gcloud auth application-default login を実行（ブラウザ認証）")
+                        .clicked()
+                    {
+                        login = true;
+                    }
+                    if running {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("ブラウザで認証してください…")
+                                .color(MUTED)
+                                .small(),
+                        );
+                    }
+                    if ui.button("後で").clicked() {
+                        dismiss = true;
+                    }
+                });
+                if let Some(s) = &status {
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(s).color(ACCENT).small());
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "※ エミュレータを使う場合は SPANNER_EMULATOR_HOST を設定して再起動するとログイン不要です。",
+                    )
+                    .color(MUTED)
+                    .small(),
+                );
+            });
+        if login {
+            self.gcp_login();
+        }
+        if dismiss {
+            self.login_dialog = false;
+            self.login_dismissed = true;
+        }
+    }
+
+    /// gcloud で接続環境（instance/database）を自動検出して登録する。
+    fn discover_envs(&mut self) {
+        use std::sync::atomic::Ordering;
+        if self.discover_running.load(Ordering::Relaxed) {
+            return;
+        }
+        self.discover_running.store(true, Ordering::Relaxed);
+        *self.discover_result.lock().unwrap() = None;
+        let project = self.discover_project.trim().to_string();
+        let running = self.discover_running.clone();
+        let result = self.discover_result.clone();
+        std::thread::spawn(move || {
+            let r = gcloud_discover(project);
+            *result.lock().unwrap() = Some(r);
+            running.store(false, Ordering::Relaxed);
+        });
+    }
+
+    /// 自動検出の結果が届いていれば env_profiles に取り込む。
+    fn drain_discovery(&mut self) {
+        let taken = self.discover_result.lock().unwrap().take();
+        if let Some(r) = taken {
+            match r {
+                Ok(found) => {
+                    let mut added = 0;
+                    for p in found {
+                        if !self.env_profiles.iter().any(|e| e.name == p.name) {
+                            self.env_profiles.push(p);
+                            added += 1;
+                        }
+                    }
+                    save_envs(&self.env_profiles, &self.active_env);
+                    self.copy_note = Some(format!("環境を {added} 件検出しました"));
+                }
+                Err(e) => self.copy_note = Some(format!("検出に失敗: {e}")),
+            }
+        }
+    }
+
+    /// ADC で一覧を取得する背景スレッドを起動する共通処理。
+    fn spawn_pick<F>(&self, ctx: &egui::Context, f: F)
+    where
+        F: FnOnce() -> PickMsg + Send + 'static,
+    {
+        if self.pick_busy.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return; // 取得中
+        }
+        let busy = self.pick_busy.clone();
+        let result = self.pick_result.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = f();
+            *result.lock().unwrap() = Some(msg);
+            busy.store(false, std::sync::atomic::Ordering::Relaxed);
+            ctx.request_repaint();
+        });
+    }
+
+    fn load_projects(&self, ctx: &egui::Context) {
+        self.spawn_pick(ctx, || PickMsg::Projects(run_blocking(query::list_projects())));
+    }
+
+    fn load_instances(&self, ctx: &egui::Context, project: String) {
+        self.spawn_pick(ctx, move || {
+            PickMsg::Instances(run_blocking(query::list_instances(&project)))
+        });
+    }
+
+    fn load_databases(&self, ctx: &egui::Context, project: String, instance: String) {
+        self.spawn_pick(ctx, move || {
+            PickMsg::Databases(run_blocking(query::list_databases(&project, &instance)))
+        });
+    }
+
+    /// カスケード選択の取得結果を取り込む。
+    fn drain_pick(&mut self) {
+        let Some(msg) = self.pick_result.lock().unwrap().take() else {
+            return;
+        };
+        match msg {
+            PickMsg::Projects(Ok(v)) => {
+                self.pick_projects = v;
+                self.pick_error = None;
+            }
+            PickMsg::Instances(Ok(v)) => {
+                self.pick_instances = v;
+                self.pick_error = None;
+            }
+            PickMsg::Databases(Ok(v)) => {
+                self.pick_databases = v;
+                self.pick_error = None;
+            }
+            PickMsg::Projects(Err(e))
+            | PickMsg::Instances(Err(e))
+            | PickMsg::Databases(Err(e)) => {
+                self.pick_error = Some(e);
+            }
+        }
+    }
+
     /// バックグラウンドスレッドから届いたデータを取り込む
     fn drain(&mut self) {
+        self.drain_discovery();
+        self.drain_pick();
         while let Ok(s) = self.sample_rx.try_recv() {
             match &s.error {
                 Some(e) => self.last_error = Some(e.clone()),
@@ -461,6 +963,114 @@ impl MonitorApp {
         while let Ok(g) = self.schema_rx.try_recv() {
             self.schema_pending = false;
             self.schema_graph = Some(g);
+        }
+        while let Ok(ev) = self.import_res_rx.try_recv() {
+            // 背景は逐次処理なので、進捗/完了は「実行中ジョブ」に属する。
+            let running = self
+                .import_jobs
+                .iter_mut()
+                .find(|j| j.status == JobStatus::Running);
+            match ev {
+                query::ImportProgress::Progress {
+                    written,
+                    bytes_done,
+                    bytes_total,
+                    ..
+                } => {
+                    let frac = progress_fraction(bytes_done, bytes_total);
+                    if let Some(j) = running {
+                        j.progress = Some(ImportProg {
+                            frac,
+                            written,
+                            bytes_done,
+                            bytes_total,
+                        });
+                    }
+                }
+                query::ImportProgress::Done(out) => {
+                    let msg = format_import_result(&out);
+                    if let Some(j) = running {
+                        j.status = if out.cancelled {
+                            JobStatus::Cancelled
+                        } else if out.error.is_some() {
+                            JobStatus::Failed
+                        } else {
+                            JobStatus::Done
+                        };
+                        j.progress = None;
+                        j.result = Some(msg.clone());
+                        j.outcome = Some(out); // レポート用に件数を保持
+                    }
+                    self.copy_note = Some(msg);
+                    // 次のジョブへ。
+                    self.pump_import_queue();
+                }
+            }
+        }
+        while let Ok(resp) = self.gcs_res_rx.try_recv() {
+            self.gcs_pending = false;
+            match resp {
+                query::GcsResponse::Fetched(out) => match out.data {
+                    // 取得成功 → GCS ダイアログを閉じてマッピング画面へ引き継ぐ。
+                    Some(bytes) => {
+                        if let Some(d) = self.gcs_dialog.take() {
+                            self.build_import_dialog(
+                                d.target,
+                                query::ImportSource::Gcs(out.uri.clone()),
+                                out.uri,
+                                bytes,
+                            );
+                        }
+                    }
+                    None => {
+                        let msg = format!("GCS 取得失敗: {}", out.error.unwrap_or_default());
+                        if let Some(d) = &mut self.gcs_dialog {
+                            d.status = Some(msg.clone());
+                        }
+                        self.copy_note = Some(msg);
+                    }
+                },
+                query::GcsResponse::Listed(out) => {
+                    if let Some(bulk) = self.pending_bulk.take() {
+                        // フォルダ一括投入: 直下の *.csv をそれぞれジョブ化。
+                        if let Some(e) = out.error {
+                            self.copy_note = Some(format!("フォルダ一覧に失敗: {e}"));
+                        } else {
+                            let csvs = csv_object_uris(&out.bucket, &out.objects);
+                            let added = csvs.len();
+                            for (uri, name) in csvs {
+                                let mut req = bulk.template.clone();
+                                req.source = query::ImportSource::Gcs(uri);
+                                req.cancel = std::sync::Arc::new(
+                                    std::sync::atomic::AtomicBool::new(false),
+                                );
+                                self.push_job(req, name);
+                            }
+                            self.copy_note = Some(if added == 0 {
+                                "このフォルダに CSV はありません".into()
+                            } else {
+                                format!("{added} 件の CSV をキューに追加しました")
+                            });
+                        }
+                    } else if let Some(d) = &mut self.gcs_dialog {
+                        match out.error {
+                            Some(e) => d.status = Some(format!("一覧取得失敗: {e}")),
+                            None => {
+                                let n = out.folders.len() + out.objects.len();
+                                d.folders = out.folders;
+                                d.objects = out.objects;
+                                d.listed_at = Some(format!("gs://{}/{}", out.bucket, out.prefix));
+                                d.bucket = out.bucket;
+                                d.status = Some(if n == 0 {
+                                    "（この階層に CSV はありません）".into()
+                                } else {
+                                    format!("{n} 件")
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
         while let Ok(m) = self.kube_metrics_rx.try_recv() {
             self.kube_metrics = Some(m);
@@ -590,6 +1200,58 @@ impl MonitorApp {
         // 監視は次のポーリングで新 context を反映（context_args を毎回読むため）
         self.kube_metrics = None;
         self.on_namespace_changed();
+    }
+
+    /// 登録済み環境（プロファイル）の i 番目に接続を切り替える。
+    fn select_env_profile(&mut self, i: usize) {
+        if let Some(p) = self.env_profiles.get(i).cloned() {
+            crate::query::set_spanner_env(crate::query::SpannerEnv {
+                project: p.project.clone(),
+                instance: p.instance.clone(),
+                database: p.database.clone(),
+            });
+            self.active_env = Some(p.name.clone());
+            self.conn_info = format!("{} · {}/{}/{}", p.name, p.project, p.instance, p.database);
+            self.data_result = None;
+            self.schema_graph = None; // 新環境のスキーマを取り直す
+            self.kube_metrics = None;
+            save_envs(&self.env_profiles, &self.active_env);
+            self.copy_note = Some(format!("環境を切り替えました: {}", p.name));
+        }
+    }
+
+    /// カスケード選択（pick_project/instance/database）の接続を適用する。
+    /// プロファイルにも登録して再起動後も使えるようにする。
+    fn apply_picked_connection(&mut self) {
+        let (project, instance, database) = (
+            self.pick_project.clone(),
+            self.pick_instance.clone(),
+            self.pick_database.clone(),
+        );
+        if project.is_empty() || instance.is_empty() || database.is_empty() {
+            return;
+        }
+        crate::query::set_spanner_env(crate::query::SpannerEnv {
+            project: project.clone(),
+            instance: instance.clone(),
+            database: database.clone(),
+        });
+        let name = format!("{project}/{instance}/{database}");
+        if !self.env_profiles.iter().any(|e| e.name == name) {
+            self.env_profiles.push(EnvProfile {
+                name: name.clone(),
+                project: project.clone(),
+                instance: instance.clone(),
+                database: database.clone(),
+            });
+        }
+        self.active_env = Some(name.clone());
+        save_envs(&self.env_profiles, &self.active_env);
+        self.conn_info = format!("{name} · {project}/{instance}/{database}");
+        self.data_result = None;
+        self.schema_graph = None; // 新環境のスキーマを取り直す
+        self.kube_metrics = None;
+        self.copy_note = Some(format!("接続を {name} に切り替えました"));
     }
 
     /// namespace 変更時に全ビューを取り直す（監視はクライアント側フィルタ）。
@@ -732,7 +1394,14 @@ impl MonitorApp {
 impl eframe::App for MonitorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain();
-        ctx.request_repaint_after(Duration::from_secs(1));
+        self.drain_screenshot(ctx);
+        self.check_login_state(ctx);
+        // 取込中は進捗バーを滑らかに更新するため高頻度で再描画。
+        if self.import_pending {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        } else {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
 
         // VS Code 風の左アクティビティバー
         egui::SidePanel::left("activity")
@@ -748,6 +1417,12 @@ impl eframe::App for MonitorApp {
             });
 
         // ビュー切替タブ（セクションごとに内容が変わる）
+        // 接続切替の操作はクロージャ内で借用中なので、解放後に適用する。
+        // トップのカスケード選択（借用解消後に適用）。
+        let mut tb_load_projects = false;
+        let mut tb_load_instances: Option<String> = None;
+        let mut tb_load_databases: Option<(String, String)> = None;
+        let mut tb_apply = false;
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -766,6 +1441,98 @@ impl eframe::App for MonitorApp {
                         if tab(ui, self.view == View::Schema, "スキーマ") {
                             self.view = View::Schema;
                         }
+                        ui.add_space(gap);
+                        if tab(ui, self.view == View::Import, "インポート") {
+                            self.view = View::Import;
+                        }
+                        // 右寄せで project / instance / DB のカスケード選択。
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let emu = std::env::var("SPANNER_EMULATOR_HOST").is_ok();
+                            let busy = self.pick_busy.load(std::sync::atomic::Ordering::Relaxed);
+                            // ③ DB（右端）。選んだら接続適用。
+                            egui::ComboBox::from_id_salt("tb_db")
+                                .selected_text(combo_text(&self.pick_database, "DB"))
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    for db in &self.pick_databases {
+                                        if ui
+                                            .selectable_label(&self.pick_database == db, db)
+                                            .clicked()
+                                        {
+                                            self.pick_database = db.clone();
+                                            tb_apply = true;
+                                        }
+                                    }
+                                });
+                            // ② インスタンス。
+                            egui::ComboBox::from_id_salt("tb_inst")
+                                .selected_text(combo_text(&self.pick_instance, "インスタンス"))
+                                .width(160.0)
+                                .show_ui(ui, |ui| {
+                                    let proj = self.pick_project.clone();
+                                    for inst in &self.pick_instances {
+                                        if ui
+                                            .selectable_label(&self.pick_instance == inst, inst)
+                                            .clicked()
+                                        {
+                                            self.pick_instance = inst.clone();
+                                            self.pick_database.clear();
+                                            self.pick_databases.clear();
+                                            tb_load_databases = Some((proj.clone(), inst.clone()));
+                                        }
+                                    }
+                                });
+                            // ① プロジェクト。開いたとき空なら自動取得。
+                            let resp = egui::ComboBox::from_id_salt("tb_proj")
+                                .selected_text(combo_text(&self.pick_project, "プロジェクト"))
+                                .width(180.0)
+                                .show_ui(ui, |ui| {
+                                    if self.pick_projects.is_empty() && !busy {
+                                        tb_load_projects = true;
+                                    }
+                                    if busy && self.pick_projects.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new("取得中…").color(MUTED).small(),
+                                        );
+                                    }
+                                    for p in &self.pick_projects {
+                                        if ui
+                                            .selectable_label(&self.pick_project == p, p)
+                                            .clicked()
+                                        {
+                                            self.pick_project = p.clone();
+                                            self.pick_instance.clear();
+                                            self.pick_database.clear();
+                                            self.pick_instances.clear();
+                                            self.pick_databases.clear();
+                                            tb_load_instances = Some(p.clone());
+                                        }
+                                    }
+                                });
+                            // プロジェクトの再取得ボタン。
+                            if resp.response.secondary_clicked() {
+                                tb_load_projects = true;
+                            }
+                            if busy {
+                                ui.spinner();
+                            }
+                            // ラベルは短く。詳細（エミュ印・取得エラー）はホバーで出す。
+                            let label = if emu { "接続(emu):" } else { "接続:" };
+                            let color = if emu {
+                                egui::Color32::from_rgb(251, 191, 36)
+                            } else {
+                                MUTED
+                            };
+                            let resp = ui.label(egui::RichText::new(label).color(color).small());
+                            if emu {
+                                resp.on_hover_text(
+                                    "エミュレータ接続中。プロジェクト/インスタンス/DB の一覧取得には\
+                                     実 Spanner 接続（ADC ログイン）が必要です。",
+                                );
+                            } else if let Some(e) = &self.pick_error {
+                                resp.on_hover_text(format!("一覧取得エラー: {e}"));
+                            }
+                        });
                     }
                     Section::Kube => {
                         if tab(ui, self.kube_view == KubeView::Monitor, "監視") {
@@ -858,10 +1625,25 @@ impl eframe::App for MonitorApp {
             });
             ui.add_space(8.0);
         });
+        // トップのカスケード選択（借用解消後）。
+        if tb_load_projects {
+            self.load_projects(ctx);
+        }
+        if let Some(p) = tb_load_instances {
+            self.load_instances(ctx, p);
+        }
+        if let Some((p, i)) = tb_load_databases {
+            self.load_databases(ctx, p, i);
+        }
+        if tb_apply {
+            self.apply_picked_connection();
+        }
 
-        // 図・イベントは初回表示時に自動取得（データビューのツリーもスキーマを使う）
+        // 図・イベントは初回表示時に自動取得（データ/インポートのテーブル一覧もスキーマを使う）
         if self.section == Section::Spanner
-            && (self.view == View::Schema || self.view == View::Data)
+            && (self.view == View::Schema
+                || self.view == View::Data
+                || self.view == View::Import)
             && self.schema_graph.is_none()
             && !self.schema_pending
         {
@@ -905,6 +1687,7 @@ impl eframe::App for MonitorApp {
                 View::Schema => self.schema_view(ctx),
                 View::Monitor => self.monitor_view(ctx),
                 View::Data => self.data_view(ctx),
+                View::Import => self.import_view(ctx),
             },
             Section::Kube => match self.kube_view {
                 KubeView::Monitor => self.kube_monitor_view(ctx),
@@ -915,6 +1698,8 @@ impl eframe::App for MonitorApp {
         }
 
         self.settings_window(ctx);
+        // インポートのマッピング/進捗は専用「インポート」タブ内にインライン描画する。
+        self.gcs_window(ctx);
         self.logs_window(ctx);
         self.confirm_window(ctx);
         self.yaml_editor_window(ctx);
@@ -973,6 +1758,9 @@ impl MonitorApp {
                         );
                     } else {
                         chip(ui, "Storage", &human_bytes(s.storage_used), STORAGE_COLOR);
+                    }
+                    if s.processing_units > 0.0 {
+                        chip(ui, "容量", &capacity_label(s.processing_units), ACCENT);
                     }
                 } else {
                     ui.label(egui::RichText::new("データ取得待ち…").color(MUTED));
@@ -1063,6 +1851,9 @@ impl MonitorApp {
         // 実行したい SQL（ツリー/履歴クリックで設定し、借用解消後に実行）
         let mut load_run: Option<String> = None;
         let mut ddl_copy: Option<String> = None;
+        // CSV インポート対象テーブル（借用解消後にダイアログを開く）
+        let mut import_open: Option<TableNode> = None;
+        let mut gcs_open: Option<TableNode> = None;
 
         // 左: オブジェクトツリー
         egui::SidePanel::left("db_objects")
@@ -1081,6 +1872,11 @@ impl MonitorApp {
                         self.run_schema();
                     }
                 });
+                ui.label(
+                    egui::RichText::new("インポートは上の「インポート」タブから")
+                        .color(MUTED)
+                        .small(),
+                );
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -1111,10 +1907,10 @@ impl MonitorApp {
                                 let tri = if expanded { "▼" } else { "▶" };
                                 if ui
                                     .add(
-                                        egui::Label::new(format!("{tri} 🗂 {}", node.name))
+                                        egui::Label::new(format!("{tri} {}", node.name))
                                             .sense(egui::Sense::click()),
                                     )
-                                    .on_hover_text("クリックで展開 / ダブルクリックで SELECT")
+                                    .on_hover_text("クリックで展開 / 右クリックでメニュー")
                                     .clicked()
                                 {
                                     if expanded {
@@ -1123,12 +1919,28 @@ impl MonitorApp {
                                         self.tree_expanded.insert(node.name.clone());
                                     }
                                 }
+                                // 名前の右に小さなインポートボタン。
+                                if ui
+                                    .small_button("⬆")
+                                    .on_hover_text(format!("{} に CSV をインポート", node.name))
+                                    .clicked()
+                                {
+                                    import_open = Some(node.clone());
+                                }
                             })
                             .response
                             .context_menu(|ui| {
                                 if ui.button("SELECT * を実行").clicked() {
                                     load_run =
                                         Some(format!("SELECT * FROM `{}` LIMIT 100", node.name));
+                                    ui.close_menu();
+                                }
+                                if ui.button("CSV をインポート…").clicked() {
+                                    import_open = Some(node.clone());
+                                    ui.close_menu();
+                                }
+                                if ui.button("GCS から CSV をインポート…").clicked() {
+                                    gcs_open = Some(node.clone());
                                     ui.close_menu();
                                 }
                                 if ui.button("テーブル名をコピー").clicked() {
@@ -1240,6 +2052,7 @@ impl MonitorApp {
 
         // 中央: 強化グリッド
         let mut new_sort: Option<Option<(usize, bool)>> = None;
+        let mut save_msg: Option<String> = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(result) = &self.data_result else {
                 centered_hint(ui, "SQL を入力して「実行」を押してください");
@@ -1272,8 +2085,22 @@ impl MonitorApp {
                 {
                     ui.ctx().copy_text(to_csv(result));
                 }
+                if ui
+                    .button("CSV保存")
+                    .on_hover_text("結果を CSV ファイルに保存（~/Downloads）")
+                    .clicked()
+                {
+                    save_msg = Some(match save_csv(result) {
+                        Ok(p) => format!("保存しました: {}", p.display()),
+                        Err(e) => format!("保存に失敗: {e}"),
+                    });
+                }
                 if self.data_sort.is_some() && ui.button("並び解除").clicked() {
                     new_sort = Some(None);
+                }
+                // コピー/保存などの通知をその場に表示
+                if let Some(note) = &self.copy_note {
+                    ui.label(egui::RichText::new(note).color(ACCENT).small());
                 }
             });
             ui.separator();
@@ -1284,13 +2111,985 @@ impl MonitorApp {
         if let Some(s) = new_sort {
             self.data_sort = s;
         }
+        if let Some(m) = save_msg {
+            self.copy_note = Some(m);
+        }
         if let Some(ddl) = ddl_copy {
             ctx.copy_text(ddl);
             self.copy_note = Some("DDL をコピーしました".into());
         }
+        if let Some(node) = import_open {
+            self.open_import_dialog(node);
+        }
+        if let Some(node) = gcs_open {
+            self.open_gcs_dialog(node);
+        }
         if let Some(sql) = load_run {
             self.sql = sql.clone();
             self.run_sql(sql);
+        }
+    }
+
+    // ── CSV インポート ──
+
+    /// 指定テーブル向けにファイルを選んでインポートダイアログを開く。
+    /// マッピング用に先頭プレフィックスだけ読む（全行は溜めない。取込時に再ストリーム）。
+    fn open_import_dialog(&mut self, node: TableNode) {
+        let Some(path) = pick_csv_file() else {
+            return; // キャンセル
+        };
+        let file_name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+        let bytes = match read_file_prefix(&path, PREVIEW_BYTES) {
+            Ok(b) => b,
+            Err(e) => {
+                self.copy_note = Some(format!("CSV を読めません: {e}"));
+                return;
+            }
+        };
+        self.build_import_dialog(node, query::ImportSource::File(path), file_name, bytes);
+    }
+
+    /// プレビュー（生バイト）からインポートダイアログ（マッピング画面）を組み立てて開く。
+    /// 実データはここに溜めず、`source` から取込時にストリーミングする。
+    fn build_import_dialog(
+        &mut self,
+        node: TableNode,
+        source: query::ImportSource,
+        display_name: String,
+        preview_bytes: Vec<u8>,
+    ) {
+        let encoding = query::Encoding::Utf8;
+        let delimiter = b',';
+        let records = query::parse_preview(&preview_bytes, encoding, delimiter, PREVIEW_ROWS + 1);
+        if records.is_empty() {
+            self.copy_note = Some("CSV が空です".into());
+            return;
+        }
+        let mut dialog = ImportDialog {
+            table: node.name,
+            table_columns: node.columns,
+            source,
+            file_name: display_name,
+            preview_bytes,
+            records,
+            encoding,
+            delimiter,
+            skip_bad_rows: false,
+            null_token: String::new(),
+            has_header: true,
+            csv_headers: Vec::new(),
+            mapping: Vec::new(),
+            mode: query::ImportMode::Insert,
+            empty_as_null: true,
+            fresh: false,
+            note: Some("プレビューは先頭のみ。取込時に全行をストリーミングします。".into()),
+            config_msg: None,
+        };
+        dialog.recompute();
+        self.import_dialog = Some(dialog);
+        // マッピングは専用「インポート」タブに表示する。
+        self.section = Section::Spanner;
+        self.view = View::Import;
+    }
+
+    /// 指定テーブル向けに GCS インポート（URI 入力）ダイアログを開く。
+    fn open_gcs_dialog(&mut self, node: TableNode) {
+        self.gcs_dialog = Some(GcsDialog {
+            target: node,
+            uri: "gs://".to_string(),
+            status: None,
+            bucket: String::new(),
+            folders: Vec::new(),
+            objects: Vec::new(),
+            listed_at: None,
+        });
+    }
+
+    /// GCS ダイアログの URI を背景へ送って取得を開始する。
+    fn start_gcs_fetch(&mut self) {
+        let Some(d) = &self.gcs_dialog else { return };
+        let uri = d.uri.trim().to_string();
+        if uri.is_empty() || uri == "gs://" {
+            if let Some(d) = &mut self.gcs_dialog {
+                d.status = Some("gs://bucket/path.csv を入力してください".into());
+            }
+            return;
+        }
+        if self.gcs_req_tx.send(query::GcsRequest::Fetch(uri)).is_ok() {
+            self.gcs_pending = true;
+            if let Some(d) = &mut self.gcs_dialog {
+                d.status = Some("取得中…".into());
+            }
+        } else if let Some(d) = &mut self.gcs_dialog {
+            d.status = Some(WORKER_GONE.into());
+        }
+    }
+
+    /// 指定 `gs://bucket/prefix` の一覧を背景へ要求する。
+    fn start_gcs_list(&mut self, location: String) {
+        if self.gcs_pending {
+            return;
+        }
+        if self.gcs_req_tx.send(query::GcsRequest::List(location)).is_ok() {
+            self.gcs_pending = true;
+            if let Some(d) = &mut self.gcs_dialog {
+                d.status = Some("一覧取得中…".into());
+            }
+        } else if let Some(d) = &mut self.gcs_dialog {
+            d.status = Some(WORKER_GONE.into());
+        }
+    }
+
+    /// 設定ダイアログの内容から ImportRequest を組み立てる（検証込み）。
+    /// マッピング不足・主キー未割当はエラーメッセージで返す。
+    fn dialog_request(&self, dry_run: bool) -> Result<query::ImportRequest, String> {
+        let Some(d) = &self.import_dialog else {
+            return Err("ダイアログがありません".into());
+        };
+        let columns: Vec<query::ImportColumn> = d
+            .table_columns
+            .iter()
+            .zip(d.mapping.iter())
+            .filter_map(|(col, m)| {
+                m.map(|src| query::ImportColumn {
+                    name: col.name.clone(),
+                    ty: col.ty.clone(),
+                    src_index: src,
+                })
+            })
+            .collect();
+        if columns.is_empty() {
+            return Err("マッピングされた列がありません".into());
+        }
+        // 実行前検証: 主キー列が未割当だと必ず失敗する。
+        let unmapped_pk = unmapped_pks(&d.table_columns, &d.mapping);
+        if !unmapped_pk.is_empty() {
+            return Err(format!(
+                "主キー列が未割当です: {}（マッピングしてください）",
+                unmapped_pk.join(", ")
+            ));
+        }
+        let null_token = (!d.null_token.is_empty()).then(|| d.null_token.clone());
+        Ok(query::ImportRequest {
+            table: d.table.clone(),
+            columns,
+            source: d.source.clone(),
+            has_header: d.has_header,
+            mode: d.mode,
+            empty_as_null: d.empty_as_null,
+            fresh: d.fresh,
+            encoding: d.encoding,
+            delimiter: d.delimiter,
+            skip_bad_rows: d.skip_bad_rows,
+            dry_run,
+            null_token,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    /// ダイアログの内容を 1 ジョブとしてキューに積み、必要なら実行を開始する。
+    /// `dry_run=true` のときは書き込まず検証だけ行う。
+    fn enqueue_import(&mut self, dry_run: bool) {
+        match self.dialog_request(dry_run) {
+            Ok(req) => {
+                let source_name = self
+                    .import_dialog
+                    .as_ref()
+                    .map(|d| d.file_name.clone())
+                    .unwrap_or_default();
+                self.import_dialog = None;
+                self.push_job(req, source_name);
+            }
+            Err(e) => {
+                if let Some(d) = &mut self.import_dialog {
+                    d.config_msg = Some(e);
+                }
+            }
+        }
+    }
+
+    /// 同じ設定で、GCS の同一フォルダ内の全 CSV をジョブ化する（バルク投入）。
+    /// 現在の設定で List を要求し、応答で各 CSV を enqueue する。
+    fn start_bulk_gcs(&mut self) {
+        let req = match self.dialog_request(false) {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(d) = &mut self.import_dialog {
+                    d.config_msg = Some(e);
+                }
+                return;
+            }
+        };
+        let query::ImportSource::Gcs(uri) = &req.source else {
+            return;
+        };
+        // フォルダ = 末尾の "/" まで。
+        let folder = match uri.rfind('/') {
+            Some(i) => uri[..=i].to_string(),
+            None => uri.clone(),
+        };
+        self.pending_bulk = Some(BulkSpec { template: req });
+        self.import_dialog = None;
+        // 同フォルダを一覧する（応答で各 CSV を enqueue）。
+        let _ = self.gcs_req_tx.send(query::GcsRequest::List(folder));
+    }
+
+    /// リクエストを 1 ジョブとしてキューに積み、キューを進める。
+    fn push_job(&mut self, req: query::ImportRequest, source_name: String) {
+        self.import_jobs.push(ImportJob {
+            req,
+            source_name,
+            sent: false,
+            status: JobStatus::Queued,
+            started: None,
+            progress: None,
+            result: None,
+            outcome: None,
+        });
+        self.pump_import_queue();
+    }
+
+    /// キューを進める: 実行中が無ければ先頭の待機ジョブを背景へ送る。
+    fn pump_import_queue(&mut self) {
+        let any_running = self
+            .import_jobs
+            .iter()
+            .any(|j| j.status == JobStatus::Running);
+        if any_running {
+            return;
+        }
+        let Some(job) = self
+            .import_jobs
+            .iter_mut()
+            .find(|j| j.status == JobStatus::Queued && !j.sent)
+        else {
+            self.import_pending = false;
+            return;
+        };
+        // cancel は送信クローンと共有されるので、後から job.req.cancel で中断できる。
+        if self.import_req_tx.send(job.req.clone()).is_ok() {
+            job.sent = true;
+            job.status = JobStatus::Running;
+            job.started = Some(std::time::Instant::now());
+            job.progress = Some(ImportProg {
+                frac: Some(0.0),
+                written: 0,
+                bytes_done: 0,
+                bytes_total: None,
+            });
+            self.import_pending = true;
+        } else {
+            job.status = JobStatus::Failed;
+            job.result = Some(WORKER_GONE.into());
+        }
+    }
+
+    /// GCS の URI を入力して CSV を取得するダイアログ。
+    fn gcs_window(&mut self, ctx: &egui::Context) {
+        if self.gcs_dialog.is_none() {
+            return;
+        }
+        let pending = self.gcs_pending;
+        let mut open = true;
+        let mut do_fetch = false;
+        // ブラウズ操作（クロージャ内で借用中なので、解放後に実行する）。
+        let mut list_loc: Option<String> = None; // この場所を一覧する
+        let mut fetch_uri: Option<String> = None; // この URI を取得＆インポートする
+
+        if let Some(d) = &mut self.gcs_dialog {
+            let title = format!("GCS から CSV → {}", d.target.name);
+            egui::Window::new(title)
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_width(520.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new("URI を直接入力するか、「一覧」でバケットを参照します")
+                            .color(MUTED)
+                            .small(),
+                    );
+                    ui.add_space(4.0);
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut d.uri)
+                            .hint_text("gs://my-bucket/path/to/data.csv")
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    // Enter で取得開始。
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !pending
+                    {
+                        do_fetch = true;
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!pending, egui::Button::new("取得してインポート"))
+                            .clicked()
+                        {
+                            do_fetch = true;
+                        }
+                        if ui
+                            .add_enabled(!pending, egui::Button::new("一覧"))
+                            .on_hover_text("入力中の gs://bucket/prefix 直下を一覧します")
+                            .clicked()
+                        {
+                            list_loc = Some(d.uri.clone());
+                        }
+                        if pending {
+                            ui.spinner();
+                        }
+                    });
+                    if let Some(s) = &d.status {
+                        ui.add_space(2.0);
+                        ui.label(egui::RichText::new(s).color(ACCENT));
+                    }
+
+                    // ── ブラウザ（一覧した場合のみ） ──
+                    if let Some(at) = &d.listed_at {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(at).monospace().small().color(MUTED),
+                            );
+                            // 親フォルダへ。
+                            if let Some(parent) = parent_location(&d.bucket, at) {
+                                if ui.small_button("上へ").clicked() {
+                                    list_loc = Some(parent);
+                                }
+                            }
+                        });
+                        egui::ScrollArea::vertical()
+                            .max_height(260.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for folder in &d.folders {
+                                    // 末尾の "/" でフォルダと分かる。
+                                    let label = leaf_name(folder);
+                                    if ui
+                                        .add(
+                                            egui::Label::new(label)
+                                                .sense(egui::Sense::click()),
+                                        )
+                                        .clicked()
+                                    {
+                                        list_loc = Some(format!("gs://{}/{}", d.bucket, folder));
+                                    }
+                                }
+                                for obj in &d.objects {
+                                    let is_csv = obj.to_lowercase().ends_with(".csv");
+                                    let name = leaf_name(obj);
+                                    let text = egui::RichText::new(name)
+                                        .color(if is_csv { ACCENT } else { MUTED });
+                                    let resp = ui
+                                        .add(egui::Label::new(text).sense(egui::Sense::click()))
+                                        .on_hover_text("クリックで取得してインポート");
+                                    if resp.clicked() {
+                                        fetch_uri = Some(format!("gs://{}/{}", d.bucket, obj));
+                                    }
+                                }
+                            });
+                    }
+
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new("読み取りには対象バケットへの閲覧権限が必要です。")
+                            .color(MUTED)
+                            .small(),
+                    );
+                });
+        }
+
+        if !open {
+            self.gcs_dialog = None;
+            return;
+        }
+        // ファイル選択 → URI を確定して取得開始。
+        if let Some(uri) = fetch_uri {
+            if let Some(d) = &mut self.gcs_dialog {
+                d.uri = uri;
+            }
+            self.start_gcs_fetch();
+        } else if do_fetch {
+            self.start_gcs_fetch();
+        } else if let Some(loc) = list_loc {
+            if let Some(d) = &mut self.gcs_dialog {
+                d.uri = loc.clone();
+            }
+            self.start_gcs_list(loc);
+        }
+    }
+
+    /// 専用「インポート」タブ。テーブル選択 → ソース選択 → マッピング/進捗をインライン表示。
+    fn import_view(&mut self, ctx: &egui::Context) {
+        let mut open_local: Option<TableNode> = None;
+        let mut open_gcs: Option<TableNode> = None;
+        // ジョブ一覧の操作（借用解消後に適用）。
+        let mut cancel_idx: Option<usize> = None;
+        let mut remove_idx: Option<usize> = None;
+        let mut requeue_idx: Option<usize> = None;
+        let mut clear_done = false;
+        let mut do_report = false;
+        let tables: Vec<TableNode> = self
+            .schema_graph
+            .as_ref()
+            .filter(|g| g.error.is_none())
+            .map(|g| g.nodes.clone())
+            .unwrap_or_default();
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // マッピング/取込中は本体をインライン描画。
+            if self.import_dialog.is_some() {
+                self.import_dialog_body(ui);
+                return;
+            }
+            // ── ランディング（取り込み先テーブル＋ソース選択） ──
+            ui.add_space(10.0);
+            ui.heading("CSV インポート");
+            ui.label(
+                egui::RichText::new(
+                    "CSV をテーブルへ高速取り込み（ストリーミング＋並列 BatchWrite・低メモリ）。",
+                )
+                .color(MUTED),
+            );
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("① 取り込み先テーブル").strong());
+                let sel_text = if self.import_table_pick.is_empty() {
+                    "選択…".to_string()
+                } else {
+                    self.import_table_pick.clone()
+                };
+                egui::ComboBox::from_id_salt("import_table_pick")
+                    .selected_text(sel_text)
+                    .width(280.0)
+                    .show_ui(ui, |ui| {
+                        if tables.is_empty() {
+                            ui.label("テーブルがありません（スキーマ未取得）");
+                        }
+                        for t in &tables {
+                            ui.selectable_value(
+                                &mut self.import_table_pick,
+                                t.name.clone(),
+                                &t.name,
+                            );
+                        }
+                    });
+            });
+            let sel = tables
+                .iter()
+                .find(|t| t.name == self.import_table_pick)
+                .cloned();
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("② CSV ソースを選ぶ").strong());
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let enabled = sel.is_some();
+                if ui
+                    .add_enabled(enabled, egui::Button::new("ローカル CSV を選択…"))
+                    .clicked()
+                {
+                    open_local = sel.clone();
+                }
+                if ui
+                    .add_enabled(enabled, egui::Button::new("GCS から選択…"))
+                    .clicked()
+                {
+                    open_gcs = sel.clone();
+                }
+            });
+            if sel.is_none() {
+                ui.add_space(6.0);
+                ui.colored_label(
+                    egui::Color32::from_rgb(251, 191, 36),
+                    "先に取り込み先テーブルを選択してください。",
+                );
+            }
+
+            // ── ジョブ一覧（順次キュー） ──
+            if !self.import_jobs.is_empty() {
+                ui.add_space(16.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("インポートジョブ").strong());
+                    if ui
+                        .button("証跡レポート出力")
+                        .on_hover_text(
+                            "各テーブルの件数・方式・結果を Markdown/CSV で出力し、\
+                             ジョブ一覧のスクリーンショット PNG も保存します（~/Downloads）。",
+                        )
+                        .clicked()
+                    {
+                        do_report = true;
+                    }
+                    if ui.small_button("完了を消去").clicked() {
+                        clear_done = true;
+                    }
+                });
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (i, job) in self.import_jobs.iter().enumerate() {
+                            let (badge, color) = match job.status {
+                                JobStatus::Queued => ("待機", MUTED),
+                                JobStatus::Running => ("実行中", ACCENT),
+                                JobStatus::Done => ("完了", egui::Color32::from_rgb(74, 222, 128)),
+                                JobStatus::Failed => ("失敗", egui::Color32::from_rgb(248, 113, 113)),
+                                JobStatus::Cancelled => {
+                                    ("中断", egui::Color32::from_rgb(251, 191, 36))
+                                }
+                            };
+                            egui::Frame::none()
+                                .fill(ELEVATED)
+                                .rounding(egui::Rounding::same(6.0))
+                                .inner_margin(egui::Margin::same(8.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(badge).color(color).strong());
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} ← {}",
+                                                job.req.table, job.source_name
+                                            ))
+                                            .strong(),
+                                        );
+                                        if job.req.dry_run {
+                                            ui.label(
+                                                egui::RichText::new("[検証]").color(MUTED).small(),
+                                            );
+                                        }
+                                        // 右寄せの操作ボタン。
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| match job.status {
+                                                JobStatus::Running => {
+                                                    if ui.small_button("⏹ 中断").clicked() {
+                                                        cancel_idx = Some(i);
+                                                    }
+                                                }
+                                                JobStatus::Queued => {
+                                                    if ui.small_button("✕ 取消").clicked() {
+                                                        remove_idx = Some(i);
+                                                    }
+                                                }
+                                                JobStatus::Failed | JobStatus::Cancelled => {
+                                                    if ui
+                                                        .small_button("↻ 再キュー")
+                                                        .on_hover_text("続きから再開します")
+                                                        .clicked()
+                                                    {
+                                                        requeue_idx = Some(i);
+                                                    }
+                                                    if ui.small_button("✕").clicked() {
+                                                        remove_idx = Some(i);
+                                                    }
+                                                }
+                                                JobStatus::Done => {
+                                                    if ui.small_button("✕").clicked() {
+                                                        remove_idx = Some(i);
+                                                    }
+                                                }
+                                            },
+                                        );
+                                    });
+                                    // 進捗バー（実行中）。
+                                    if let Some(p) = &job.progress {
+                                        let written = fmt_count(p.written);
+                                        // 速度・ETA（経過時間と進捗から算出）。
+                                        let rate = import_rate_eta(job.started, p);
+                                        match p.frac {
+                                            Some(f) => {
+                                                let bytes = match p.bytes_total {
+                                                    Some(t) => format!(
+                                                        "  ·  {} / {}",
+                                                        human_bytes(p.bytes_done as f64),
+                                                        human_bytes(t as f64),
+                                                    ),
+                                                    None => String::new(),
+                                                };
+                                                let text = format!(
+                                                    "{:.0}%  ·  {written} 行{bytes}{rate}",
+                                                    f * 100.0
+                                                );
+                                                ui.add(
+                                                    egui::ProgressBar::new(f)
+                                                        .text(text)
+                                                        .fill(ACCENT)
+                                                        .desired_width(f32::INFINITY),
+                                                );
+                                            }
+                                            None => {
+                                                ui.add(
+                                                    egui::ProgressBar::new(0.0)
+                                                        .text(format!("取込中…  {written} 行{rate}"))
+                                                        .animate(true)
+                                                        .desired_width(f32::INFINITY),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if let Some(r) = &job.result {
+                                        ui.label(egui::RichText::new(r).color(MUTED).small());
+                                    }
+                                });
+                            ui.add_space(4.0);
+                        }
+                    });
+            }
+        });
+
+        if let Some(n) = open_local {
+            self.open_import_dialog(n);
+        }
+        if let Some(n) = open_gcs {
+            self.open_gcs_dialog(n);
+        }
+        if let Some(i) = cancel_idx {
+            // 実行中ジョブに中断要求（送信クローンと cancel を共有）。
+            if let Some(j) = self.import_jobs.get(i) {
+                j.req.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if let Some(i) = requeue_idx {
+            if let Some(old) = self.import_jobs.get(i) {
+                let mut req = old.req.clone();
+                req.cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let source_name = old.source_name.clone();
+                self.push_job(req, source_name);
+            }
+        }
+        if let Some(i) = remove_idx {
+            if i < self.import_jobs.len() && self.import_jobs[i].status != JobStatus::Running {
+                self.import_jobs.remove(i);
+            }
+        }
+        if clear_done {
+            self.import_jobs.retain(|j| j.is_active());
+        }
+        if do_report {
+            self.export_import_report(ctx);
+        }
+    }
+
+    /// 証跡レポート（Markdown/CSV）を出力し、スクリーンショットを要求する。
+    fn export_import_report(&mut self, ctx: &egui::Context) {
+        if self.import_jobs.is_empty() {
+            self.copy_note = Some("ジョブがありません".into());
+            return;
+        }
+        let ts = chrono::Local::now();
+        let home = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let base = {
+            let d = home.join("Downloads");
+            if d.is_dir() {
+                d
+            } else {
+                home
+            }
+        };
+        let dir = base.join(format!("spanner_import_report_{}", ts.format("%Y%m%d_%H%M%S")));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.copy_note = Some(format!("レポート用フォルダ作成に失敗: {e}"));
+            return;
+        }
+        let md = report_markdown(&self.import_jobs, &ts);
+        let csv = report_csv(&self.import_jobs);
+        let _ = std::fs::write(dir.join("report.md"), md);
+        let _ = std::fs::write(dir.join("report.csv"), csv);
+        // スクショは次フレームで Event::Screenshot として届く。届いたら同フォルダへ保存。
+        self.pending_report_dir = Some(dir.clone());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+        self.copy_note = Some(format!("レポートを出力中…: {}", dir.display()));
+    }
+
+    /// スクリーンショット応答が来ていれば PNG として保存し、Finder で開く。
+    fn drain_screenshot(&mut self, ctx: &egui::Context) {
+        let shot = ctx.input(|i| {
+            i.raw.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(image) = shot {
+            if let Some(dir) = self.pending_report_dir.take() {
+                let png = dir.join("screenshot.png");
+                let saved = save_screenshot_png(&png, &image).is_ok();
+                // フォルダを Finder で開く（macOS）。
+                let _ = std::process::Command::new("open").arg(&dir).spawn();
+                self.copy_note = Some(if saved {
+                    format!("証跡レポートを保存しました: {}", dir.display())
+                } else {
+                    format!("レポートは保存（スクショは失敗）: {}", dir.display())
+                });
+            }
+        }
+    }
+
+    /// インポートのマッピング・オプション・進捗をインライン描画する（インポートタブ内）。
+    fn import_dialog_body(&mut self, ui: &mut egui::Ui) {
+        let mut do_import = false;
+        let mut do_dry = false;
+        let mut do_bulk = false;
+        let mut repick = false;
+        let mut close = false;
+
+        if let Some(d) = &mut self.import_dialog {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("← テーブル選択へ戻る").clicked() {
+                    close = true;
+                }
+                ui.label(egui::RichText::new(format!("インポート先 → {}", d.table)).strong());
+            });
+            ui.separator();
+            {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("ファイル:").color(MUTED));
+                        ui.label(&d.file_name);
+                        if ui.small_button("選び直す").clicked() {
+                            repick = true;
+                        }
+                    });
+                    let data_rows = d.data_rows_count();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} 列 · プレビュー {} 行（全体は取込時にストリーミング）",
+                            d.csv_headers.len(),
+                            data_rows
+                        ))
+                        .color(MUTED)
+                        .small(),
+                    );
+                    if let Some(n) = &d.note {
+                        ui.colored_label(egui::Color32::from_rgb(251, 191, 36), n);
+                    }
+
+                    ui.add_space(4.0);
+                    // 文字コード・区切り（変更したらプレビューを再パース）。
+                    ui.horizontal(|ui| {
+                        ui.label("文字コード:");
+                        let mut enc_changed = false;
+                        egui::ComboBox::from_id_salt("import_encoding")
+                            .selected_text(match d.encoding {
+                                query::Encoding::Utf8 => "UTF-8",
+                                query::Encoding::ShiftJis => "Shift-JIS",
+                            })
+                            .show_ui(ui, |ui| {
+                                enc_changed |= ui
+                                    .selectable_value(&mut d.encoding, query::Encoding::Utf8, "UTF-8")
+                                    .changed();
+                                enc_changed |= ui
+                                    .selectable_value(
+                                        &mut d.encoding,
+                                        query::Encoding::ShiftJis,
+                                        "Shift-JIS (CP932)",
+                                    )
+                                    .changed();
+                            });
+                        ui.add_space(8.0);
+                        ui.label("区切り:");
+                        let mut delim_changed = false;
+                        let delim_label = match d.delimiter {
+                            b'\t' => "タブ",
+                            b';' => "セミコロン",
+                            _ => "カンマ",
+                        };
+                        egui::ComboBox::from_id_salt("import_delimiter")
+                            .selected_text(delim_label)
+                            .show_ui(ui, |ui| {
+                                delim_changed |=
+                                    ui.selectable_value(&mut d.delimiter, b',', "カンマ ,").changed();
+                                delim_changed |=
+                                    ui.selectable_value(&mut d.delimiter, b'\t', "タブ").changed();
+                                delim_changed |= ui
+                                    .selectable_value(&mut d.delimiter, b';', "セミコロン ;")
+                                    .changed();
+                            });
+                        if enc_changed || delim_changed {
+                            d.reparse_preview();
+                        }
+                    });
+                    if ui
+                        .checkbox(&mut d.has_header, "先頭行をヘッダとして扱う")
+                        .changed()
+                    {
+                        d.recompute();
+                    }
+                    ui.checkbox(&mut d.empty_as_null, "空欄を NULL として扱う");
+                    ui.horizontal(|ui| {
+                        ui.label("NULL トークン:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.null_token)
+                                .hint_text("例: NULL, \\N（空なら無効）")
+                                .desired_width(160.0),
+                        )
+                        .on_hover_text("この文字列のセルを NULL として書き込みます（空欄扱いとは別）。");
+                    });
+                    ui.checkbox(&mut d.skip_bad_rows, "不正な行はスキップして続行（リジェクトに記録）")
+                        .on_hover_text(
+                            "型変換やコミットに失敗した行を飛ばして続けます。\
+                             飛ばした行は CSV のリジェクトファイルに書き出します。",
+                        );
+                    ui.horizontal(|ui| {
+                        ui.label("方式:");
+                        ui.radio_value(&mut d.mode, query::ImportMode::Insert, "挿入のみ");
+                        ui.radio_value(
+                            &mut d.mode,
+                            query::ImportMode::InsertOrUpdate,
+                            "上書き挿入",
+                        )
+                        .on_hover_text("主キーが既存なら更新（INSERT OR UPDATE）");
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "取込はソースから直接ストリーミングし、並列 BatchWrite で投入します（高速・低メモリ）。",
+                        )
+                        .color(MUTED)
+                        .small(),
+                    );
+                    if d.mode == query::ImportMode::Insert {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(251, 191, 36),
+                            "⚠ BatchWrite はリプレイ保護がありません。再実行時の重複を避けるため「上書き挿入」を推奨します。",
+                        );
+                    }
+                    ui.checkbox(&mut d.fresh, "最初からやり直す（前回の途中を無視）")
+                        .on_hover_text(
+                            "通常は前回コミット済みのバッチを自動でスキップして続きから取り込みます。\
+                             これを ON にすると最初から全て取り込み直します。",
+                        );
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("列のマッピング").strong());
+                    ui.label(
+                        egui::RichText::new("テーブル列 ← CSV 列")
+                            .color(MUTED)
+                            .small(),
+                    );
+                    ui.add_space(2.0);
+
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            egui::Grid::new("import_map_grid")
+                                .num_columns(2)
+                                .spacing([12.0, 6.0])
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for (ci, col) in d.table_columns.iter().enumerate() {
+                                        let key = if col.pk { "🔑 " } else { "" };
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{key}{}  {}",
+                                                col.name, col.ty
+                                            ))
+                                            .monospace()
+                                            .small(),
+                                        );
+                                        let cur = d.mapping[ci];
+                                        let sel_text = match cur {
+                                            Some(i) => d
+                                                .csv_headers
+                                                .get(i)
+                                                .cloned()
+                                                .unwrap_or_else(|| format!("列{}", i + 1)),
+                                            None => "（スキップ）".to_string(),
+                                        };
+                                        egui::ComboBox::from_id_salt(("import_map", ci))
+                                            .selected_text(sel_text)
+                                            .width(220.0)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut d.mapping[ci],
+                                                    None,
+                                                    "（スキップ）",
+                                                );
+                                                for (hi, h) in d.csv_headers.iter().enumerate() {
+                                                    ui.selectable_value(
+                                                        &mut d.mapping[ci],
+                                                        Some(hi),
+                                                        h,
+                                                    );
+                                                }
+                                            });
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let mapped = d.mapping.iter().filter(|m| m.is_some()).count();
+                        if ui
+                            .add_enabled(mapped > 0, egui::Button::new("キューに追加して実行"))
+                            .on_hover_text("ジョブとしてキューに積みます（実行中があれば順番待ち）。")
+                            .clicked()
+                        {
+                            do_import = true;
+                        }
+                        if ui
+                            .add_enabled(mapped > 0, egui::Button::new("検証のみ"))
+                            .on_hover_text("書き込まずに全行を型チェックして件数・エラーを確認します。")
+                            .clicked()
+                        {
+                            do_dry = true;
+                        }
+                        // GCS ソースなら、同フォルダの全 CSV を同設定で一括投入。
+                        if matches!(d.source, query::ImportSource::Gcs(_))
+                            && ui
+                                .add_enabled(
+                                    mapped > 0,
+                                    egui::Button::new("同フォルダの全CSVをキュー"),
+                                )
+                                .on_hover_text(
+                                    "この GCS フォルダ直下の *.csv を、同じマッピング/設定で\
+                                     1 つずつジョブにします（同一レイアウト前提）。",
+                                )
+                                .clicked()
+                        {
+                            do_bulk = true;
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("{mapped} 列を書き込み"))
+                                .color(MUTED)
+                                .small(),
+                        );
+                    });
+                    if let Some(r) = &d.config_msg {
+                        ui.colored_label(egui::Color32::from_rgb(248, 113, 113), r);
+                    }
+            }
+        }
+
+        if close {
+            self.import_dialog = None;
+            return;
+        }
+        if repick {
+            // テーブル情報を保ったままファイルを選び直す。
+            if let Some(d) = self.import_dialog.take() {
+                self.open_import_dialog(TableNode {
+                    name: d.table,
+                    columns: d.table_columns,
+                    indexes: Vec::new(),
+                });
+            }
+        }
+        if do_import {
+            self.enqueue_import(false);
+        } else if do_dry {
+            self.enqueue_import(true);
+        } else if do_bulk {
+            self.start_bulk_gcs();
         }
     }
 
@@ -2142,6 +3941,16 @@ impl MonitorApp {
         let mut open = self.settings_open;
         let mut chosen = self.current_context.clone();
         let mut login_clicked = false;
+        // 環境操作（描画中に収集→借用解消後に適用）
+        let mut env_select: Option<usize> = None;
+        let mut env_delete: Option<usize> = None;
+        let mut env_add = false;
+        let mut discover_clicked = false;
+        // カスケード選択の操作（借用解消後に適用）
+        let mut do_load_projects = false;
+        let mut do_load_instances: Option<String> = None;
+        let mut do_load_databases: Option<(String, String)> = None;
+        let mut do_apply_pick = false;
         egui::Window::new("設定")
             .open(&mut open)
             .collapsible(false)
@@ -2149,6 +3958,178 @@ impl MonitorApp {
             .show(ctx, |ui| {
                 ui.label(egui::RichText::new("Spanner 接続").color(MUTED).small());
                 ui.label(&self.conn_info);
+
+                // ── ADC でプロジェクト/インスタンス/DB を選択（1 回のログインのみ） ──
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("接続先を選択（ADC）")
+                            .color(MUTED)
+                            .small(),
+                    );
+                    let busy = self.pick_busy.load(std::sync::atomic::Ordering::Relaxed);
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("プロジェクト一覧").small())
+                        .on_hover_text("ADC でアクセスできるプロジェクトを一覧します")
+                        .clicked()
+                    {
+                        do_load_projects = true;
+                    }
+                    if busy {
+                        ui.spinner();
+                    }
+                });
+                // ① プロジェクト
+                egui::ComboBox::from_id_salt("pick_project")
+                    .selected_text(if self.pick_project.is_empty() {
+                        "プロジェクト…".to_string()
+                    } else {
+                        self.pick_project.clone()
+                    })
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        for p in &self.pick_projects {
+                            if ui
+                                .selectable_value(&mut self.pick_project, p.clone(), p)
+                                .clicked()
+                            {
+                                // プロジェクト変更 → 下位をリセットして再取得。
+                                self.pick_instance.clear();
+                                self.pick_database.clear();
+                                self.pick_instances.clear();
+                                self.pick_databases.clear();
+                                do_load_instances = Some(p.clone());
+                            }
+                        }
+                    });
+                // ② インスタンス
+                ui.add_enabled_ui(!self.pick_project.is_empty(), |ui| {
+                    egui::ComboBox::from_id_salt("pick_instance")
+                        .selected_text(if self.pick_instance.is_empty() {
+                            "インスタンス…".to_string()
+                        } else {
+                            self.pick_instance.clone()
+                        })
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            let proj = self.pick_project.clone();
+                            for inst in &self.pick_instances {
+                                if ui
+                                    .selectable_value(&mut self.pick_instance, inst.clone(), inst)
+                                    .clicked()
+                                {
+                                    self.pick_database.clear();
+                                    self.pick_databases.clear();
+                                    do_load_databases = Some((proj.clone(), inst.clone()));
+                                }
+                            }
+                        });
+                });
+                // ③ データベース
+                ui.add_enabled_ui(!self.pick_instance.is_empty(), |ui| {
+                    egui::ComboBox::from_id_salt("pick_database")
+                        .selected_text(if self.pick_database.is_empty() {
+                            "データベース…".to_string()
+                        } else {
+                            self.pick_database.clone()
+                        })
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            for db in &self.pick_databases {
+                                ui.selectable_value(&mut self.pick_database, db.clone(), db);
+                            }
+                        });
+                });
+                let ready = !self.pick_project.is_empty()
+                    && !self.pick_instance.is_empty()
+                    && !self.pick_database.is_empty();
+                if ui
+                    .add_enabled(ready, egui::Button::new("この接続に切り替える"))
+                    .clicked()
+                {
+                    do_apply_pick = true;
+                }
+                if let Some(e) = &self.pick_error {
+                    ui.colored_label(egui::Color32::from_rgb(248, 113, 113), e);
+                }
+                ui.separator();
+
+                // 登録済み環境の一覧（選択・削除）
+                for (i, p) in self.env_profiles.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let active = self.active_env.as_deref() == Some(p.name.as_str());
+                        if ui.radio(active, &p.name).clicked() {
+                            env_select = Some(i);
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}/{}/{}",
+                                p.project, p.instance, p.database
+                            ))
+                            .color(MUTED)
+                            .small(),
+                        );
+                        if ui.small_button("🗑").on_hover_text("削除").clicked() {
+                            env_delete = Some(i);
+                        }
+                    });
+                }
+                // 自動検出（gcloud で instance/database を列挙）
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.discover_project)
+                            .hint_text("project（空=gcloud既定）")
+                            .desired_width(160.0),
+                    );
+                    let running = self
+                        .discover_running
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if ui
+                        .add_enabled(!running, egui::Button::new("環境を自動検出"))
+                        .on_hover_text(
+                            "ログイン済みなら gcloud で instance/database を列挙して登録",
+                        )
+                        .clicked()
+                    {
+                        discover_clicked = true;
+                    }
+                    if running {
+                        ui.spinner();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("または手動で登録:")
+                        .color(MUTED)
+                        .small(),
+                );
+                // 新規登録フォーム
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.env_form.name)
+                            .hint_text("名前")
+                            .desired_width(110.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.env_form.project)
+                            .hint_text("project")
+                            .desired_width(130.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.env_form.instance)
+                            .hint_text("instance")
+                            .desired_width(130.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.env_form.database)
+                            .hint_text("database")
+                            .desired_width(130.0),
+                    );
+                    if ui.button("環境を追加").clicked() {
+                        env_add = true;
+                    }
+                });
                 ui.separator();
 
                 // GCP 認証（ADC ログイン）
@@ -2215,6 +4196,60 @@ impl MonitorApp {
 
         if login_clicked {
             self.gcp_login();
+        }
+        if discover_clicked {
+            self.discover_envs();
+        }
+        // カスケード選択の取得。
+        if do_load_projects {
+            self.load_projects(ctx);
+        }
+        if let Some(project) = do_load_instances {
+            self.load_instances(ctx, project);
+        }
+        if let Some((project, instance)) = do_load_databases {
+            self.load_databases(ctx, project, instance);
+        }
+        if do_apply_pick {
+            self.apply_picked_connection();
+        }
+        // 検出中は結果を取り込むため再描画を促す
+        if self
+            .discover_running
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || self.pick_busy.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            ctx.request_repaint_after(Duration::from_millis(300));
+        }
+
+        // 環境の追加
+        if env_add {
+            let f = &self.env_form;
+            if !f.project.is_empty() && !f.instance.is_empty() && !f.database.is_empty() {
+                let mut p = self.env_form.clone();
+                if p.name.trim().is_empty() {
+                    p.name = format!("{}/{}", p.instance, p.database);
+                }
+                self.env_profiles.push(p);
+                self.env_form = EnvProfile::default();
+                save_envs(&self.env_profiles, &self.active_env);
+            } else {
+                self.copy_note = Some("project / instance / database を入力してください".into());
+            }
+        }
+        // 環境の削除
+        if let Some(i) = env_delete {
+            if i < self.env_profiles.len() {
+                let removed = self.env_profiles.remove(i);
+                if self.active_env.as_deref() == Some(removed.name.as_str()) {
+                    self.active_env = None;
+                }
+                save_envs(&self.env_profiles, &self.active_env);
+            }
+        }
+        // 環境の選択 → 接続先を切り替え、データ/スキーマを取り直す
+        if let Some(i) = env_select {
+            self.select_env_profile(i);
         }
 
         // コンテキスト切替 → 以降の kubectl 呼び出しに反映し、表示をリセット
@@ -2665,8 +4700,8 @@ impl MonitorApp {
             // ノード内のテキストは枠外へはみ出さないようクリップ
             let pc = painter.with_clip_rect(screen.intersect(rect));
 
-            // 背景 + 枠
-            let rounding = egui::Rounding::same(8.0);
+            // 背景 + 枠（角丸なしのシャープな矩形。ER 図らしい見た目）
+            let rounding = egui::Rounding::ZERO;
             painter.rect_filled(screen, rounding, dim(ELEVATED));
             let border = if is_sel {
                 egui::Stroke::new(2.0, ACCENT)
@@ -3090,6 +5125,168 @@ const H_GAP: f32 = 56.0;
 const V_GAP: f32 = 70.0;
 
 /// スキーマ図のノード配置をファイルに保存する。
+/// 登録した Spanner 接続環境。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+struct EnvProfile {
+    name: String,
+    project: String,
+    instance: String,
+    database: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct EnvStore {
+    profiles: Vec<EnvProfile>,
+    active: Option<String>,
+}
+
+const ENV_FILE: &str = "spanner_envs.json";
+
+fn load_envs() -> EnvStore {
+    std::fs::read_to_string(ENV_FILE)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_envs(profiles: &[EnvProfile], active: &Option<String>) {
+    let store = EnvStore {
+        profiles: profiles.to_vec(),
+        active: active.clone(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&store) {
+        let _ = std::fs::write(ENV_FILE, json);
+    }
+}
+
+/// 単発の async（ADC 一覧 API など）を専用ランタイムでブロッキング実行する。
+fn run_blocking<T>(fut: impl std::future::Future<Output = anyhow::Result<T>>) -> Result<T, String> {
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt.block_on(fut).map_err(|e| e.to_string()),
+        Err(e) => Err(format!("ランタイム生成に失敗: {e}")),
+    }
+}
+
+/// gcloud 実行ファイルのパスを解決する。PATH に無くても（Finder 起動など）
+/// よくある配置先を探す。見つからなければ "gcloud"（PATH 任せ）。
+fn gcloud_bin() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let cand = dir.join("gcloud");
+            if cand.is_file() {
+                return cand;
+            }
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        "/usr/local/bin/gcloud".to_string(),
+        "/opt/homebrew/bin/gcloud".to_string(),
+        "/opt/homebrew/share/google-cloud-sdk/bin/gcloud".to_string(),
+        "/usr/local/share/google-cloud-sdk/bin/gcloud".to_string(),
+        "/opt/homebrew/Caskroom/google-cloud-sdk/latest/google-cloud-sdk/bin/gcloud".to_string(),
+        format!("{home}/google-cloud-sdk/bin/gcloud"),
+        format!("{home}/.google-cloud-sdk/bin/gcloud"),
+    ];
+    for p in candidates {
+        let pb = std::path::PathBuf::from(p);
+        if pb.is_file() {
+            return pb;
+        }
+    }
+    std::path::PathBuf::from("gcloud")
+}
+
+/// gcloud が見つかったか（絶対パスで解決できれば true）。
+fn gcloud_found() -> bool {
+    gcloud_bin().is_absolute()
+}
+
+/// gcloud が見つからないときの案内文。
+const GCLOUD_MISSING: &str = "gcloud が見つかりません。Google Cloud SDK をインストールしてください（https://cloud.google.com/sdk/docs/install）。インストール後にアプリを再起動すると認識されます。";
+
+/// gcloud で Spanner の instance/database を列挙して EnvProfile を作る（ブロッキング）。
+/// project 未指定なら gcloud config の既定 project を使う。
+fn gcloud_discover(mut project: String) -> Result<Vec<EnvProfile>, String> {
+    // gcloud を実行して value 行を取り出す
+    let run = |args: &[&str]| -> Result<Vec<String>, String> {
+        let out = std::process::Command::new(gcloud_bin())
+            .args(args)
+            .output()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    GCLOUD_MISSING.to_string()
+                } else {
+                    format!("gcloud 実行失敗: {e}")
+                }
+            })?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(err
+                .lines()
+                .last()
+                .unwrap_or("gcloud エラー")
+                .trim()
+                .to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().rsplit('/').next().unwrap_or("").to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
+    };
+
+    if project.is_empty() {
+        project = run(&["config", "get-value", "project"])?
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        if project.is_empty() {
+            return Err("project を指定するか gcloud config を設定してください".into());
+        }
+    }
+
+    let instances = run(&[
+        "spanner",
+        "instances",
+        "list",
+        "--project",
+        &project,
+        "--format=value(name)",
+    ])?;
+    let mut profiles = Vec::new();
+    for inst in &instances {
+        let dbs = run(&[
+            "spanner",
+            "databases",
+            "list",
+            "--instance",
+            inst,
+            "--project",
+            &project,
+            "--format=value(name)",
+        ])
+        .unwrap_or_default();
+        for db in dbs {
+            profiles.push(EnvProfile {
+                name: format!("{project}/{inst}/{db}"),
+                project: project.clone(),
+                instance: inst.clone(),
+                database: db,
+            });
+        }
+    }
+    if profiles.is_empty() {
+        return Err(format!(
+            "{project} に Spanner database が見つかりませんでした"
+        ));
+    }
+    Ok(profiles)
+}
+
 const LAYOUT_FILE: &str = "schema_layout.json";
 
 fn save_layout(positions: &HashMap<String, egui::Pos2>) -> std::io::Result<()> {
@@ -3682,6 +5879,86 @@ fn data_result_grid(
 }
 
 /// 結果を CSV 文字列にする（カンマ/引用符/改行を含む値はクォート）。
+/// 結果を CSV ファイルに保存する。保存先は ~/Downloads（無ければ HOME / カレント）。
+fn save_csv(result: &QueryOutcome) -> std::io::Result<std::path::PathBuf> {
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let downloads = home.join("Downloads");
+    let dir = if downloads.is_dir() { downloads } else { home };
+    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let path = dir.join(format!("spanner_export_{ts}.csv"));
+    std::fs::write(&path, to_csv(result))?;
+    // 保存先を Finder で表示（macOS。失敗しても無視）
+    let _ = std::process::Command::new("open")
+        .arg("-R")
+        .arg(&path)
+        .spawn();
+    Ok(path)
+}
+
+/// マッピング用プレビューで読むバイト数の上限（全行は溜めない）。
+const PREVIEW_BYTES: usize = 128 * 1024;
+/// プレビュー表示の最大データ行数。
+const PREVIEW_ROWS: usize = 50;
+
+/// ファイルの先頭 `max_bytes` までを生バイトで読む（プレビュー用・文字コード未確定）。
+fn read_file_prefix(path: &std::path::Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; max_bytes];
+    let n = f.read(&mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// GCS オブジェクト/フォルダのフルパスから末尾セグメント（表示名）を取り出す。
+/// フォルダ（末尾 /）は "sub/"、オブジェクトは "file.csv" のように返す。
+fn leaf_name(path: &str) -> String {
+    let trimmed = path.strip_suffix('/').unwrap_or(path);
+    let leaf = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if path.ends_with('/') {
+        format!("{leaf}/")
+    } else {
+        leaf.to_string()
+    }
+}
+
+/// 現在の一覧位置 `gs://bucket/prefix` から 1 つ上の階層を返す。ルートなら None。
+fn parent_location(bucket: &str, listed_at: &str) -> Option<String> {
+    let head = format!("gs://{bucket}/");
+    let prefix = listed_at.strip_prefix(&head).unwrap_or("");
+    if prefix.is_empty() {
+        return None; // 既にバケット直下
+    }
+    let trimmed = prefix.strip_suffix('/').unwrap_or(prefix);
+    let parent = match trimmed.rfind('/') {
+        Some(i) => &trimmed[..=i], // スラッシュ込みで残す
+        None => "",                // ルートへ
+    };
+    Some(format!("gs://{bucket}/{parent}"))
+}
+
+/// macOS のネイティブダイアログでファイルを 1 つ選ぶ（osascript 利用）。
+/// キャンセル時や失敗時は None。
+fn pick_csv_file() -> Option<std::path::PathBuf> {
+    let script = "POSIX path of (choose file with prompt \"インポートする CSV を選択\" \
+                  of type {\"csv\", \"txt\", \"public.comma-separated-values-text\", \"public.plain-text\"})";
+    let out = std::process::Command::new("osascript")
+        .args(["-e", script])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None; // キャンセル含む
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(path))
+    }
+}
+
 fn to_csv(result: &QueryOutcome) -> String {
     fn esc(s: &str) -> String {
         if s.contains(',') || s.contains('"') || s.contains('\n') {
@@ -3821,19 +6098,20 @@ fn setup_style(ctx: &egui::Context) {
     ctx.set_visuals(v);
 
     ctx.style_mut(|s| {
-        s.spacing.item_spacing = egui::vec2(8.0, 7.0);
-        s.spacing.button_padding = egui::vec2(12.0, 7.0);
-        s.spacing.interact_size.y = 28.0;
-        s.spacing.window_margin = egui::Margin::same(12.0);
+        // フォントを少し小さく＋余白も合わせて詰める。
+        s.spacing.item_spacing = egui::vec2(7.0, 6.0);
+        s.spacing.button_padding = egui::vec2(10.0, 6.0);
+        s.spacing.interact_size.y = 25.0;
+        s.spacing.window_margin = egui::Margin::same(11.0);
         s.spacing.menu_margin = egui::Margin::same(8.0);
         s.spacing.scroll.bar_width = 10.0;
         s.spacing.scroll.floating = false;
         s.text_styles = [
-            (TextStyle::Heading, FontId::new(20.0, Proportional)),
-            (TextStyle::Body, FontId::new(14.5, Proportional)),
-            (TextStyle::Button, FontId::new(14.5, Proportional)),
-            (TextStyle::Monospace, FontId::new(13.5, Monospace)),
-            (TextStyle::Small, FontId::new(12.0, Proportional)),
+            (TextStyle::Heading, FontId::new(18.0, Proportional)),
+            (TextStyle::Body, FontId::new(13.0, Proportional)),
+            (TextStyle::Button, FontId::new(13.0, Proportional)),
+            (TextStyle::Monospace, FontId::new(12.5, Monospace)),
+            (TextStyle::Small, FontId::new(11.0, Proportional)),
         ]
         .into_iter()
         .collect();
@@ -3881,6 +6159,16 @@ fn chip(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
         });
 }
 
+/// 容量表示。1 ノード = 1000 PU。ちょうどノード単位ならノード数も併記。
+fn capacity_label(pu: f64) -> String {
+    let pu = pu.round() as i64;
+    if pu > 0 && pu % 1000 == 0 {
+        format!("{pu} PU (= {} ノード)", pu / 1000)
+    } else {
+        format!("{pu} PU")
+    }
+}
+
 fn human_bytes(b: f64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = b;
@@ -3890,4 +6178,461 @@ fn human_bytes(b: f64) -> String {
         i += 1;
     }
     format!("{v:.1} {}", UNITS[i])
+}
+
+/// 取込の進捗割合（処理バイト ÷ 全体）。全体が不明/0 なら None（不確定表示）。
+fn progress_fraction(bytes_done: u64, bytes_total: Option<u64>) -> Option<f32> {
+    bytes_total
+        .filter(|t| *t > 0)
+        .map(|t| (bytes_done as f32 / t as f32).clamp(0.0, 1.0))
+}
+
+/// 取込の速度（rows/s）と残り時間（ETA）の表示文字列。情報が足りなければ空。
+fn import_rate_eta(started: Option<std::time::Instant>, p: &ImportProg) -> String {
+    match started {
+        Some(t) => rate_eta(t.elapsed().as_secs_f64(), p.written, p.frac),
+        None => String::new(),
+    }
+}
+
+/// 速度・ETA 文字列の純粋ロジック（テスト用に時間を引数化）。
+fn rate_eta(elapsed: f64, written: usize, frac: Option<f32>) -> String {
+    if elapsed < 0.5 || written == 0 {
+        return String::new();
+    }
+    let rps = written as f64 / elapsed;
+    let speed = if rps >= 1000.0 {
+        format!("{:.0}k 行/s", rps / 1000.0)
+    } else {
+        format!("{rps:.0} 行/s")
+    };
+    // ETA は進捗割合から。frac が分かるときだけ。
+    let eta = match frac {
+        Some(f) if f > 0.01 && f < 0.999 => {
+            let remain = elapsed * (1.0 - f as f64) / f as f64;
+            format!("  ·  残り ~{}", fmt_duration(remain))
+        }
+        _ => String::new(),
+    };
+    format!("  ·  {speed}{eta}")
+}
+
+/// 秒数を人に読みやすい残り時間表記にする。
+fn fmt_duration(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    if s >= 3600 {
+        format!("{}h{}m", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("{}m{}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// 未割当の主キー列名を返す（空なら OK）。
+fn unmapped_pks(table_columns: &[query::Column], mapping: &[Option<usize>]) -> Vec<String> {
+    table_columns
+        .iter()
+        .zip(mapping.iter())
+        .filter(|(c, m)| c.pk && m.is_none())
+        .map(|(c, _)| c.name.clone())
+        .collect()
+}
+
+/// フォルダ一括用: オブジェクト群から *.csv のみ抽出し (gs:// URI, 表示名) を返す。
+fn csv_object_uris(bucket: &str, objects: &[String]) -> Vec<(String, String)> {
+    objects
+        .iter()
+        .filter(|o| o.to_lowercase().ends_with(".csv"))
+        .map(|o| (format!("gs://{bucket}/{o}"), leaf_name(o)))
+        .collect()
+}
+
+/// ジョブの状態を日本語ラベルにする。
+fn job_status_label(s: JobStatus) -> &'static str {
+    match s {
+        JobStatus::Queued => "待機",
+        JobStatus::Running => "実行中",
+        JobStatus::Done => "完了",
+        JobStatus::Failed => "失敗",
+        JobStatus::Cancelled => "中断",
+    }
+}
+
+/// 方式ラベル（挿入のみ / 上書き挿入）。
+fn mode_label(mode: query::ImportMode) -> &'static str {
+    match mode {
+        query::ImportMode::Insert => "挿入のみ",
+        query::ImportMode::InsertOrUpdate => "上書き挿入",
+    }
+}
+
+/// ジョブの取得元の表示文字列。
+fn job_source(req: &query::ImportRequest) -> String {
+    match &req.source {
+        query::ImportSource::File(p) => p.display().to_string(),
+        query::ImportSource::Gcs(u) => u.clone(),
+    }
+}
+
+/// 証跡レポート（Markdown）を組み立てる。
+fn report_markdown(jobs: &[ImportJob], ts: &chrono::DateTime<chrono::Local>) -> String {
+    let mut s = String::new();
+    s.push_str("# インポート証跡レポート\n\n");
+    s.push_str(&format!("生成日時: {}\n\n", ts.format("%Y-%m-%d %H:%M:%S")));
+    s.push_str(
+        "| テーブル | 方式 | 状態 | 書込行数 | 総行数 | スキップ | 再開スキップ | 所要(ms) | リジェクト | エラー | ソース |\n",
+    );
+    s.push_str("|---|---|---|--:|--:|--:|--:|--:|---|---|---|\n");
+    let mut total_written = 0usize;
+    for j in jobs {
+        let o = j.outcome.as_ref();
+        let written = o.map(|o| o.written).unwrap_or(0);
+        total_written += written;
+        let mode = if o.map(|o| o.dry_run).unwrap_or(false) {
+            "検証(ドライラン)".to_string()
+        } else {
+            mode_label(j.req.mode).to_string()
+        };
+        s.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            j.req.table,
+            mode,
+            job_status_label(j.status),
+            fmt_count(written),
+            fmt_count(o.map(|o| o.total).unwrap_or(0)),
+            fmt_count(o.map(|o| o.skipped).unwrap_or(0)),
+            fmt_count(o.map(|o| o.resumed).unwrap_or(0)),
+            o.map(|o| o.elapsed_ms).unwrap_or(0),
+            o.and_then(|o| o.reject_path.clone()).unwrap_or_else(|| "-".into()),
+            o.and_then(|o| o.error.clone()).unwrap_or_else(|| "-".into()),
+            job_source(&j.req),
+        ));
+    }
+    s.push_str(&format!(
+        "\n合計: {} ジョブ / 書込 {} 行\n",
+        jobs.len(),
+        fmt_count(total_written)
+    ));
+    s.push_str(
+        "\n※ 書込行数は BatchWrite で適用に成功した行数です。Spanner は行ごとの\n\
+         「新規挿入/更新」内訳を返さないため、本レポートには内訳は含みません。\n",
+    );
+    s
+}
+
+/// 証跡レポート（CSV）を組み立てる。
+fn report_csv(jobs: &[ImportJob]) -> String {
+    let esc = |s: &str| {
+        if s.contains(',') || s.contains('"') || s.contains('\n') {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    };
+    let mut out = String::from(
+        "table,mode,status,written,total,skipped,resumed,elapsed_ms,reject_path,error,source\n",
+    );
+    for j in jobs {
+        let o = j.outcome.as_ref();
+        let mode = if o.map(|o| o.dry_run).unwrap_or(false) {
+            "dry_run"
+        } else {
+            match j.req.mode {
+                query::ImportMode::Insert => "insert",
+                query::ImportMode::InsertOrUpdate => "insert_or_update",
+            }
+        };
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            esc(&j.req.table),
+            mode,
+            job_status_label(j.status),
+            o.map(|o| o.written).unwrap_or(0),
+            o.map(|o| o.total).unwrap_or(0),
+            o.map(|o| o.skipped).unwrap_or(0),
+            o.map(|o| o.resumed).unwrap_or(0),
+            o.map(|o| o.elapsed_ms).unwrap_or(0),
+            esc(&o.and_then(|o| o.reject_path.clone()).unwrap_or_default()),
+            esc(&o.and_then(|o| o.error.clone()).unwrap_or_default()),
+            esc(&job_source(&j.req)),
+        ));
+    }
+    out
+}
+
+/// egui のスクリーンショット（ColorImage）を PNG として保存する。
+fn save_screenshot_png(
+    path: &std::path::Path,
+    img: &egui::ColorImage,
+) -> Result<(), image::ImageError> {
+    let [w, h] = img.size;
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for px in &img.pixels {
+        rgba.extend_from_slice(&[px.r(), px.g(), px.b(), px.a()]);
+    }
+    image::save_buffer(
+        path,
+        &rgba,
+        w as u32,
+        h as u32,
+        image::ExtendedColorType::Rgba8,
+    )
+}
+
+/// インポート完了の結果メッセージを組み立てる。
+fn format_import_result(out: &query::ImportOutcome) -> String {
+    let partial = out.error.is_some() && out.written > 0;
+    let mut notes = String::new();
+    if out.resumed > 0 {
+        notes.push_str(&format!("・前回完了分 {} 行をスキップ", out.resumed));
+    }
+    if out.skipped > 0 {
+        notes.push_str(&format!("・不正行 {} 行をスキップ", out.skipped));
+    }
+    if let Some(p) = &out.reject_path {
+        notes.push_str(&format!("・リジェクト: {p}"));
+    }
+    if out.dry_run {
+        return match &out.error {
+            Some(e) => format!("検証で停止: {e}{notes}"),
+            None => format!(
+                "検証完了: {} 行中 {} 行が書き込み可能（不正 {} 行）{notes}",
+                out.total, out.written, out.skipped
+            ),
+        };
+    }
+    if out.cancelled {
+        return format!(
+            "中断（{} 行まで取込）。再キューで続きから再開します。{notes}",
+            out.written
+        );
+    }
+    match &out.error {
+        Some(e) if partial => format!(
+            "{} 件まで書き込み後にエラー: {e}（再キューで続きから再開）{notes}",
+            out.written
+        ),
+        Some(e) => format!("失敗: {e}{notes}"),
+        None => format!(
+            "{} / {} 行を取り込みました（{} ms）{notes}",
+            out.written, out.total, out.elapsed_ms
+        ),
+    }
+}
+
+/// ドロップダウンの選択テキスト（空ならプレースホルダ）。
+fn combo_text(val: &str, placeholder: &str) -> String {
+    if val.is_empty() {
+        format!("{placeholder}…")
+    } else {
+        val.to_string()
+    }
+}
+
+/// 整数を 3 桁区切りで表示する（例: 1234567 → "1,234,567"）。
+fn fmt_count(n: usize) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GCS パスの末尾セグメント取り出し（フォルダ/ファイル）。
+    #[test]
+    fn leaf_name_folder_and_file() {
+        assert_eq!(leaf_name("dir/sub/file.csv"), "file.csv");
+        assert_eq!(leaf_name("dir/sub/"), "sub/");
+        assert_eq!(leaf_name("file.csv"), "file.csv");
+        assert_eq!(leaf_name("top/"), "top/");
+    }
+
+    /// 一覧位置から 1 つ上の階層（ルートは None）。
+    #[test]
+    fn parent_location_walks_up() {
+        assert_eq!(
+            parent_location("b", "gs://b/dir/sub/").as_deref(),
+            Some("gs://b/dir/")
+        );
+        assert_eq!(
+            parent_location("b", "gs://b/dir/").as_deref(),
+            Some("gs://b/")
+        );
+        // バケット直下からはこれ以上上がれない。
+        assert_eq!(parent_location("b", "gs://b/"), None);
+    }
+
+    /// 行数の 3 桁区切り表示。
+    #[test]
+    fn fmt_count_groups_thousands() {
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(7), "7");
+        assert_eq!(fmt_count(42), "42");
+        assert_eq!(fmt_count(1000), "1,000");
+        assert_eq!(fmt_count(12_345), "12,345");
+        assert_eq!(fmt_count(1_234_567), "1,234,567");
+    }
+
+    /// 残り時間の表記（h/m/s）。
+    #[test]
+    fn fmt_duration_units() {
+        assert_eq!(fmt_duration(5.0), "5s");
+        assert_eq!(fmt_duration(65.0), "1m5s");
+        assert_eq!(fmt_duration(3661.0), "1h1m");
+        assert_eq!(fmt_duration(-3.0), "0s");
+    }
+
+    /// 進捗割合: 全体不明/0 は None、それ以外は 0..1 にクランプ。
+    #[test]
+    fn progress_fraction_cases() {
+        assert_eq!(progress_fraction(50, None), None);
+        assert_eq!(progress_fraction(50, Some(0)), None);
+        assert_eq!(progress_fraction(0, Some(100)), Some(0.0));
+        assert_eq!(progress_fraction(50, Some(100)), Some(0.5));
+        assert_eq!(progress_fraction(100, Some(100)), Some(1.0));
+        // 読み出しが全体を超えても 1.0 にクランプ。
+        assert_eq!(progress_fraction(150, Some(100)), Some(1.0));
+    }
+
+    /// 速度・ETA: 経過が短い/0 行は空、それ以外は rows/s と残り時間。
+    #[test]
+    fn rate_eta_cases() {
+        assert_eq!(rate_eta(0.2, 100, Some(0.5)), ""); // 経過が短すぎ
+        assert_eq!(rate_eta(2.0, 0, Some(0.5)), ""); // まだ 0 行
+        // 100 行/2s = 50 行/s、50% なら残りは経過と同じ ~2s。
+        assert_eq!(rate_eta(2.0, 100, Some(0.5)), "  ·  50 行/s  ·  残り ~2s");
+        // 1000 行/s 以上は k 表記、frac 不明なら ETA 無し。
+        assert_eq!(rate_eta(1.0, 5000, None), "  ·  5k 行/s");
+    }
+
+    /// 未割当 PK の検出。
+    #[test]
+    fn unmapped_pks_detects() {
+        let cols = vec![
+            query::Column { name: "Id".into(), ty: "INT64".into(), pk: true },
+            query::Column { name: "Name".into(), ty: "STRING(MAX)".into(), pk: false },
+        ];
+        // PK 未割当。
+        assert_eq!(
+            unmapped_pks(&cols, &[None, Some(0)]),
+            vec!["Id".to_string()]
+        );
+        // 全割当なら空。
+        assert!(unmapped_pks(&cols, &[Some(1), Some(0)]).is_empty());
+    }
+
+    /// フォルダ一括: *.csv だけ抽出して URI と表示名を作る。
+    #[test]
+    fn csv_object_uris_filters() {
+        let objs = vec![
+            "dir/a.csv".to_string(),
+            "dir/readme.txt".to_string(),
+            "dir/B.CSV".to_string(),
+        ];
+        let got = csv_object_uris("bkt", &objs);
+        assert_eq!(
+            got,
+            vec![
+                ("gs://bkt/dir/a.csv".to_string(), "a.csv".to_string()),
+                ("gs://bkt/dir/B.CSV".to_string(), "B.CSV".to_string()),
+            ]
+        );
+    }
+
+    /// 証跡レポート CSV: ヘッダ＋各ジョブの行（件数・方式・状態）。
+    #[test]
+    fn report_csv_rows() {
+        fn job(table: &str, mode: query::ImportMode, written: usize, total: usize) -> ImportJob {
+            ImportJob {
+                req: query::ImportRequest {
+                    table: table.into(),
+                    columns: vec![],
+                    source: query::ImportSource::File("/tmp/x.csv".into()),
+                    has_header: true,
+                    mode,
+                    empty_as_null: true,
+                    fresh: false,
+                    encoding: query::Encoding::Utf8,
+                    delimiter: b',',
+                    skip_bad_rows: false,
+                    dry_run: false,
+                    null_token: None,
+                    cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
+                source_name: "x.csv".into(),
+                sent: true,
+                status: JobStatus::Done,
+                started: None,
+                progress: None,
+                result: None,
+                outcome: Some(query::ImportOutcome {
+                    written,
+                    total,
+                    elapsed_ms: 10,
+                    ..Default::default()
+                }),
+            }
+        }
+        let jobs = vec![
+            job("A", query::ImportMode::Insert, 100, 100),
+            job("B", query::ImportMode::InsertOrUpdate, 50, 60),
+        ];
+        let csv = report_csv(&jobs);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert!(lines[0].starts_with("table,mode,status,written,total"));
+        assert_eq!(lines[1], "A,insert,完了,100,100,0,0,10,,,/tmp/x.csv");
+        assert_eq!(lines[2], "B,insert_or_update,完了,50,60,0,0,10,,,/tmp/x.csv");
+    }
+
+    /// 結果メッセージ: 成功/ドライラン/中断/部分適用/失敗 と注記。
+    #[test]
+    fn format_import_result_branches() {
+        let base = query::ImportOutcome {
+            table: "T".into(),
+            total: 100,
+            elapsed_ms: 50,
+            ..Default::default()
+        };
+        // 成功（注記なし）。
+        let ok = query::ImportOutcome { written: 100, ..base.clone() };
+        assert_eq!(format_import_result(&ok), "100 / 100 行を取り込みました（50 ms）");
+        // 再開＋スキップ＋リジェクトの注記付き。
+        let noted = query::ImportOutcome {
+            written: 90,
+            resumed: 30,
+            skipped: 5,
+            reject_path: Some("/tmp/r.csv".into()),
+            ..base.clone()
+        };
+        let m = format_import_result(&noted);
+        assert!(m.contains("前回完了分 30 行をスキップ"));
+        assert!(m.contains("不正行 5 行をスキップ"));
+        assert!(m.contains("/tmp/r.csv"));
+        // ドライラン。
+        let dry = query::ImportOutcome { written: 80, skipped: 20, dry_run: true, ..base.clone() };
+        assert!(format_import_result(&dry).starts_with("検証完了: 100 行中 80 行が書き込み可能"));
+        // 中断。
+        let cancelled = query::ImportOutcome { written: 40, cancelled: true, ..base.clone() };
+        assert!(format_import_result(&cancelled).starts_with("中断（40 行まで取込）"));
+        // 部分適用（書込後にエラー）。
+        let partial = query::ImportOutcome {
+            written: 60,
+            error: Some("boom".into()),
+            ..base.clone()
+        };
+        assert!(format_import_result(&partial).contains("60 件まで書き込み後にエラー: boom"));
+        // 1 行も書けずに失敗。
+        let failed = query::ImportOutcome { written: 0, error: Some("nope".into()), ..base };
+        assert!(format_import_result(&failed).starts_with("失敗: nope"));
+    }
 }

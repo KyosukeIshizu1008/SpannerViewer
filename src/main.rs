@@ -31,14 +31,13 @@ fn main() -> eframe::Result<()> {
     if mock {
         eprintln!("モックモードで起動します（MONITOR_MOCK=1）。合成データを表示します。");
     } else if project.is_empty() || instance.is_empty() {
-        eprintln!("環境変数 SPANNER_PROJECT と SPANNER_INSTANCE を設定してください。");
+        eprintln!(
+            "接続先が未設定です。アプリ内でログイン後、設定 →「接続先を選択（ADC）」で\
+             プロジェクト/インスタンス/DB を選んでください（環境変数は任意）。"
+        );
     }
 
-    let mon_cfg = monitoring::Config {
-        project: project.clone(),
-        instance: instance.clone(),
-        mock,
-    };
+    let mon_cfg = monitoring::Config { mock };
     let conn_info = if mock {
         "モックモード".to_string()
     } else if std::env::var("SPANNER_EMULATOR_HOST").is_ok() {
@@ -62,6 +61,12 @@ fn main() -> eframe::Result<()> {
     let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel::<(query::Target, String)>();
     // クエリ結果: 背景 → UI
     let (res_tx, res_rx) = mpsc::channel::<query::QueryOutcome>();
+    // CSV インポート要求: UI → 背景、結果: 背景 → UI
+    let (import_req_tx, import_req_rx) = tokio::sync::mpsc::unbounded_channel::<query::ImportRequest>();
+    let (import_res_tx, import_res_rx) = mpsc::channel::<query::ImportProgress>();
+    // GCS インポート: 要求（取得 / 一覧）UI → 背景、結果 背景 → UI
+    let (gcs_req_tx, gcs_req_rx) = tokio::sync::mpsc::unbounded_channel::<query::GcsRequest>();
+    let (gcs_res_tx, gcs_res_rx) = mpsc::channel::<query::GcsResponse>();
     // スキーマ図: 背景 → UI
     let (schema_tx, schema_rx) = mpsc::channel::<query::SchemaGraph>();
     // k8s 監視: 背景 → UI
@@ -108,7 +113,9 @@ fn main() -> eframe::Result<()> {
                     bg_interval.clone(),
                     sample_tx,
                 )),
-                tokio::spawn(query::query_loop(q_cfg, req_rx, res_tx, schema_tx)),
+                tokio::spawn(query::query_loop(q_cfg.clone(), req_rx, res_tx, schema_tx)),
+                tokio::spawn(query::import_loop(q_cfg.clone(), import_req_rx, import_res_tx)),
+                tokio::spawn(query::gcs_loop(q_cfg, gcs_req_rx, gcs_res_tx)),
                 tokio::spawn(k8s::monitor_loop(
                     k8s::Config { mock },
                     bg_interval,
@@ -165,6 +172,10 @@ fn main() -> eframe::Result<()> {
                     sample_rx,
                     req_tx,
                     res_rx,
+                    import_req_tx,
+                    import_res_rx,
+                    gcs_req_tx,
+                    gcs_res_rx,
                     schema_rx,
                     kube_metrics_rx,
                     kube_topo_req_tx,
