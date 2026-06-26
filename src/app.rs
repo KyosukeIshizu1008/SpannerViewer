@@ -1496,14 +1496,17 @@ impl eframe::App for MonitorApp {
                                             egui::RichText::new("取得中…").color(MUTED).small(),
                                         );
                                     }
-                                    for inst in &self.pick_instances {
+                                    for inst in self.pick_instances.clone() {
                                         if ui
-                                            .selectable_label(&self.pick_instance == inst, inst)
+                                            .selectable_label(self.pick_instance == inst, &inst)
                                             .clicked()
                                         {
-                                            self.pick_instance = inst.clone();
-                                            self.pick_database.clear();
-                                            self.pick_databases.clear();
+                                            cascade::select_instance(
+                                                &mut self.pick_instance,
+                                                &mut self.pick_database,
+                                                &mut self.pick_databases,
+                                                &inst,
+                                            );
                                             tb_load_databases = Some((proj.clone(), inst.clone()));
                                         }
                                     }
@@ -3989,18 +3992,19 @@ impl MonitorApp {
                     })
                     .width(260.0)
                     .show_ui(ui, |ui| {
-                        for p in self.pick_projects.clone() {
-                            if ui
-                                .selectable_value(&mut self.pick_project, p.clone(), &p)
-                                .clicked()
-                            {
-                                // プロジェクト変更 → 下位をリセットして再取得。
-                                self.pick_instance.clear();
-                                self.pick_database.clear();
-                                self.pick_instances.clear();
-                                self.pick_databases.clear();
-                                do_load_instances = Some(p.clone());
-                            }
+                        if let Some(p) =
+                            project_list_ui(ui, &self.pick_projects, &self.pick_project)
+                        {
+                            // プロジェクト変更 → 下位をリセットして再取得。
+                            cascade::select_project(
+                                &mut self.pick_project,
+                                &mut self.pick_instance,
+                                &mut self.pick_database,
+                                &mut self.pick_instances,
+                                &mut self.pick_databases,
+                                &p,
+                            );
+                            do_load_instances = Some(p);
                         }
                     });
                 // インスタンス／DB はトップバーで切り替える（ここでは選ばない）。
@@ -4048,9 +4052,11 @@ impl MonitorApp {
                         );
                         ui.end_row();
                     });
-                    let manual_ready = !self.pick_project_filter.trim().is_empty()
-                        && !self.pick_instance_manual.trim().is_empty()
-                        && !self.pick_database_manual.trim().is_empty();
+                    let manual_ready = cascade::ready(
+                        self.pick_project_filter.trim(),
+                        self.pick_instance_manual.trim(),
+                        self.pick_database_manual.trim(),
+                    );
                     if ui
                         .add_enabled(
                             manual_ready,
@@ -6431,11 +6437,62 @@ fn format_import_result(out: &query::ImportOutcome) -> String {
 }
 
 /// ドロップダウンの選択テキスト（空ならプレースホルダ）。
+/// プロジェクト一覧を selectable で描画し、クリックされた項目を返す。
+/// 実 UI（設定のプルダウン内）と egui_kittest の操作テストで同じ関数を共有する。
+fn project_list_ui(ui: &mut egui::Ui, projects: &[String], selected: &str) -> Option<String> {
+    let mut clicked = None;
+    for p in projects {
+        if ui.selectable_label(selected == p, p).clicked() {
+            clicked = Some(p.clone());
+        }
+    }
+    clicked
+}
+
 fn combo_text(val: &str, placeholder: &str) -> String {
     if val.is_empty() {
         format!("{placeholder}…")
     } else {
         val.to_string()
+    }
+}
+
+/// 接続先カスケード選択の状態遷移（描画から切り離して単体テストするための純ロジック）。
+///
+/// 「プロジェクトを選ぶと instance/DB がリセットされる」「3 つ揃って初めて接続できる」
+/// といった規則をここに集約し、UI はこれを呼ぶだけにする。
+mod cascade {
+    /// プロジェクト選択時: 値を更新し、下位（instance/DB と各候補一覧）を消す。
+    pub fn select_project(
+        project: &mut String,
+        instance: &mut String,
+        database: &mut String,
+        instances: &mut Vec<String>,
+        databases: &mut Vec<String>,
+        chosen: &str,
+    ) {
+        chosen.clone_into(project);
+        instance.clear();
+        database.clear();
+        instances.clear();
+        databases.clear();
+    }
+
+    /// インスタンス選択時: 値を更新し、DB と DB 候補一覧を消す。
+    pub fn select_instance(
+        instance: &mut String,
+        database: &mut String,
+        databases: &mut Vec<String>,
+        chosen: &str,
+    ) {
+        chosen.clone_into(instance);
+        database.clear();
+        databases.clear();
+    }
+
+    /// project/instance/database が 3 つとも空でなければ接続を適用できる。
+    pub fn ready(project: &str, instance: &str, database: &str) -> bool {
+        !project.is_empty() && !instance.is_empty() && !database.is_empty()
     }
 }
 
@@ -6479,6 +6536,128 @@ mod tests {
         );
         // バケット直下からはこれ以上上がれない。
         assert_eq!(parent_location("b", "gs://b/"), None);
+    }
+
+    /// プロジェクトを選ぶと instance/DB と各候補一覧がリセットされる。
+    #[test]
+    fn cascade_select_project_resets_lower() {
+        let mut project = "old-proj".to_string();
+        let mut instance = "old-inst".to_string();
+        let mut database = "old-db".to_string();
+        let mut instances = vec!["i1".to_string(), "i2".to_string()];
+        let mut databases = vec!["d1".to_string()];
+
+        cascade::select_project(
+            &mut project,
+            &mut instance,
+            &mut database,
+            &mut instances,
+            &mut databases,
+            "new-proj",
+        );
+
+        assert_eq!(project, "new-proj");
+        assert!(instance.is_empty(), "instance はクリアされる");
+        assert!(database.is_empty(), "database はクリアされる");
+        assert!(instances.is_empty(), "instance 候補はクリアされる");
+        assert!(databases.is_empty(), "database 候補はクリアされる");
+    }
+
+    /// インスタンスを選ぶと DB と DB 候補だけがリセットされる（project は保持）。
+    #[test]
+    fn cascade_select_instance_resets_database_only() {
+        let mut instance = "old-inst".to_string();
+        let mut database = "old-db".to_string();
+        let mut databases = vec!["d1".to_string(), "d2".to_string()];
+
+        cascade::select_instance(&mut instance, &mut database, &mut databases, "new-inst");
+
+        assert_eq!(instance, "new-inst");
+        assert!(database.is_empty());
+        assert!(databases.is_empty());
+    }
+
+    /// 3 つ揃ったときだけ接続適用できる。
+    #[test]
+    fn cascade_ready_requires_all_three() {
+        assert!(cascade::ready("p", "i", "d"));
+        assert!(!cascade::ready("", "i", "d"));
+        assert!(!cascade::ready("p", "", "d"));
+        assert!(!cascade::ready("p", "i", ""));
+        assert!(!cascade::ready("", "", ""));
+    }
+
+    /// egui 0.29 標準の Context でヘッドレスにクリックを再現し、project_list_ui が
+    /// クリックされた項目を返すことを確認する（egui_kittest は egui>=0.30 必須で
+    /// 本プロジェクトの 0.29 では使えないため、その代替となる操作テスト）。
+    #[test]
+    fn project_list_ui_click_returns_item() {
+        use egui::{Event, PointerButton, Pos2, Rect};
+
+        let ctx = egui::Context::default();
+        let projects = vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+        ];
+        let selected = String::new();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 400.0));
+        let base_input = || egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+
+        // パス0: レイアウトして "beta" の矩形（クリック座標）を得る。
+        let beta_rect = std::cell::Cell::new(None);
+        let _ = ctx.run(base_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for p in &projects {
+                    let r = ui.selectable_label(false, p);
+                    if p == "beta" {
+                        beta_rect.set(Some(r.rect));
+                    }
+                }
+            });
+        });
+        let pos = beta_rect.get().expect("beta の矩形").center();
+
+        // パス1: ポインタを重ねて押下。
+        let mut down = base_input();
+        down.events.push(Event::PointerMoved(pos));
+        down.events.push(Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        let _ = ctx.run(down, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = project_list_ui(ui, &projects, &selected);
+            });
+        });
+
+        // パス2: 離してクリック確定。返り値を捕捉する。
+        let clicked = std::cell::RefCell::new(None);
+        let mut up = base_input();
+        up.events.push(Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        let _ = ctx.run(up, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(p) = project_list_ui(ui, &projects, &selected) {
+                    *clicked.borrow_mut() = Some(p);
+                }
+            });
+        });
+
+        assert_eq!(
+            clicked.into_inner().as_deref(),
+            Some("beta"),
+            "クリックした項目が返るべき"
+        );
     }
 
     /// 行数の 3 桁区切り表示。
