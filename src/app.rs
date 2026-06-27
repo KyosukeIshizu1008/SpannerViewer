@@ -2110,6 +2110,23 @@ impl CsvTab {
         self.col_widths.clear();
     }
 
+    /// 指定列を「表示中の最長セル」に合わせた幅にする（上限なし＝全部見える）。
+    /// 境界のダブルクリックで使う。
+    fn fit_col_width(&self, ci: usize) -> f32 {
+        const CHAR_PX: f32 = 7.1;
+        const PAD: f32 = 18.0;
+        let units = |s: &str| -> usize {
+            s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+        };
+        let mut max_u = self.header_cells().get(ci).map(|h| units(h) + 1).unwrap_or(2);
+        for row in self.visible_rows(0, 500) {
+            if let Some(c) = row.get(ci) {
+                max_u = max_u.max(units(c));
+            }
+        }
+        (max_u as f32 * CHAR_PX + PAD).max(40.0)
+    }
+
     /// 背景で索引を作る（巨大ファイルでも UI を止めない）。
     fn start_load(&mut self, ctx: &egui::Context) {
         use std::sync::atomic::Ordering;
@@ -2456,7 +2473,8 @@ impl CsvTab {
                             human_bytes(idx.bytes as f64)
                         ))
                         .color(MUTED),
-                    );
+                    )
+                    .on_hover_text("列の境界をドラッグで幅変更・ダブルクリックで内容にフィット");
                 }
             });
         });
@@ -2609,11 +2627,58 @@ impl CsvTab {
 
         let row_h = 22.0_f32;
         let sb = 12.0_f32;
+        let full = ui.available_rect_before_wrap();
+        let grid = egui::Rect::from_min_max(full.min, egui::pos2(full.max.x - sb, full.max.y - sb));
+        let header_h = row_h;
+        let body_top = grid.top() + header_h;
+        let body_h = (grid.bottom() - body_top).max(0.0);
+        let visible = (body_h / row_h).floor().max(0.0) as u64;
+        let max_first = data_rows.saturating_sub(visible);
+
         // 列幅を内容に合わせて算出（必要時のみ。ヘッダ + 先頭サンプル）。
         if self.col_widths.len() != ncols {
             self.col_widths = self.compute_col_widths();
         }
-        // 各列の左端オフセット（先頭からの累積）と総幅。
+
+        // ── 列幅の手動調整: 境界ドラッグでリサイズ / ダブルクリックで内容にフィット ──
+        {
+            let coloff = self.col_off;
+            let mut bounds = Vec::with_capacity(ncols);
+            let mut cx = 0.0_f32;
+            for w in &self.col_widths {
+                cx += *w;
+                bounds.push(cx); // 列 ci の右境界（コンテンツ座標）
+            }
+            for ci in 0..ncols {
+                let bx = bounds.get(ci).copied().unwrap_or(0.0);
+                let x = grid.left() + bx - coloff;
+                if x < grid.left() - 1.0 || x > grid.right() + 1.0 {
+                    continue;
+                }
+                let handle = egui::Rect::from_min_max(
+                    egui::pos2(x - 3.0, grid.top()),
+                    egui::pos2(x + 3.0, grid.bottom()),
+                );
+                let id = ui.id().with(("csv_colsep", &salt, ci));
+                let r = ui.interact(handle, id, egui::Sense::click_and_drag());
+                if r.hovered() || r.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                if r.dragged() {
+                    let dx = r.drag_delta().x;
+                    if let Some(w) = self.col_widths.get_mut(ci) {
+                        *w = (*w + dx).clamp(40.0, 4000.0);
+                    }
+                } else if r.double_clicked() {
+                    let fit = self.fit_col_width(ci);
+                    if let Some(w) = self.col_widths.get_mut(ci) {
+                        *w = fit;
+                    }
+                }
+            }
+        }
+
+        // 調整後の幅から各列の左端オフセット（累積）と総幅を作る。
         let widths = self.col_widths.clone();
         let mut col_x = Vec::with_capacity(ncols + 1);
         let mut acc = 0.0_f32;
@@ -2623,13 +2688,6 @@ impl CsvTab {
         }
         col_x.push(acc);
         let content_w = acc;
-        let full = ui.available_rect_before_wrap();
-        let grid = egui::Rect::from_min_max(full.min, egui::pos2(full.max.x - sb, full.max.y - sb));
-        let header_h = row_h;
-        let body_top = grid.top() + header_h;
-        let body_h = (grid.bottom() - body_top).max(0.0);
-        let visible = (body_h / row_h).floor().max(0.0) as u64;
-        let max_first = data_rows.saturating_sub(visible);
         let max_off = (content_w - grid.width()).max(0.0);
 
         let resp = ui.interact(grid, ui.id().with(("csv_grid", &salt)), egui::Sense::hover());
@@ -2746,9 +2804,12 @@ impl CsvTab {
 
         let vbar_bg = egui::Color32::from_gray(30);
         painter.rect_filled(vtrack, 0.0, vbar_bg);
-        if max_first > 0 {
+        if max_first > 0 && vtrack.height() > 0.0 {
+            // つまみの最小高は 24px だがトラックがそれより短いと min>max で clamp が
+            // パニックするため、トラック高で頭打ちにする。
+            let min_th = 24.0_f32.min(vtrack.height());
             let th =
-                (visible as f32 / data_rows as f32 * vtrack.height()).clamp(24.0, vtrack.height());
+                (visible as f32 / data_rows as f32 * vtrack.height()).clamp(min_th, vtrack.height());
             let ty = vtrack.top() + (first as f32 / max_first as f32) * (vtrack.height() - th);
             painter.rect_filled(
                 egui::Rect::from_min_size(egui::pos2(vtrack.left() + 2.0, ty), egui::vec2(sb - 4.0, th)),
@@ -2826,30 +2887,38 @@ impl MonitorApp {
             if ui.button("GCS を開く…").clicked() {
                 do_gcs = true;
             }
-            if !self.csv_tabs.is_empty() {
-                ui.separator();
+        });
+        // ── タブ帯（VS Code 風） ──
+        if !self.csv_tabs.is_empty() {
+            ui.add_space(4.0);
+            egui::Frame::NONE.fill(PANEL).show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                 egui::ScrollArea::horizontal()
-                    .max_width(f32::INFINITY)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                             for (i, t) in self.csv_tabs.iter().enumerate() {
-                                let active = i == self.csv_active;
-                                let mark = if t.loading { "… " } else { "" };
-                                if ui
-                                    .selectable_label(active, format!("{mark}{}", t.title))
-                                    .clicked()
-                                {
+                                let (act, cl) =
+                                    draw_vscode_tab(ui, &t.title, i == self.csv_active, t.loading, i);
+                                if act {
                                     activate = Some(i);
                                 }
-                                if ui.small_button("×").on_hover_text("閉じる").clicked() {
+                                if cl {
                                     close = Some(i);
                                 }
-                                ui.add_space(2.0);
                             }
                         });
                     });
-            }
-        });
+            });
+            // 帯下のボーダー（エディタ領域との境界）。
+            let sep = ui.min_rect();
+            ui.painter().hline(
+                sep.x_range(),
+                ui.cursor().top(),
+                egui::Stroke::new(1.0, BORDER),
+            );
+        }
         if do_open {
             self.open_csv(ui.ctx());
         }
@@ -7663,6 +7732,102 @@ fn build_ddl(node: &TableNode) -> String {
     s
 }
 
+/// VS Code 風のタブを 1 つ描く。戻り値 (アクティブ化された, 閉じるが押された)。
+/// アクティブはエディタ背景色＋上にアクセント線、非アクティブは暗いタブ色。
+fn draw_vscode_tab(
+    ui: &mut egui::Ui,
+    title: &str,
+    active: bool,
+    loading: bool,
+    idx: usize,
+) -> (bool, bool) {
+    let h = 34.0;
+    let pad = 11.0;
+    let close_box = 16.0;
+    let font = egui::FontId::proportional(13.0);
+    let label = if loading {
+        format!("● {title}")
+    } else {
+        title.to_string()
+    };
+    // タイトル幅を実測してタブ幅を決める。
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.clone(), font.clone(), egui::Color32::WHITE);
+    let tab_w = pad + galley.size().x + 8.0 + close_box + 8.0;
+
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(tab_w, h), egui::Sense::click());
+    // 閉じる × の当たり判定（先に取って描画は後でまとめて行う）。
+    let close_center = egui::pos2(rect.right() - pad - close_box * 0.5, rect.center().y);
+    let close_rect = egui::Rect::from_center_size(close_center, egui::vec2(close_box, close_box));
+    let close_resp = ui.interact(
+        close_rect,
+        ui.id().with(("vstab_close", idx)),
+        egui::Sense::click(),
+    );
+
+    let painter = ui.painter();
+    let bg = if active {
+        BASE // エディタ背景 #1e1e1e
+    } else if resp.hovered() {
+        egui::Color32::from_rgb(50, 50, 50)
+    } else {
+        egui::Color32::from_rgb(45, 45, 45) // 非アクティブタブ #2d2d2d
+    };
+    painter.rect_filled(rect, 0.0, bg);
+    if active {
+        // 上端 2px のアクセント線。
+        painter.rect_filled(
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.top() + 2.0)),
+            0.0,
+            ACCENT,
+        );
+    }
+    // 右側の区切り線。
+    painter.vline(
+        rect.right(),
+        rect.y_range(),
+        egui::Stroke::new(1.0, egui::Color32::from_gray(37)),
+    );
+    // タイトル。
+    let tcol = if active {
+        egui::Color32::from_gray(230)
+    } else {
+        egui::Color32::from_gray(150)
+    };
+    painter.text(
+        egui::pos2(rect.left() + pad, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        &label,
+        font,
+        tcol,
+    );
+    // 閉じる ×（ホバーで丸い下地）。
+    if close_resp.hovered() {
+        painter.rect_filled(
+            close_rect,
+            egui::CornerRadius::same(3),
+            egui::Color32::from_gray(75),
+        );
+    }
+    let show_close = active || resp.hovered() || close_resp.hovered();
+    if show_close {
+        let xcol = if close_resp.hovered() {
+            egui::Color32::from_gray(235)
+        } else {
+            egui::Color32::from_gray(160)
+        };
+        painter.text(
+            close_center,
+            egui::Align2::CENTER_CENTER,
+            "×",
+            egui::FontId::proportional(15.0),
+            xcol,
+        );
+    }
+    (resp.clicked() && !close_resp.clicked(), close_resp.clicked())
+}
+
 /// 中央寄せの控えめなヒント表示。
 fn centered_hint(ui: &mut egui::Ui, text: &str) {
     ui.add_space(20.0);
@@ -8784,6 +8949,14 @@ mod tests {
             let mut tab = CsvTab::new(path.clone());
             tab.index = Some(Arc::new(idx));
             app.csv_tabs.push(tab);
+            // VS Code 風タブの見た目確認用に複数タブを足す（2 番目はローディング表示）。
+            for name in ["users.csv", "orders_2024.csv"] {
+                let p = std::env::temp_dir().join(name);
+                std::fs::write(&p, "a,b\n1,2\n").ok();
+                let mut t = CsvTab::new(p);
+                t.loading = name.starts_with("orders");
+                app.csv_tabs.push(t);
+            }
             app.csv_active = 0;
         }
         for _ in 0..3 {
