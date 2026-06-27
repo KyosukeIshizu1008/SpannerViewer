@@ -2,6 +2,7 @@
 name = "spanner-viewer"
 version = "0.1.0"
 edition = "2021"
+default-run = "spanner-viewer"
 
 [dependencies]
 eframe = "0.35"
