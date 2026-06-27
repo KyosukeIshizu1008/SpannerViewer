@@ -104,7 +104,7 @@ struct ImportProg {
 }
 
 /// インポートジョブの状態。
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum JobStatus {
     Queued,
     Running,
@@ -6723,6 +6723,162 @@ mod tests {
         harness.run();
 
         assert_eq!(clicked.borrow().as_deref(), Some("beta"));
+    }
+
+    /// E2E: 実アプリ（MonitorApp）を kittest で動かし、実際の import_loop を
+    /// 介してエミュレータ Spanner へ CSV を取り込み、行が入ることを確認する。
+    /// UI のジョブキュー → チャネル → 背景ループ → Spanner → チャネル → UI まで通す。
+    /// emulator が必要なので既定では実行しない（GPU も要るため #[ignore]）。
+    /// 単独実行推奨: `cargo test --ignored e2e_import_pipeline -- --test-threads=1`
+    #[ignore = "emulator + GPU が必要。E2E は単独で実行する"]
+    #[test]
+    fn e2e_import_pipeline() {
+        use egui_kittest::Harness;
+        if std::env::var("SPANNER_EMULATOR_HOST").is_err() {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        }
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let project = std::env::var("SPANNER_PROJECT").unwrap();
+        let instance = std::env::var("SPANNER_INSTANCE").unwrap();
+        let database = std::env::var("SPANNER_DATABASE").unwrap();
+        let db = format!("projects/{project}/instances/{instance}/databases/{database}");
+        let table = "E2EImport";
+
+        fn block<F: std::future::Future>(f: F) -> F::Output {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(f)
+        }
+
+        // 1) テーブル作成＋既存行クリア（DDL は admin クライアントで）。
+        block(async {
+            use gcloud_spanner::admin::client::Client as AdminClient;
+            use gcloud_spanner::admin::AdminClientConfig;
+            use gcloud_spanner::client::{Client, ClientConfig};
+            use google_cloud_googleapis::spanner::admin::database::v1::UpdateDatabaseDdlRequest;
+            let cfg = AdminClientConfig::default().with_auth().await.unwrap();
+            let admin = AdminClient::new(cfg).await.unwrap();
+            let req = UpdateDatabaseDdlRequest {
+                database: db.clone(),
+                statements: vec![format!(
+                    "CREATE TABLE IF NOT EXISTS {table} \
+                     (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)"
+                )],
+                ..Default::default()
+            };
+            admin
+                .database()
+                .update_database_ddl(req, None)
+                .await
+                .unwrap()
+                .wait(None)
+                .await
+                .unwrap();
+            let c = Client::new(&db, ClientConfig::default().with_auth().await.unwrap())
+                .await
+                .unwrap();
+            let _ = c
+                .apply(vec![gcloud_spanner::mutation::delete(
+                    table,
+                    gcloud_spanner::key::all_keys(),
+                )])
+                .await;
+        });
+
+        // 2) 実 import_loop を背景ランタイムで起動。
+        let (import_req_tx, import_req_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (import_res_tx, import_res_rx) = std::sync::mpsc::channel();
+        let cfg = query::Config {
+            project,
+            instance,
+            database,
+            mock: false,
+        };
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(query::import_loop(cfg, import_req_rx, import_res_tx));
+        });
+
+        // 3) 実 MonitorApp を kittest で構築（import チャネルだけ実物に差し替え）。
+        let mut ch = make_test_channels();
+        ch.import_req_tx = import_req_tx;
+        ch.import_res_rx = import_res_rx;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 720.0))
+            .build_eframe(|cc| MonitorApp::new(ch, cc));
+
+        // 4) CSV を用意し、アプリのジョブキューに投入（UI 経由のディスパッチ）。
+        let csv = "Id,Name\n1,alice\n2,bob\n3,carol\n";
+        let path = std::env::temp_dir().join("spanner_viewer_e2e.csv");
+        std::fs::write(&path, csv).unwrap();
+        let req = query::ImportRequest {
+            table: table.into(),
+            columns: vec![
+                query::ImportColumn { name: "Id".into(), ty: "INT64".into(), src_index: 0 },
+                query::ImportColumn {
+                    name: "Name".into(),
+                    ty: "STRING(MAX)".into(),
+                    src_index: 1,
+                },
+            ],
+            source: query::ImportSource::File(path),
+            has_header: true,
+            mode: query::ImportMode::Insert,
+            empty_as_null: true,
+            fresh: true,
+            encoding: query::Encoding::Utf8,
+            delimiter: b',',
+            skip_bad_rows: false,
+            dry_run: false,
+            null_token: None,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        harness.state_mut().push_job(req, "e2e.csv".into());
+
+        // 5) ジョブが完了するまでフレームを回す（drain がチャネルを取り込む）。
+        // run() は安定するまで回ろうとして、取込中の再描画で収束せず panic するので
+        // step()（1 フレーム進める）を使う。
+        let mut status = None;
+        for _ in 0..200 {
+            harness.step();
+            status = harness.state().import_jobs.first().map(|j| j.status);
+            if matches!(status, Some(JobStatus::Done) | Some(JobStatus::Failed)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(status, Some(JobStatus::Done), "ジョブが完了するはず");
+        let written = harness
+            .state()
+            .import_jobs
+            .first()
+            .and_then(|j| j.outcome.as_ref())
+            .map(|o| o.written);
+        assert_eq!(written, Some(3), "3 行書き込まれるはず");
+
+        // 6) エミュレータを直接読んで実データを検証。
+        let n: i64 = block(async {
+            use gcloud_spanner::client::{Client, ClientConfig};
+            use gcloud_spanner::statement::Statement;
+            let c = Client::new(&db, ClientConfig::default().with_auth().await.unwrap())
+                .await
+                .unwrap();
+            let mut tx = c.single().await.unwrap();
+            let mut it = tx
+                .query(Statement::new(format!("SELECT COUNT(*) FROM {table}")))
+                .await
+                .unwrap();
+            let row = it.next().await.unwrap().unwrap();
+            row.column::<i64>(0).unwrap()
+        });
+        assert_eq!(n, 3, "Spanner に 3 行入っているはず");
     }
 
     /// テスト用に Channels を作る（背景ループは無いので送受信端は捨てる）。
