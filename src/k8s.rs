@@ -553,8 +553,13 @@ pub async fn pf_loop(
                     });
                     continue;
                 }
+                // 自然終了した port-forward のハンドルを掃除（リーク防止）。
+                running.retain(|_, h| !h.is_finished());
                 let handle = tokio::spawn(pf_run(id, ns, target, local, remote, label, tx.clone()));
-                running.insert(id, handle);
+                // id 再利用時は古いタスクを止めてから差し替える（旧タスクの取りこぼし防止）。
+                if let Some(old) = running.insert(id, handle) {
+                    old.abort();
+                }
             }
             PortForwardReq::Stop { id } => {
                 if let Some(h) = running.remove(&id) {
