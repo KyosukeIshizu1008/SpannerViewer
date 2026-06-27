@@ -2033,6 +2033,8 @@ struct CsvTab {
     filter_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     filter_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     filter_result: std::sync::Arc<std::sync::Mutex<Option<Vec<u64>>>>,
+    /// 各列の表示幅（内容に合わせて算出。空なら次の描画で再計算）。
+    col_widths: Vec<f32>,
 }
 
 impl CsvTab {
@@ -2068,7 +2070,45 @@ impl CsvTab {
             filter_progress: Arc::new(AtomicU64::new(0)),
             filter_cancel: Arc::new(AtomicBool::new(false)),
             filter_result: Arc::new(Mutex::new(None)),
+            col_widths: Vec::new(),
         }
+    }
+
+    /// 各列の表示幅を内容（ヘッダ + 先頭付近のデータ行）から算出する。
+    /// 100GB でも先頭サンプルだけ見るので軽い。半角=1/全角=2 で文字幅を概算し、
+    /// 列ごとに [MIN, MAX] でクランプする。
+    fn compute_col_widths(&self) -> Vec<f32> {
+        const CHAR_PX: f32 = 7.1; // 12px プロポーショナルの 1 単位ぶんの目安
+        const PAD: f32 = 16.0;
+        const MIN_W: f32 = 54.0;
+        const MAX_W: f32 = 460.0;
+        let ncols = self.ncols();
+        if ncols == 0 {
+            return Vec::new();
+        }
+        let units = |s: &str| -> usize {
+            s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+        };
+        let mut max_units = vec![0usize; ncols];
+        // ヘッダはやや太字なので +1 単位みておく。
+        for (i, h) in self.header_cells().iter().enumerate().take(ncols) {
+            max_units[i] = max_units[i].max(units(h) + 1);
+        }
+        // 先頭付近のデータ行をサンプル（フィルタ中は一致行の先頭）。
+        for row in self.visible_rows(0, 200) {
+            for (i, cell) in row.iter().enumerate().take(ncols) {
+                max_units[i] = max_units[i].max(units(cell));
+            }
+        }
+        max_units
+            .into_iter()
+            .map(|u| (u as f32 * CHAR_PX + PAD).clamp(MIN_W, MAX_W))
+            .collect()
+    }
+
+    /// 列幅キャッシュを無効化する（フィルタ変更・再読込時）。
+    fn invalidate_col_widths(&mut self) {
+        self.col_widths.clear();
     }
 
     /// 背景で索引を作る（巨大ファイルでも UI を止めない）。
@@ -2248,19 +2288,26 @@ impl CsvTab {
     /// 背景タスクの結果を取り込む（毎フレーム全タブで呼ぶ）。
     fn drain(&mut self) {
         if self.loading {
-            if let Some(r) = self.result.lock().unwrap().take() {
+            // 先に取り出して MutexGuard を落としてから self を変更する（借用衝突回避）。
+            let r = self.result.lock().unwrap().take();
+            if let Some(r) = r {
                 self.loading = false;
                 match r {
-                    Ok(idx) => self.index = Some(std::sync::Arc::new(idx)),
+                    Ok(idx) => {
+                        self.index = Some(std::sync::Arc::new(idx));
+                        self.invalidate_col_widths();
+                    }
                     Err(e) => self.err = Some(e),
                 }
             }
         }
         if self.filtering {
-            if let Some(v) = self.filter_result.lock().unwrap().take() {
+            let v = self.filter_result.lock().unwrap().take();
+            if let Some(v) = v {
                 self.filtering = false;
                 self.first_row = 0;
                 self.matches = Some(std::sync::Arc::new(v));
+                self.invalidate_col_widths();
             }
         }
     }
@@ -2358,8 +2405,9 @@ impl CsvTab {
         let salt = self.title.clone();
         let mut do_goto = false;
         ui.add_space(6.0);
+        let mut layout_changed = false;
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.has_header, "先頭行をヘッダ");
+            layout_changed |= ui.checkbox(&mut self.has_header, "先頭行をヘッダ").changed();
             egui::ComboBox::from_id_salt(("csv_delim", &salt))
                 .selected_text(match self.delim {
                     b'\t' => "タブ",
@@ -2368,10 +2416,10 @@ impl CsvTab {
                     _ => "カンマ",
                 })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.delim, b',', "カンマ");
-                    ui.selectable_value(&mut self.delim, b'\t', "タブ");
-                    ui.selectable_value(&mut self.delim, b';', "セミコロン");
-                    ui.selectable_value(&mut self.delim, b'|', "パイプ");
+                    layout_changed |= ui.selectable_value(&mut self.delim, b',', "カンマ").changed();
+                    layout_changed |= ui.selectable_value(&mut self.delim, b'\t', "タブ").changed();
+                    layout_changed |= ui.selectable_value(&mut self.delim, b';', "セミコロン").changed();
+                    layout_changed |= ui.selectable_value(&mut self.delim, b'|', "パイプ").changed();
                 });
             egui::ComboBox::from_id_salt(("csv_enc", &salt))
                 .selected_text(match self.encoding {
@@ -2379,12 +2427,12 @@ impl CsvTab {
                     _ => "UTF-8",
                 })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.encoding, query::Encoding::Utf8, "UTF-8");
-                    ui.selectable_value(
-                        &mut self.encoding,
-                        query::Encoding::ShiftJis,
-                        "Shift-JIS",
-                    );
+                    layout_changed |= ui
+                        .selectable_value(&mut self.encoding, query::Encoding::Utf8, "UTF-8")
+                        .changed();
+                    layout_changed |= ui
+                        .selectable_value(&mut self.encoding, query::Encoding::ShiftJis, "Shift-JIS")
+                        .changed();
                 });
             if self.ready() {
                 ui.separator();
@@ -2417,6 +2465,10 @@ impl CsvTab {
             if let Ok(n) = self.goto.trim().replace(',', "").parse::<u64>() {
                 self.first_row = n.saturating_sub(1);
             }
+        }
+        if layout_changed {
+            // ヘッダ有無/区切り/文字コードが変わると列の内容も変わるので幅を再算出。
+            self.invalidate_col_widths();
         }
 
         // ── 検索 / 絞り込み行 ──
@@ -2470,6 +2522,7 @@ impl CsvTab {
             if do_clear {
                 self.matches = None;
                 self.first_row = 0;
+                self.invalidate_col_widths();
             }
             if self.filtering {
                 let done = self.filter_progress.load(Ordering::Relaxed);
@@ -2556,8 +2609,21 @@ impl CsvTab {
         };
 
         let row_h = 22.0_f32;
-        let col_w = 160.0_f32;
         let sb = 12.0_f32;
+        // 列幅を内容に合わせて算出（必要時のみ。ヘッダ + 先頭サンプル）。
+        if self.col_widths.len() != ncols {
+            self.col_widths = self.compute_col_widths();
+        }
+        // 各列の左端オフセット（先頭からの累積）と総幅。
+        let widths = self.col_widths.clone();
+        let mut col_x = Vec::with_capacity(ncols + 1);
+        let mut acc = 0.0_f32;
+        for w in &widths {
+            col_x.push(acc);
+            acc += *w;
+        }
+        col_x.push(acc);
+        let content_w = acc;
         let full = ui.available_rect_before_wrap();
         let grid = egui::Rect::from_min_max(full.min, egui::pos2(full.max.x - sb, full.max.y - sb));
         let header_h = row_h;
@@ -2565,7 +2631,6 @@ impl CsvTab {
         let body_h = (grid.bottom() - body_top).max(0.0);
         let visible = (body_h / row_h).floor().max(0.0) as u64;
         let max_first = data_rows.saturating_sub(visible);
-        let content_w = ncols as f32 * col_w;
         let max_off = (content_w - grid.width()).max(0.0);
 
         let resp = ui.interact(grid, ui.id().with(("csv_grid", &salt)), egui::Sense::hover());
@@ -2615,8 +2680,9 @@ impl CsvTab {
         let painter = ui.painter_at(full);
         painter.rect_filled(full, 0.0, BASE);
 
-        let cell_chars = ((col_w - 12.0) / 7.5).max(2.0) as usize;
-        let clip = |s: &str| -> String {
+        // 列幅に応じてセル文字列を省略する（… 付き）。
+        let clip = |s: &str, w: f32| -> String {
+            let cell_chars = ((w - 12.0) / 7.5).max(2.0) as usize;
             if s.chars().count() > cell_chars {
                 let mut t: String = s.chars().take(cell_chars.saturating_sub(1)).collect();
                 t.push('…');
@@ -2627,8 +2693,9 @@ impl CsvTab {
         };
         let draw_cells = |cells: &[String], y: f32, strong: bool, fg: egui::Color32| {
             for ci in 0..ncols {
-                let x = grid.left() + ci as f32 * col_w - coloff;
-                if x + col_w < grid.left() || x > grid.right() {
+                let cw = widths.get(ci).copied().unwrap_or(120.0);
+                let x = grid.left() + col_x[ci] - coloff;
+                if x + cw < grid.left() || x > grid.right() {
                     continue;
                 }
                 if let Some(v) = cells.get(ci) {
@@ -2640,7 +2707,7 @@ impl CsvTab {
                     painter.text(
                         egui::pos2(x + 6.0, y + row_h * 0.5),
                         egui::Align2::LEFT_CENTER,
-                        clip(v),
+                        clip(v, cw),
                         font,
                         fg,
                     );
@@ -8597,6 +8664,44 @@ mod tests {
         match h.render() {
             Ok(img) => img.save("target/ui_shots/font_check.png").unwrap(),
             Err(e) => eprintln!("[render] font_check 失敗: {e}"),
+        }
+    }
+
+    /// CSV ビューアの列幅が内容に応じて変わることを視覚確認する。
+    #[ignore = "wgpu アダプタが必要。視覚確認時のみ手動実行する"]
+    #[test]
+    fn render_csv_column_widths() {
+        use egui_kittest::Harness;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        std::fs::create_dir_all("target/ui_shots").unwrap();
+        let body = "id,name,description,country\n\
+                    1,Al,short,JP\n\
+                    2,Bob,A much longer description that should widen this column considerably,US\n\
+                    42,Charlie,mid,United Kingdom\n\
+                    7,Dee,tiny,フランス\n";
+        let path = std::env::temp_dir().join("spanner_viewer_csv_widths.csv");
+        std::fs::write(&path, body).unwrap();
+        let idx = csvview::CsvIndex::build(&path, Arc::new(AtomicU64::new(0))).unwrap();
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 240.0))
+            .build_eframe(|cc| MonitorApp::new(make_test_channels(), cc));
+        {
+            let app = harness.state_mut();
+            app.section = Section::Csv;
+            let mut tab = CsvTab::new(path.clone());
+            tab.index = Some(Arc::new(idx));
+            app.csv_tabs.push(tab);
+            app.csv_active = 0;
+        }
+        for _ in 0..3 {
+            harness.step();
+        }
+        match harness.render() {
+            Ok(img) => img.save("target/ui_shots/csv_widths.png").unwrap(),
+            Err(e) => eprintln!("[render] csv_widths 失敗: {e}"),
         }
     }
 
