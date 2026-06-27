@@ -1483,7 +1483,7 @@ impl eframe::App for MonitorApp {
 
         // VS Code 風の左アクティビティバー
         egui::Panel::left("activity")
-            .exact_size(54.0)
+            .exact_size(44.0)
             .resizable(false)
             .frame(
                 egui::Frame::NONE
@@ -5998,7 +5998,7 @@ fn activity_item(
     tip: &str,
 ) -> bool {
     let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 50.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 42.0), egui::Sense::click());
     let p = ui.painter();
     if selected {
         p.rect_filled(
@@ -6018,7 +6018,7 @@ fn activity_item(
     };
     draw(
         p,
-        egui::Rect::from_center_size(rect.center(), egui::vec2(26.0, 26.0)),
+        egui::Rect::from_center_size(rect.center(), egui::vec2(20.0, 20.0)),
         color,
     );
     if resp.hovered() {
