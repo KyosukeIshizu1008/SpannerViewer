@@ -7025,12 +7025,12 @@ fn setup_style(ctx: &egui::Context) {
     ctx.set_visuals(v);
 
     ctx.all_styles_mut(|s| {
-        // VS Code に合わせる: UI は 13px、コンパクトな余白。
-        s.spacing.item_spacing = egui::vec2(6.0, 4.0);
-        s.spacing.button_padding = egui::vec2(8.0, 3.0);
-        s.spacing.interact_size.y = 22.0;
-        s.spacing.window_margin = egui::Margin::same(10);
-        s.spacing.menu_margin = egui::Margin::same(6);
+        // VS Code に合わせる: UI は 13px、行間（縦）をかなり詰める。
+        s.spacing.item_spacing = egui::vec2(6.0, 2.0);
+        s.spacing.button_padding = egui::vec2(8.0, 2.0);
+        s.spacing.interact_size.y = 18.0;
+        s.spacing.window_margin = egui::Margin::same(8);
+        s.spacing.menu_margin = egui::Margin::same(5);
         s.spacing.scroll.bar_width = 10.0;
         s.spacing.scroll.floating = false;
         s.text_styles = [
