@@ -1274,7 +1274,9 @@ async fn run_streaming_import(
                                 abort.load(Ordering::Relaxed) || req.cancel.load(Ordering::Relaxed);
                             if is_retryable(&status) && attempt < RETRY_MAX && !stop {
                                 attempt += 1;
-                                tokio::time::sleep(retry_delay(attempt, &sname)).await;
+                                // 待機中も中断要求に即応する（最大 5s 固まらない）。
+                                cancellable_sleep(retry_delay(attempt, &sname), &abort, &req.cancel)
+                                    .await;
                                 if abort.load(Ordering::Relaxed)
                                     || req.cancel.load(Ordering::Relaxed)
                                 {
@@ -1412,9 +1414,10 @@ async fn run_streaming_import(
                 let n = batch.len();
                 processed += n;
                 if committed.contains(&batch_idx) {
-                    // 前回コミット済み → 再送しない（無駄を省く）。済み行として数える。
+                    // 前回コミット済み → 再送しない。resumed として数え、written には
+                    // 含めない（written は「今回書いた行数」。証跡レポートの更新数推定で
+                    // 二重計上しないため）。
                     resumed += n;
-                    written.fetch_add(n, Ordering::Relaxed);
                     batch.clear();
                 } else if tx
                     .send((batch_idx, start_line, std::mem::take(&mut batch)))
@@ -1450,8 +1453,8 @@ async fn run_streaming_import(
             let n = batch.len();
             processed += n;
             if committed.contains(&batch_idx) {
+                // resumed のみ。written には含めない（上の主ループと同じ理由）。
                 resumed += n;
-                written.fetch_add(n, Ordering::Relaxed);
                 batch.clear();
             } else {
                 let _ = tx
@@ -1964,6 +1967,21 @@ fn is_retryable_code(code: i32) -> bool {
     matches!(code, 4 | 8 | 10 | 14)
 }
 
+/// 指定時間だけ待つが、abort/cancel が立ったら即座に返る。
+/// リトライのバックオフ待機中でも中断要求に素早く応答するため。
+async fn cancellable_sleep(dur: std::time::Duration, abort: &AtomicBool, cancel: &AtomicBool) {
+    let step = std::time::Duration::from_millis(100);
+    let mut left = dur;
+    while left > std::time::Duration::ZERO {
+        if abort.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let s = step.min(left);
+        tokio::time::sleep(s).await;
+        left = left.saturating_sub(s);
+    }
+}
+
 /// リトライ回数の上限と、attempt(1始まり)・ワーカー名からのバックオフ待ち時間。
 const RETRY_MAX: usize = 5;
 
@@ -2358,9 +2376,12 @@ fn mock_data(sql: &str) -> QueryOutcome {
 
 /// SQL 末尾の `LIMIT n` を取り出す（モック用の簡易パース）。
 fn parse_limit(sql: &str) -> Option<usize> {
+    // 小文字化した文字列側でオフセットを取り、同じ小文字側を切る。
+    // 元の sql を切ると、非 ASCII を含む SQL で小文字化により長さが変わったとき
+    // バイト境界がずれて panic することがある（数字は ASCII なので lower で十分）。
     let lower = sql.to_lowercase();
     let pos = lower.rfind("limit")?;
-    sql[pos + "limit".len()..]
+    lower[pos + "limit".len()..]
         .split_whitespace()
         .next()?
         .parse::<usize>()
@@ -2666,6 +2687,17 @@ mod tests {
         w2.mark(9);
         assert!(load_checkpoint(&path, sig).contains(&9));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// parse_limit: 非 ASCII を含む SQL でも panic せず LIMIT を取れる。
+    #[test]
+    fn parse_limit_handles_non_ascii() {
+        assert_eq!(parse_limit("SELECT * FROM T LIMIT 5"), Some(5));
+        assert_eq!(parse_limit("select * from t limit 12"), Some(12));
+        // 日本語コメント/リテラルが前にあっても境界ずれで panic しない。
+        assert_eq!(parse_limit("SELECT * FROM T -- 表 LIMIT 7"), Some(7));
+        assert_eq!(parse_limit("SELECT 'İstanbul' FROM T LIMIT 3"), Some(3));
+        assert_eq!(parse_limit("SELECT * FROM T"), None);
     }
 
     /// シグネチャは列/ per_request / ソースで変わり、mode では変わらない。
