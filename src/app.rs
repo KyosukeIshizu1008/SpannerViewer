@@ -12,11 +12,12 @@ use crate::monitoring::Sample;
 use crate::query::{self, EdgeKind, QueryOutcome, SchemaGraph, TableNode, Target};
 
 // ── カラーパレット（モダンダーク） ──
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(56, 189, 248); // sky
-const CPU_COLOR: egui::Color32 = egui::Color32::from_rgb(251, 146, 60); // amber/orange
-const STORAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(56, 189, 248); // sky
-const TEXT: egui::Color32 = egui::Color32::from_rgb(226, 232, 240); // 明るいテキスト
-const MUTED: egui::Color32 = egui::Color32::from_rgb(148, 163, 184); // 補助テキスト
+// VS Code Dark+ 配色
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0, 122, 204); // VS Code blue #007acc
+const CPU_COLOR: egui::Color32 = egui::Color32::from_rgb(206, 145, 120); // 文字列っぽい橙
+const STORAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(78, 201, 176); // teal
+const TEXT: egui::Color32 = egui::Color32::from_rgb(204, 204, 204); // #cccccc
+const MUTED: egui::Color32 = egui::Color32::from_rgb(133, 133, 133); // #858585
 
 /// 背景ワーカーへの送信失敗時に表示するメッセージ。
 const WORKER_GONE: &str = "バックグラウンド処理が停止しています。アプリを再起動してください。";
@@ -1478,11 +1479,47 @@ impl eframe::App for MonitorApp {
             .resizable(false)
             .frame(
                 egui::Frame::NONE
-                    .fill(BASE)
+                    .fill(ACTIVITY_BG)
                     .stroke(egui::Stroke::new(1.0, BORDER)),
             )
             .show(ui, |ui| {
                 self.activity_bar(ui);
+            });
+
+        // VS Code 風の下部ステータスバー（青）。
+        egui::Panel::bottom("statusbar")
+            .exact_size(24.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(STATUS_BG)
+                    .inner_margin(egui::Margin::symmetric(10, 3)),
+            )
+            .show(ui, |ui| {
+                let white = egui::Color32::WHITE;
+                ui.horizontal(|ui| {
+                    let sec = match self.section {
+                        Section::Spanner => "Spanner",
+                        Section::Kube => "Kubernetes",
+                        Section::Csv => "CSV ビューア",
+                    };
+                    ui.label(egui::RichText::new(sec).color(white).small());
+                    ui.label(egui::RichText::new("·").color(white).small());
+                    let info = match self.section {
+                        Section::Csv => self
+                            .csv_tabs
+                            .get(self.csv_active)
+                            .map(|t| t.title.clone())
+                            .unwrap_or_else(|| "ファイル未選択".into()),
+                        _ => self.conn_info.clone(),
+                    };
+                    ui.label(egui::RichText::new(info).color(white).small());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(note) = &self.copy_note {
+                            ui.label(egui::RichText::new(note).color(white).small());
+                        }
+                    });
+                });
             });
 
         // ビュー切替タブ（セクションごとに内容が変わる）
@@ -6894,13 +6931,15 @@ fn centered_hint(ui: &mut egui::Ui, text: &str) {
 
 /// モダンなダークテーマを適用する（配色・角丸・余白・フォントサイズ）。
 // ── 表面（背景レイヤー） ──
-const BASE: egui::Color32 = egui::Color32::from_rgb(13, 15, 19); // 最暗（アクティビティバー等）
-const PANEL: egui::Color32 = egui::Color32::from_rgb(22, 24, 30); // コンテンツ
-const ELEVATED: egui::Color32 = egui::Color32::from_rgb(29, 32, 39); // ウィンドウ/カード
-const HOVER: egui::Color32 = egui::Color32::from_rgb(38, 42, 51);
-const BORDER: egui::Color32 = egui::Color32::from_rgb(42, 47, 57);
-const INPUT_BG: egui::Color32 = egui::Color32::from_rgb(16, 18, 23);
-const ROW_ALT: egui::Color32 = egui::Color32::from_rgb(27, 30, 37); // 縞模様
+const BASE: egui::Color32 = egui::Color32::from_rgb(30, 30, 30); // エディタ #1e1e1e（グリッド等）
+const PANEL: egui::Color32 = egui::Color32::from_rgb(37, 37, 38); // サイドバー/パネル #252526
+const ELEVATED: egui::Color32 = egui::Color32::from_rgb(45, 45, 45); // ウィンドウ/ヘッダ #2d2d2d
+const BORDER: egui::Color32 = egui::Color32::from_rgb(60, 60, 60); // 境界 #3c3c3c
+const INPUT_BG: egui::Color32 = egui::Color32::from_rgb(60, 60, 60); // 入力 #3c3c3c
+const ROW_ALT: egui::Color32 = egui::Color32::from_rgb(42, 42, 42); // 縞模様（控えめ）
+const ACTIVITY_BG: egui::Color32 = egui::Color32::from_rgb(51, 51, 51); // アクティビティバー #333333
+const STATUS_BG: egui::Color32 = egui::Color32::from_rgb(0, 122, 204); // ステータスバー #007acc
+const BUTTON_BG: egui::Color32 = egui::Color32::from_rgb(14, 99, 156); // ボタン #0e639c
 
 fn setup_style(ctx: &egui::Context) {
     use egui::FontFamily::{Monospace, Proportional};
@@ -6915,55 +6954,57 @@ fn setup_style(ctx: &egui::Context) {
     v.extreme_bg_color = INPUT_BG;
     v.code_bg_color = INPUT_BG;
     v.hyperlink_color = ACCENT;
-    v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(56, 189, 248, 48);
+    // 選択ハイライトは VS Code のリスト選択色 #264f78。
+    v.selection.bg_fill = egui::Color32::from_rgb(38, 79, 120);
     v.selection.stroke = Stroke::new(1.0, ACCENT);
 
-    // 角丸・影
-    v.window_corner_radius = CornerRadius::same(10);
-    v.menu_corner_radius = CornerRadius::same(8);
+    // 角丸は小さめ（VS Code はほぼ角ばっている）・影は控えめ。
+    v.window_corner_radius = CornerRadius::same(5);
+    v.menu_corner_radius = CornerRadius::same(3);
     v.window_shadow = egui::epaint::Shadow {
-        offset: [0, 6],
-        blur: 24,
+        offset: [0, 4],
+        blur: 16,
         spread: 0,
-        color: egui::Color32::from_black_alpha(110),
+        color: egui::Color32::from_black_alpha(120),
     };
     v.popup_shadow = egui::epaint::Shadow {
-        offset: [0, 3],
-        blur: 14,
+        offset: [0, 2],
+        blur: 10,
         spread: 0,
-        color: egui::Color32::from_black_alpha(90),
+        color: egui::Color32::from_black_alpha(100),
     };
 
-    // ウィジェット状態（フラットで控えめなボーダー、ホバーで浮く）
-    let round = CornerRadius::same(6);
+    // ウィジェット: 平らな #3c3c3c、ホバーで少し明るく、アクティブは VS Code 青。
+    let round = CornerRadius::same(3);
     let w = &mut v.widgets;
     w.noninteractive.corner_radius = round;
     w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
     w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
 
     w.inactive.corner_radius = round;
-    w.inactive.weak_bg_fill = egui::Color32::from_rgb(34, 38, 46);
-    w.inactive.bg_fill = egui::Color32::from_rgb(34, 38, 46);
+    w.inactive.weak_bg_fill = INPUT_BG;
+    w.inactive.bg_fill = INPUT_BG;
     w.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-    w.inactive.fg_stroke = Stroke::new(1.0, egui::Color32::from_rgb(205, 211, 222));
+    w.inactive.fg_stroke = Stroke::new(1.0, TEXT);
 
     w.hovered.corner_radius = round;
-    w.hovered.weak_bg_fill = HOVER;
-    w.hovered.bg_fill = HOVER;
-    w.hovered.bg_stroke = Stroke::new(1.0, ACCENT.gamma_multiply(0.7));
-    w.hovered.fg_stroke = Stroke::new(1.0, TEXT);
-    w.hovered.expansion = 1.0;
+    w.hovered.weak_bg_fill = egui::Color32::from_rgb(70, 70, 70);
+    w.hovered.bg_fill = egui::Color32::from_rgb(70, 70, 70);
+    w.hovered.bg_stroke = Stroke::new(1.0, egui::Color32::from_rgb(90, 90, 90));
+    w.hovered.fg_stroke = Stroke::new(1.0, egui::Color32::from_rgb(240, 240, 240));
+    w.hovered.expansion = 0.0;
 
     w.active.corner_radius = round;
-    w.active.weak_bg_fill = ACCENT.gamma_multiply(0.35);
-    w.active.bg_fill = ACCENT.gamma_multiply(0.35);
+    w.active.weak_bg_fill = BUTTON_BG;
+    w.active.bg_fill = BUTTON_BG;
     w.active.bg_stroke = Stroke::new(1.0, ACCENT);
     w.active.fg_stroke = Stroke::new(1.0, egui::Color32::WHITE);
-    w.active.expansion = 1.0;
+    w.active.expansion = 0.0;
 
     w.open.corner_radius = round;
-    w.open.weak_bg_fill = HOVER;
-    w.open.bg_stroke = Stroke::new(1.0, BORDER);
+    w.open.weak_bg_fill = egui::Color32::from_rgb(70, 70, 70);
+    w.open.bg_fill = INPUT_BG;
+    w.open.bg_stroke = Stroke::new(1.0, ACCENT);
 
     ctx.set_visuals(v);
 
