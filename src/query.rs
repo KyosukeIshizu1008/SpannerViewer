@@ -259,6 +259,99 @@ pub enum ImportProgress {
     Done(ImportOutcome),
 }
 
+// ── CSV ↔ DB 照合（突合）用モデル ──
+
+/// 照合に使う 1 カラム（テーブル列名・主キーか・対応する CSV 列）。
+#[derive(Clone, Debug)]
+pub struct VerifyColumn {
+    pub name: String,
+    /// 主キー構成カラムか（行の突合キーに使う）。
+    pub pk: bool,
+    /// この列に対応する CSV 側の列インデックス（0 始まり）。
+    pub src_index: usize,
+}
+
+/// CSV とテーブルを主キーで突合し、各カラム値まで比較する要求。
+#[derive(Clone, Debug)]
+pub struct VerifyRequest {
+    pub table: String,
+    /// 比較対象の列（主キー列を最低 1 つ含むこと）。
+    pub columns: Vec<VerifyColumn>,
+    pub source: ImportSource,
+    pub has_header: bool,
+    pub encoding: Encoding,
+    pub delimiter: u8,
+    /// 空欄を NULL とみなして比較するか（DB の NULL は "NULL" 表記）。
+    pub empty_as_null: bool,
+    /// この文字列を NULL とみなす（空欄とは別。例 "NULL" / "\\N"）。
+    pub null_token: Option<String>,
+    /// 中断フラグ。
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// 不一致サンプルの種別。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyKind {
+    /// 主キーは一致するが、いずれかのカラム値が異なる。
+    ValueMismatch,
+    /// CSV にあるが DB に無い主キー。
+    CsvOnly,
+    /// DB にあるが CSV に無い主キー。
+    DbOnly,
+}
+
+/// 不一致 1 件のサンプル（一覧表示用。件数は別途集計、サンプルは打ち切りあり）。
+#[derive(Clone, Debug)]
+pub struct VerifySample {
+    pub kind: VerifyKind,
+    /// 主キーの表示（複合キーは ", " 連結）。
+    pub key: String,
+    /// 詳細（値差異なら "列名: 'csv値' ≠ 'db値'"、片側のみなら空）。
+    pub detail: String,
+}
+
+/// 照合結果（UI へ返す）。
+#[derive(Clone, Debug, Default)]
+pub struct VerifyOutcome {
+    pub table: String,
+    /// 読み込んだ CSV データ行数（ヘッダ除く）。
+    pub csv_rows: usize,
+    /// 読み込んだ DB 行数。
+    pub db_rows: usize,
+    /// 主キー一致かつ全カラム値一致。
+    pub matched: usize,
+    /// 主キー一致だが値が異なる。
+    pub value_mismatch: usize,
+    /// CSV のみ（DB に無い）。
+    pub csv_only: usize,
+    /// DB のみ（CSV に無い）。
+    pub db_only: usize,
+    /// CSV 内で主キーが重複していた行数（2 回目以降）。
+    pub csv_dup: usize,
+    /// 不一致サンプル（種別ごとに一覧。総数は上のカウント）。
+    pub samples: Vec<VerifySample>,
+    /// サンプルを上限で打ち切ったか。
+    pub samples_truncated: bool,
+    /// DB 行を上限で打ち切ったか（巨大テーブル時）。
+    pub db_truncated: bool,
+    pub elapsed_ms: u128,
+    pub error: Option<String>,
+    /// 補足（モード制限など）。
+    pub note: Option<String>,
+}
+
+/// 照合中に背景 → UI へ流すイベント（進捗 / 完了）。
+#[derive(Clone, Debug)]
+pub enum VerifyProgress {
+    Progress {
+        /// 現在のフェーズ（"DB読込" / "CSV照合"）。
+        phase: &'static str,
+        db_rows: usize,
+        csv_rows: usize,
+    },
+    Done(VerifyOutcome),
+}
+
 /// GCS から CSV プレビューを取得した結果（UI へ返す）。
 #[derive(Clone, Debug, Default)]
 pub struct GcsFetchOutcome {
@@ -483,6 +576,334 @@ pub async fn import_loop(
                 ..Default::default()
             }));
         }
+    }
+}
+
+/// 照合で DB に読み込む最大行数（メモリ保護。超えたら note で通知）。
+const VERIFY_DB_CAP: usize = 5_000_000;
+/// 不一致サンプルの保持上限（UI 表示用。総数は別途集計）。
+const VERIFY_SAMPLE_CAP: usize = 500;
+/// 複合主キーの内部連結に使う区切り（データに現れない制御文字）。
+const KEY_SEP: char = '\u{1}';
+
+/// UI からの CSV↔DB 照合要求を順次処理する。req 側が閉じたら終了。
+pub async fn verify_loop(
+    cfg: Config,
+    mut req_rx: UnboundedReceiver<VerifyRequest>,
+    res_tx: std::sync::mpsc::Sender<VerifyProgress>,
+) {
+    init_spanner_env(SpannerEnv {
+        project: cfg.project.clone(),
+        instance: cfg.instance.clone(),
+        database: cfg.database.clone(),
+    });
+    let mock = cfg.mock;
+
+    while let Some(req) = req_rx.recv().await {
+        let res_tx_task = res_tx.clone();
+        let res_tx_err = res_tx.clone();
+        let table = req.table.clone();
+
+        let handle = tokio::spawn(async move {
+            let start = Instant::now();
+            let env = current_spanner_env();
+            let mut out = if !mock && !env.configured() {
+                VerifyOutcome {
+                    error: Some(NO_CONFIG.into()),
+                    ..Default::default()
+                }
+            } else {
+                run_verify(&env, &req, mock, &res_tx_task).await
+            };
+            out.table = req.table.clone();
+            out.elapsed_ms = start.elapsed().as_millis();
+            let _ = res_tx_task.send(VerifyProgress::Done(out));
+        });
+
+        if let Err(join_err) = handle.await {
+            let _ = res_tx_err.send(VerifyProgress::Done(VerifyOutcome {
+                table,
+                error: Some(panic_message(join_err)),
+                ..Default::default()
+            }));
+        }
+    }
+}
+
+/// CSV 1 セルを比較用に正規化する。空欄/NULL トークンは "NULL" に揃える
+/// （DB の NULL も "NULL" で文字列化されるため、これで突合できる）。
+fn canon_cell(raw: &str, empty_as_null: bool, null_token: Option<&str>) -> String {
+    if let Some(tok) = null_token {
+        if raw == tok {
+            return "NULL".to_string();
+        }
+    }
+    if empty_as_null && raw.is_empty() {
+        return "NULL".to_string();
+    }
+    raw.to_string()
+}
+
+/// テーブル全行を読み込む（行数上限 cap）。UI 保護の MAX_ROWS は適用しない。
+async fn read_all_rows(
+    client: &Client,
+    sql: &str,
+    cap: usize,
+) -> anyhow::Result<(Vec<Vec<String>>, bool)> {
+    let mut tx = client.single().await?;
+    let mut iter = tx.query(Statement::new(sql)).await?;
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = iter.next().await? {
+        if rows.len() >= cap {
+            truncated = true;
+            break;
+        }
+        let mut r = Vec::new();
+        let mut i = 0;
+        while let Some(cell) = stringify_cell(&row, i) {
+            r.push(cell);
+            i += 1;
+        }
+        rows.push(r);
+    }
+    Ok((rows, truncated))
+}
+
+/// CSV とテーブルを主キーで突合し、全カラム値まで比較する。
+async fn run_verify(
+    env: &SpannerEnv,
+    req: &VerifyRequest,
+    mock: bool,
+    progress: &std::sync::mpsc::Sender<VerifyProgress>,
+) -> VerifyOutcome {
+    // 比較する列（テーブル列名・PK・CSV列）。並び順 = SELECT・値比較の順。
+    if req.columns.is_empty() {
+        return VerifyOutcome {
+            error: Some("比較する列がありません".into()),
+            ..Default::default()
+        };
+    }
+    let pk_positions: Vec<usize> = req
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.pk)
+        .map(|(i, _)| i)
+        .collect();
+    if pk_positions.is_empty() {
+        return VerifyOutcome {
+            error: Some("主キー列が割り当てられていません（突合キーに必要です）".into()),
+            ..Default::default()
+        };
+    }
+
+    // ── DB 側を全件読み込み、主キー → 全カラム値 のマップを作る ──
+    // モックモードでは実テーブルが無いので空とみなす（CSV 件数のみ）。
+    let mut db_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut db_truncated = false;
+    if !mock {
+        let select_cols = req
+            .columns
+            .iter()
+            .map(|c| format!("`{}`", c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {select_cols} FROM `{}`", req.table);
+        let client = match build_client(env).await {
+            Ok(c) => c,
+            Err(e) => {
+                return VerifyOutcome {
+                    error: Some(format!("接続/認証に失敗: {e}")),
+                    ..Default::default()
+                }
+            }
+        };
+        let _ = progress.send(VerifyProgress::Progress {
+            phase: "DB読込",
+            db_rows: 0,
+            csv_rows: 0,
+        });
+        let (rows, truncated) = match read_all_rows(&client, &sql, VERIFY_DB_CAP).await {
+            Ok(v) => v,
+            Err(e) => {
+                return VerifyOutcome {
+                    error: Some(format!("DB 読み込みに失敗: {e}")),
+                    ..Default::default()
+                }
+            }
+        };
+        db_truncated = truncated;
+        db_map.reserve(rows.len());
+        for row in rows {
+            // SELECT の列順 = req.columns 順。PK 位置から突合キーを作る。
+            let key = pk_positions
+                .iter()
+                .map(|&p| row.get(p).cloned().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(&KEY_SEP.to_string());
+            db_map.insert(key, row);
+        }
+        let _ = progress.send(VerifyProgress::Progress {
+            phase: "DB読込",
+            db_rows: db_map.len(),
+            csv_rows: 0,
+        });
+    }
+
+    // ── CSV をストリーミングし、各行を DB マップと突合 ──
+    let (mut source, _bytes_total, _id) = match open_source(&req.source).await {
+        Ok(s) => s,
+        Err(e) => {
+            return VerifyOutcome {
+                error: Some(format!("CSV を開けません: {e}")),
+                ..Default::default()
+            }
+        }
+    };
+
+    let mut out = VerifyOutcome {
+        db_rows: db_map.len(),
+        db_truncated,
+        ..Default::default()
+    };
+    // CSV 側で突合できた DB キー（db_only 算出用）と、CSV 内重複検出用。
+    let mut matched_keys: HashSet<String> = HashSet::new();
+    let mut csv_seen: HashSet<String> = HashSet::new();
+
+    let mut streamer = CsvStreamer::new(req.encoding, req.delimiter);
+    let mut recs: Vec<Vec<String>> = Vec::new();
+    let mut first_chunk = true;
+    let mut row_no = 0usize; // 1 始まりの CSV 行番号（ヘッダ含む）
+
+    let process = |rec: &[String],
+                       out: &mut VerifyOutcome,
+                       matched_keys: &mut HashSet<String>,
+                       csv_seen: &mut HashSet<String>| {
+        out.csv_rows += 1;
+        // 比較用に各列を正規化。列不足は空欄（→ empty_as_null で NULL）扱い。
+        let cell = |src: usize| -> String {
+            let raw = rec.get(src).map(|s| s.as_str()).unwrap_or("");
+            canon_cell(raw, req.empty_as_null, req.null_token.as_deref())
+        };
+        let key_disp = pk_positions
+            .iter()
+            .map(|&p| cell(req.columns[p].src_index))
+            .collect::<Vec<_>>();
+        let key = key_disp.join(&KEY_SEP.to_string());
+        let key_show = key_disp.join(", ");
+        if !csv_seen.insert(key.clone()) {
+            out.csv_dup += 1;
+        }
+        match db_map.get(&key) {
+            None => {
+                out.csv_only += 1;
+                push_sample(out, VerifyKind::CsvOnly, key_show, String::new());
+            }
+            Some(db_row) => {
+                matched_keys.insert(key.clone());
+                // 全カラム値を比較し、最初に異なる列を詳細に出す。
+                let mut diff: Option<String> = None;
+                for (i, c) in req.columns.iter().enumerate() {
+                    let cv = cell(c.src_index);
+                    let dv = db_row.get(i).cloned().unwrap_or_default();
+                    if cv != dv {
+                        diff = Some(format!("{}: '{cv}'(csv) ≠ '{dv}'(db)", c.name));
+                        break;
+                    }
+                }
+                match diff {
+                    None => out.matched += 1,
+                    Some(detail) => {
+                        out.value_mismatch += 1;
+                        push_sample(out, VerifyKind::ValueMismatch, key_show, detail);
+                    }
+                }
+            }
+        }
+    };
+
+    loop {
+        if req.cancel.load(Ordering::Relaxed) {
+            out.note = Some("中断しました（部分的な結果）".into());
+            break;
+        }
+        let chunk = match source.next_chunk().await {
+            Ok(Some(mut b)) => {
+                if first_chunk {
+                    strip_bom(&mut b);
+                    first_chunk = false;
+                }
+                b
+            }
+            Ok(None) => break,
+            Err(e) => {
+                out.error = Some(format!("CSV 読み込み中にエラー: {e}"));
+                return out;
+            }
+        };
+        streamer.push(&chunk, &mut recs);
+        for rec in recs.drain(..) {
+            row_no += 1;
+            if req.has_header && row_no == 1 {
+                continue; // ヘッダ行は飛ばす
+            }
+            // 列数が極端に少ない行も突合は試みる（不足分は空欄補完）。
+            process(&rec, &mut out, &mut matched_keys, &mut csv_seen);
+        }
+        if out.csv_rows.is_multiple_of(50_000) {
+            let _ = progress.send(VerifyProgress::Progress {
+                phase: "CSV照合",
+                db_rows: out.db_rows,
+                csv_rows: out.csv_rows,
+            });
+        }
+    }
+    // 末尾の未確定レコードを処理。
+    streamer.finish(&mut recs);
+    for rec in recs.drain(..) {
+        row_no += 1;
+        if req.has_header && row_no == 1 {
+            continue;
+        }
+        process(&rec, &mut out, &mut matched_keys, &mut csv_seen);
+    }
+
+    // DB のみ（CSV で突合されなかった DB キー）。
+    out.db_only = db_map.len().saturating_sub(matched_keys.len());
+    for (key, _) in db_map.iter() {
+        if out.samples.len() >= VERIFY_SAMPLE_CAP {
+            out.samples_truncated = true;
+            break;
+        }
+        if !matched_keys.contains(key) {
+            let key_show = key.split(KEY_SEP).collect::<Vec<_>>().join(", ");
+            out.samples.push(VerifySample {
+                kind: VerifyKind::DbOnly,
+                key: key_show,
+                detail: String::new(),
+            });
+        }
+    }
+
+    if mock {
+        out.note = Some(
+            "モックモードでは実テーブルが無いため、全行を『CSVのみ』として扱います。".into(),
+        );
+    } else if db_truncated {
+        out.note = Some(format!(
+            "DB 行が上限 {VERIFY_DB_CAP} 件で打ち切られました。結果は部分的です。"
+        ));
+    }
+    out
+}
+
+/// 不一致サンプルを上限まで蓄える（超過分は truncated フラグのみ立てる）。
+fn push_sample(out: &mut VerifyOutcome, kind: VerifyKind, key: String, detail: String) {
+    if out.samples.len() < VERIFY_SAMPLE_CAP {
+        out.samples.push(VerifySample { kind, key, detail });
+    } else {
+        out.samples_truncated = true;
     }
 }
 
@@ -3182,6 +3603,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows[0][0], "alice2");
+    }
+
+    /// CSV↔DB 照合: 一致 / 値差異 / CSVのみ / DBのみ を正しく数える（emulator 前提）。
+    #[tokio::test]
+    async fn verify_counts_match_mismatch_csvonly_dbonly() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _guard = EMU_LOCK.lock().await;
+        create_import_table().await;
+
+        // DB へ 3 行投入: Id 1/2/3。
+        let seed = "Id,Name,Score,Active,Note\n\
+                    1,alice,1.5,true,\n\
+                    2,bob,2.0,false,hi\n\
+                    3,carol,3.0,true,x\n";
+        let seed_path = write_temp_csv("verify_seed", seed);
+        let import = ImportRequest {
+            table: "ImportTest".into(),
+            columns: cols(&[
+                ("Id", "INT64"),
+                ("Name", "STRING(MAX)"),
+                ("Score", "FLOAT64"),
+                ("Active", "BOOL"),
+                ("Note", "STRING(MAX)"),
+            ]),
+            source: ImportSource::File(seed_path),
+            has_header: true,
+            mode: ImportMode::InsertOrUpdate,
+            empty_as_null: true,
+            fresh: true,
+            encoding: Encoding::Utf8,
+            delimiter: b',',
+            skip_bad_rows: false,
+            dry_run: false,
+            null_token: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (ptx, _prx) = std::sync::mpsc::channel::<ImportProgress>();
+        let out = run_streaming_import(&test_env(), &import, false, &ptx).await;
+        assert_eq!(out.error, None, "seed import error: {:?}", out.error);
+
+        // 照合用 CSV: Id1=完全一致, Id2=Name差異, Id4=CSVのみ。Id3 は DB のみ。
+        let csv = "Id,Name,Score,Active,Note\n\
+                   1,alice,1.5,true,\n\
+                   2,bobX,2.0,false,hi\n\
+                   4,dave,9.0,true,new\n";
+        let csv_path = write_temp_csv("verify_target", csv);
+        let vreq = VerifyRequest {
+            table: "ImportTest".into(),
+            columns: vec![
+                VerifyColumn { name: "Id".into(), pk: true, src_index: 0 },
+                VerifyColumn { name: "Name".into(), pk: false, src_index: 1 },
+                VerifyColumn { name: "Score".into(), pk: false, src_index: 2 },
+                VerifyColumn { name: "Active".into(), pk: false, src_index: 3 },
+                VerifyColumn { name: "Note".into(), pk: false, src_index: 4 },
+            ],
+            source: ImportSource::File(csv_path),
+            has_header: true,
+            encoding: Encoding::Utf8,
+            delimiter: b',',
+            empty_as_null: true,
+            null_token: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (vtx, _vrx) = std::sync::mpsc::channel::<VerifyProgress>();
+        let r = run_verify(&test_env(), &vreq, false, &vtx).await;
+        assert_eq!(r.error, None, "verify error: {:?}", r.error);
+        assert_eq!(r.csv_rows, 3, "csv rows");
+        assert_eq!(r.db_rows, 3, "db rows");
+        assert_eq!(r.matched, 1, "matched (Id1)");
+        assert_eq!(r.value_mismatch, 1, "value mismatch (Id2 Name)");
+        assert_eq!(r.csv_only, 1, "csv only (Id4)");
+        assert_eq!(r.db_only, 1, "db only (Id3)");
+        // 値差異サンプルに Name の差分が含まれる。
+        assert!(
+            r.samples
+                .iter()
+                .any(|s| s.kind == VerifyKind::ValueMismatch && s.detail.contains("Name")),
+            "Name 差分サンプルがない: {:?}",
+            r.samples
+        );
     }
 
     /// ヘッダ無し CSV + 列の並べ替え（src_index）でも正しく書き込めるか（emulator 前提）。

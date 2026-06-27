@@ -37,6 +37,7 @@ enum View {
     Data,
     Schema,
     Import,
+    Verify,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -203,9 +204,18 @@ impl ImportDialog {
     }
 }
 
+/// GCS ダイアログの用途（取得成功後の引き継ぎ先）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GcsPurpose {
+    Import,
+    Verify,
+}
+
 /// GCS から CSV を取り込むための入力ダイアログ。
 /// URI を入力 → 背景で取得 → 成功したら ImportDialog（マッピング画面）へ引き継ぐ。
 struct GcsDialog {
+    /// 取得成功後の引き継ぎ先（インポート / 照合）。
+    purpose: GcsPurpose,
     /// インポート先テーブル（取得成功後に ImportDialog へ渡す）。
     target: TableNode,
     /// 入力中の `gs://bucket/path.csv`。
@@ -220,6 +230,76 @@ struct GcsDialog {
     objects: Vec<String>,
     /// 現在一覧している `gs://bucket/prefix`（ブラウズ位置の見出し）。
     listed_at: Option<String>,
+}
+
+/// CSV↔DB 照合タブのマッピング状態。テーブルと CSV を選ぶと作られる。
+/// 実データは溜めず、実行時に `source` からストリーミングして突合する。
+struct VerifyState {
+    /// 照合対象テーブル。
+    table: String,
+    /// テーブルのカラム（名前・型・PK）。比較列とキーの算出に使う。
+    table_columns: Vec<query::Column>,
+    /// 取得元（ファイル/GCS）。実行時にここからストリーミングする。
+    source: query::ImportSource,
+    /// 表示用のソース名。
+    source_name: String,
+    /// プレビュー用の生バイト（文字コード/区切り変更時に再パース）。
+    preview_bytes: Vec<u8>,
+    /// マッピング表示用のプレビュー行（先頭の数行のみ）。
+    records: Vec<Vec<String>>,
+    /// CSV 側の列見出し。
+    csv_headers: Vec<String>,
+    encoding: query::Encoding,
+    delimiter: u8,
+    has_header: bool,
+    /// 空欄を NULL とみなして比較するか。
+    empty_as_null: bool,
+    /// NULL とみなす文字列（空なら無効）。
+    null_token: String,
+    /// テーブル各カラムに割り当てる CSV 列インデックス（None=比較から除外）。
+    mapping: Vec<Option<usize>>,
+    note: Option<String>,
+    config_msg: Option<String>,
+}
+
+impl VerifyState {
+    /// has_header に応じて CSV 見出しと自動マッピングを作り直す（ImportDialog と同じ規則）。
+    fn recompute(&mut self) {
+        let ncols = self.records.iter().map(|r| r.len()).max().unwrap_or(0);
+        self.csv_headers = if self.has_header {
+            let head = self.records.first().cloned().unwrap_or_default();
+            (0..ncols)
+                .map(|i| {
+                    head.get(i)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| format!("列{}", i + 1))
+                })
+                .collect()
+        } else {
+            (0..ncols).map(|i| format!("列{}", i + 1)).collect()
+        };
+        let lower: Vec<String> = self
+            .csv_headers
+            .iter()
+            .map(|h| h.trim().to_lowercase())
+            .collect();
+        self.mapping = self
+            .table_columns
+            .iter()
+            .map(|c| {
+                let name = c.name.trim().to_lowercase();
+                lower.iter().position(|h| *h == name)
+            })
+            .collect();
+    }
+
+    /// 文字コード/区切りを変えたとき、プレビューを生バイトから再パースする。
+    fn reparse_preview(&mut self) {
+        self.records =
+            query::parse_preview(&self.preview_bytes, self.encoding, self.delimiter, PREVIEW_ROWS + 1);
+        self.recompute();
+    }
 }
 
 /// リソースブラウザの行操作（描画中に収集し、借用解消後に実行する）。
@@ -365,6 +445,8 @@ pub struct Channels {
     pub import_res_rx: Receiver<query::ImportProgress>,
     pub gcs_req_tx: UnboundedSender<query::GcsRequest>,
     pub gcs_res_rx: Receiver<query::GcsResponse>,
+    pub verify_req_tx: UnboundedSender<query::VerifyRequest>,
+    pub verify_res_rx: Receiver<query::VerifyProgress>,
     pub schema_rx: Receiver<SchemaGraph>,
     pub kube_metrics_rx: Receiver<k8s::KubeMetrics>,
     pub kube_topo_req_tx: UnboundedSender<Option<String>>,
@@ -415,6 +497,24 @@ pub struct MonitorApp {
     gcs_res_rx: Receiver<query::GcsResponse>,
     gcs_dialog: Option<GcsDialog>,
     gcs_pending: bool,
+
+    // CSV↔DB 照合（突合）
+    verify_req_tx: UnboundedSender<query::VerifyRequest>,
+    verify_res_rx: Receiver<query::VerifyProgress>,
+    /// マッピング状態（テーブル + CSV を選ぶと作られる）。
+    verify: Option<VerifyState>,
+    /// 照合タブで選択中のテーブル名。
+    verify_table_pick: String,
+    /// 実行中か（結果待ち）。
+    verify_running: bool,
+    /// 実行中の進捗（フェーズ・DB件数・CSV件数）。
+    verify_progress: Option<(&'static str, usize, usize)>,
+    /// 直近の照合結果。
+    verify_result: Option<query::VerifyOutcome>,
+    /// 結果一覧の種別フィルタ（None=すべて）。
+    verify_filter: Option<query::VerifyKind>,
+    /// 中断フラグ（実行中ジョブと共有）。
+    verify_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     sql: String,
     data_result: Option<QueryOutcome>,
     data_pending: bool,
@@ -616,6 +716,15 @@ impl MonitorApp {
             gcs_res_rx: ch.gcs_res_rx,
             gcs_dialog: None,
             gcs_pending: false,
+            verify_req_tx: ch.verify_req_tx,
+            verify_res_rx: ch.verify_res_rx,
+            verify: None,
+            verify_table_pick: String::new(),
+            verify_running: false,
+            verify_progress: None,
+            verify_result: None,
+            verify_filter: None,
+            verify_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sql: "SELECT * FROM LoadTest LIMIT 100".to_string(),
             data_result: None,
             data_pending: false,
@@ -1069,12 +1178,20 @@ impl MonitorApp {
                     // 取得成功 → GCS ダイアログを閉じてマッピング画面へ引き継ぐ。
                     Some(bytes) => {
                         if let Some(d) = self.gcs_dialog.take() {
-                            self.build_import_dialog(
-                                d.target,
-                                query::ImportSource::Gcs(out.uri.clone()),
-                                out.uri,
-                                bytes,
-                            );
+                            match d.purpose {
+                                GcsPurpose::Import => self.build_import_dialog(
+                                    d.target,
+                                    query::ImportSource::Gcs(out.uri.clone()),
+                                    out.uri,
+                                    bytes,
+                                ),
+                                GcsPurpose::Verify => self.build_verify_state(
+                                    d.target,
+                                    query::ImportSource::Gcs(out.uri.clone()),
+                                    out.uri,
+                                    bytes,
+                                ),
+                            }
                         }
                     }
                     None => {
@@ -1131,6 +1248,33 @@ impl MonitorApp {
                             }
                         }
                     }
+                }
+            }
+        }
+        while let Ok(ev) = self.verify_res_rx.try_recv() {
+            match ev {
+                query::VerifyProgress::Progress {
+                    phase,
+                    db_rows,
+                    csv_rows,
+                } => {
+                    if self.verify_running {
+                        self.verify_progress = Some((phase, db_rows, csv_rows));
+                    }
+                }
+                query::VerifyProgress::Done(out) => {
+                    self.verify_running = false;
+                    self.verify_progress = None;
+                    self.verify_filter = None;
+                    self.copy_note = Some(if let Some(e) = &out.error {
+                        format!("照合エラー: {e}")
+                    } else {
+                        format!(
+                            "照合完了: 一致 {} / 値差異 {} / CSVのみ {} / DBのみ {}",
+                            out.matched, out.value_mismatch, out.csv_only, out.db_only
+                        )
+                    });
+                    self.verify_result = Some(out);
                 }
             }
         }
@@ -1558,6 +1702,10 @@ impl eframe::App for MonitorApp {
                         if tab(ui, self.view == View::Import, "インポート") {
                             self.view = View::Import;
                         }
+                        ui.add_space(gap);
+                        if tab(ui, self.view == View::Verify, "照合") {
+                            self.view = View::Verify;
+                        }
                         // 右寄せで project / instance / DB のカスケード選択。
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let emu = std::env::var("SPANNER_EMULATOR_HOST").is_ok();
@@ -1821,6 +1969,7 @@ impl eframe::App for MonitorApp {
                 View::Monitor => self.monitor_view(ui),
                 View::Data => self.data_view(ui),
                 View::Import => self.import_view(ui),
+                View::Verify => self.verify_view(ui),
             },
             Section::Kube => match self.kube_view {
                 KubeView::Monitor => self.kube_monitor_view(ui),
@@ -3173,6 +3322,7 @@ impl MonitorApp {
     /// 指定テーブル向けに GCS インポート（URI 入力）ダイアログを開く。
     fn open_gcs_dialog(&mut self, node: TableNode) {
         self.gcs_dialog = Some(GcsDialog {
+            purpose: GcsPurpose::Import,
             target: node,
             uri: "gs://".to_string(),
             status: None,
@@ -3181,6 +3331,144 @@ impl MonitorApp {
             objects: Vec::new(),
             listed_at: None,
         });
+    }
+
+    // ── CSV↔DB 照合 ──
+
+    /// ローカル CSV を選び、照合のマッピング状態を作る。
+    fn open_verify_local(&mut self, node: TableNode) {
+        let Some(path) = pick_csv_file() else {
+            return;
+        };
+        let file_name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+        let bytes = match read_file_prefix(&path, PREVIEW_BYTES) {
+            Ok(b) => b,
+            Err(e) => {
+                self.copy_note = Some(format!("CSV を読めません: {e}"));
+                return;
+            }
+        };
+        self.build_verify_state(node, query::ImportSource::File(path), file_name, bytes);
+    }
+
+    /// 照合用に GCS URI 入力ダイアログを開く（取得成功で照合状態へ）。
+    fn open_verify_gcs(&mut self, node: TableNode) {
+        self.gcs_dialog = Some(GcsDialog {
+            purpose: GcsPurpose::Verify,
+            target: node,
+            uri: "gs://".to_string(),
+            status: None,
+            bucket: String::new(),
+            folders: Vec::new(),
+            objects: Vec::new(),
+            listed_at: None,
+        });
+    }
+
+    /// プレビュー（生バイト）から照合状態を組み立てる。
+    fn build_verify_state(
+        &mut self,
+        node: TableNode,
+        source: query::ImportSource,
+        display_name: String,
+        preview_bytes: Vec<u8>,
+    ) {
+        let encoding = query::Encoding::Utf8;
+        let delimiter = b',';
+        let records = query::parse_preview(&preview_bytes, encoding, delimiter, PREVIEW_ROWS + 1);
+        if records.is_empty() {
+            self.copy_note = Some("CSV が空です".into());
+            return;
+        }
+        let mut st = VerifyState {
+            table: node.name,
+            table_columns: node.columns,
+            source,
+            source_name: display_name,
+            preview_bytes,
+            records,
+            csv_headers: Vec::new(),
+            encoding,
+            delimiter,
+            has_header: true,
+            empty_as_null: true,
+            null_token: String::new(),
+            mapping: Vec::new(),
+            note: Some("プレビューは先頭のみ。実行時に全行をストリーミングして突合します。".into()),
+            config_msg: None,
+        };
+        st.recompute();
+        self.verify = Some(st);
+        self.verify_result = None;
+        self.verify_progress = None;
+        self.section = Section::Spanner;
+        self.view = View::Verify;
+    }
+
+    /// 照合状態から VerifyRequest を組み立てる（検証込み）。
+    fn verify_request(&self) -> Result<query::VerifyRequest, String> {
+        let Some(d) = &self.verify else {
+            return Err("照合の設定がありません".into());
+        };
+        let columns: Vec<query::VerifyColumn> = d
+            .table_columns
+            .iter()
+            .zip(d.mapping.iter())
+            .filter_map(|(col, m)| {
+                m.map(|src| query::VerifyColumn {
+                    name: col.name.clone(),
+                    pk: col.pk,
+                    src_index: src,
+                })
+            })
+            .collect();
+        if columns.is_empty() {
+            return Err("比較する列がありません（マッピングしてください）".into());
+        }
+        let unmapped_pk = unmapped_pks(&d.table_columns, &d.mapping);
+        if !unmapped_pk.is_empty() {
+            return Err(format!(
+                "主キー列が未割当です: {}（突合キーに必要です）",
+                unmapped_pk.join(", ")
+            ));
+        }
+        let null_token = (!d.null_token.is_empty()).then(|| d.null_token.clone());
+        Ok(query::VerifyRequest {
+            table: d.table.clone(),
+            columns,
+            source: d.source.clone(),
+            has_header: d.has_header,
+            encoding: d.encoding,
+            delimiter: d.delimiter,
+            empty_as_null: d.empty_as_null,
+            null_token,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    /// 照合を背景へ投入して開始する。
+    fn start_verify(&mut self) {
+        match self.verify_request() {
+            Ok(req) => {
+                self.verify_cancel = req.cancel.clone();
+                if self.verify_req_tx.send(req).is_ok() {
+                    self.verify_running = true;
+                    self.verify_result = None;
+                    self.verify_filter = None;
+                    self.verify_progress = Some(("開始", 0, 0));
+                } else {
+                    self.copy_note = Some(WORKER_GONE.into());
+                }
+            }
+            Err(e) => {
+                if let Some(d) = &mut self.verify {
+                    d.config_msg = Some(e);
+                }
+            }
+        }
     }
 
     /// GCS ダイアログの URI を背景へ送って取得を開始する。
@@ -5425,6 +5713,276 @@ impl MonitorApp {
         });
     }
 
+    fn verify_view(&mut self, ui: &mut egui::Ui) {
+        let mut open_local: Option<TableNode> = None;
+        let mut open_gcs: Option<TableNode> = None;
+        let mut do_run = false;
+        let mut do_cancel = false;
+        let mut back = false;
+        let tables: Vec<TableNode> = self
+            .schema_graph
+            .as_ref()
+            .filter(|g| g.error.is_none())
+            .map(|g| g.nodes.clone())
+            .unwrap_or_default();
+        let running = self.verify_running;
+        let progress = self.verify_progress;
+
+        egui::CentralPanel::default_margins().show(ui, |ui| {
+            ui.add_space(10.0);
+            ui.heading("CSV ↔ DB 照合");
+            ui.label(
+                egui::RichText::new(
+                    "主キーで突合し、各カラムの値まで比較します（一致 / 値差異 / CSVのみ / DBのみ）。",
+                )
+                .color(MUTED),
+            );
+            ui.add_space(12.0);
+
+            if self.verify.is_none() {
+                // ── ランディング（テーブル + ソース選択） ──
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("① テーブル").strong());
+                    let sel_text = if self.verify_table_pick.is_empty() {
+                        "選択…".to_string()
+                    } else {
+                        self.verify_table_pick.clone()
+                    };
+                    egui::ComboBox::from_id_salt("verify_table_pick")
+                        .selected_text(sel_text)
+                        .width(280.0)
+                        .show_ui(ui, |ui| {
+                            if tables.is_empty() {
+                                ui.label("テーブルがありません（スキーマ未取得）");
+                            }
+                            for t in &tables {
+                                ui.selectable_value(
+                                    &mut self.verify_table_pick,
+                                    t.name.clone(),
+                                    &t.name,
+                                );
+                            }
+                        });
+                });
+                let sel = tables
+                    .iter()
+                    .find(|t| t.name == self.verify_table_pick)
+                    .cloned();
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("② 突合する CSV を選ぶ").strong());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let enabled = sel.is_some();
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("ローカル CSV を選択…"))
+                        .clicked()
+                    {
+                        open_local = sel.clone();
+                    }
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("GCS から選択…"))
+                        .clicked()
+                    {
+                        open_gcs = sel.clone();
+                    }
+                });
+                if sel.is_none() {
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(251, 191, 36),
+                        "先にテーブルを選択してください。",
+                    );
+                }
+            } else if let Some(d) = &mut self.verify {
+                // ── マッピング + オプション + 実行 ──
+                ui.horizontal(|ui| {
+                    if ui.button("← 別の CSV / テーブルを選ぶ").clicked() {
+                        back = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{}  ↔  {}", d.table, d.source_name)).strong(),
+                    );
+                });
+                ui.add_space(8.0);
+
+                // オプション行（変更時はプレビューを再パース）。
+                let mut reparse = false;
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut d.has_header, "先頭行はヘッダ").changed() {
+                        reparse = true;
+                    }
+                    ui.separator();
+                    ui.label("文字コード:");
+                    egui::ComboBox::from_id_salt("verify_enc")
+                        .selected_text(match d.encoding {
+                            query::Encoding::Utf8 => "UTF-8",
+                            query::Encoding::ShiftJis => "Shift-JIS",
+                        })
+                        .show_ui(ui, |ui| {
+                            reparse |= ui
+                                .selectable_value(&mut d.encoding, query::Encoding::Utf8, "UTF-8")
+                                .changed();
+                            reparse |= ui
+                                .selectable_value(
+                                    &mut d.encoding,
+                                    query::Encoding::ShiftJis,
+                                    "Shift-JIS",
+                                )
+                                .changed();
+                        });
+                    ui.label("区切り:");
+                    egui::ComboBox::from_id_salt("verify_delim")
+                        .selected_text(match d.delimiter {
+                            b'\t' => "Tab",
+                            b';' => ";",
+                            _ => ",",
+                        })
+                        .show_ui(ui, |ui| {
+                            reparse |=
+                                ui.selectable_value(&mut d.delimiter, b',', ",").changed();
+                            reparse |=
+                                ui.selectable_value(&mut d.delimiter, b'\t', "Tab").changed();
+                            reparse |=
+                                ui.selectable_value(&mut d.delimiter, b';', ";").changed();
+                        });
+                    ui.separator();
+                    ui.checkbox(&mut d.empty_as_null, "空欄=NULL")
+                        .on_hover_text("空欄を NULL とみなして比較します（DB の NULL と一致）。");
+                });
+                if reparse {
+                    d.reparse_preview();
+                }
+                ui.add_space(8.0);
+
+                // マッピング表。テーブル列と mapping を同時に触らないよう列情報は複製する。
+                ui.label(egui::RichText::new("列のマッピング（🔑 = 突合キー）").strong());
+                ui.add_space(4.0);
+                let headers = d.csv_headers.clone();
+                let cols: Vec<(String, String, bool)> = d
+                    .table_columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.ty.clone(), c.pk))
+                    .collect();
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .auto_shrink([false, false])
+                    .id_salt("verify_map_scroll")
+                    .show(ui, |ui| {
+                        egui::Grid::new("verify_map")
+                            .striped(true)
+                            .num_columns(3)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("テーブル列").color(MUTED));
+                                ui.label(egui::RichText::new("型").color(MUTED));
+                                ui.label(egui::RichText::new("CSV 列").color(MUTED));
+                                ui.end_row();
+                                for (i, (name, ty, pk)) in cols.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        if *pk {
+                                            ui.label(egui::RichText::new("🔑").color(PK_COLOR));
+                                        }
+                                        ui.label(name);
+                                    });
+                                    ui.label(egui::RichText::new(ty).color(MUTED).small());
+                                    let cur = d.mapping.get(i).copied().flatten();
+                                    let sel_text = match cur {
+                                        Some(idx) => headers
+                                            .get(idx)
+                                            .cloned()
+                                            .unwrap_or_else(|| format!("列{}", idx + 1)),
+                                        None => "（比較しない）".to_string(),
+                                    };
+                                    egui::ComboBox::from_id_salt(("verify_map_combo", i))
+                                        .selected_text(sel_text)
+                                        .width(240.0)
+                                        .show_ui(ui, |ui| {
+                                            let mut v = d.mapping.get(i).copied().flatten();
+                                            if ui
+                                                .selectable_label(v.is_none(), "（比較しない）")
+                                                .clicked()
+                                            {
+                                                v = None;
+                                            }
+                                            for (h, hn) in headers.iter().enumerate() {
+                                                if ui
+                                                    .selectable_label(
+                                                        v == Some(h),
+                                                        format!("{} (列{})", hn, h + 1),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    v = Some(h);
+                                                }
+                                            }
+                                            if let Some(slot) = d.mapping.get_mut(i) {
+                                                *slot = v;
+                                            }
+                                        });
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                ui.add_space(10.0);
+
+                // 実行 / 中断 + 進捗。
+                ui.horizontal(|ui| {
+                    if running {
+                        ui.spinner();
+                        let (phase, db, csv) = progress.unwrap_or(("実行中", 0, 0));
+                        ui.label(format!(
+                            "{phase}…  DB {} 行 / CSV {} 行",
+                            fmt_count(db),
+                            fmt_count(csv)
+                        ));
+                        if ui.button("⏹ 中断").clicked() {
+                            do_cancel = true;
+                        }
+                    } else if ui
+                        .add(egui::Button::new(egui::RichText::new("照合を実行").strong()))
+                        .clicked()
+                    {
+                        do_run = true;
+                    }
+                });
+                if let Some(m) = &d.config_msg {
+                    ui.add_space(4.0);
+                    ui.colored_label(egui::Color32::from_rgb(248, 113, 113), m);
+                }
+                if let Some(n) = &d.note {
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(n).color(MUTED).small());
+                }
+            }
+
+            // ── 結果 ──
+            if let Some(res) = &self.verify_result {
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(6.0);
+                verify_result_ui(ui, res, &mut self.verify_filter);
+            }
+        });
+
+        if let Some(n) = open_local {
+            self.open_verify_local(n);
+        }
+        if let Some(n) = open_gcs {
+            self.open_verify_gcs(n);
+        }
+        if back {
+            self.verify = None;
+            self.verify_result = None;
+        }
+        if do_run {
+            self.start_verify();
+        }
+        if do_cancel {
+            self.verify_cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn schema_view(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("schema_bar").show(ui, |ui| {
             ui.add_space(6.0);
@@ -7214,6 +7772,167 @@ fn fmt_duration(secs: f64) -> String {
     }
 }
 
+/// 照合結果（サマリーカード + 不一致サンプル一覧）を描画する。
+fn verify_result_ui(
+    ui: &mut egui::Ui,
+    res: &query::VerifyOutcome,
+    filter: &mut Option<query::VerifyKind>,
+) {
+    use query::VerifyKind;
+    if let Some(e) = &res.error {
+        ui.colored_label(egui::Color32::from_rgb(248, 113, 113), format!("エラー: {e}"));
+        return;
+    }
+    ui.heading("照合結果");
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        verify_stat(ui, "一致", res.matched, egui::Color32::from_rgb(74, 222, 128));
+        verify_stat(
+            ui,
+            "値差異",
+            res.value_mismatch,
+            egui::Color32::from_rgb(251, 191, 36),
+        );
+        verify_stat(
+            ui,
+            "CSVのみ",
+            res.csv_only,
+            egui::Color32::from_rgb(96, 165, 250),
+        );
+        verify_stat(
+            ui,
+            "DBのみ",
+            res.db_only,
+            egui::Color32::from_rgb(248, 113, 113),
+        );
+    });
+    ui.add_space(6.0);
+    let perfect = res.value_mismatch == 0 && res.csv_only == 0 && res.db_only == 0;
+    if perfect {
+        ui.colored_label(
+            egui::Color32::from_rgb(74, 222, 128),
+            "✓ 完全一致（CSV と DB のレコードは同一です）",
+        );
+    } else {
+        ui.colored_label(
+            egui::Color32::from_rgb(251, 191, 36),
+            "✗ 差分があります（下の一覧で詳細を確認）",
+        );
+    }
+    let extra = format!(
+        "{}{}",
+        if res.csv_dup > 0 {
+            format!(" / CSV内PK重複 {}", fmt_count(res.csv_dup))
+        } else {
+            String::new()
+        },
+        if res.db_truncated { " / DB打切あり" } else { "" },
+    );
+    ui.label(
+        egui::RichText::new(format!(
+            "CSV {} 行 / DB {} 行{extra}",
+            fmt_count(res.csv_rows),
+            fmt_count(res.db_rows),
+        ))
+        .color(MUTED)
+        .small(),
+    );
+    if let Some(n) = &res.note {
+        ui.label(egui::RichText::new(n).color(MUTED).small());
+    }
+    if res.samples.is_empty() {
+        return;
+    }
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label("表示:");
+        if ui.selectable_label(filter.is_none(), "すべて").clicked() {
+            *filter = None;
+        }
+        if ui
+            .selectable_label(*filter == Some(VerifyKind::ValueMismatch), "値差異")
+            .clicked()
+        {
+            *filter = Some(VerifyKind::ValueMismatch);
+        }
+        if ui
+            .selectable_label(*filter == Some(VerifyKind::CsvOnly), "CSVのみ")
+            .clicked()
+        {
+            *filter = Some(VerifyKind::CsvOnly);
+        }
+        if ui
+            .selectable_label(*filter == Some(VerifyKind::DbOnly), "DBのみ")
+            .clicked()
+        {
+            *filter = Some(VerifyKind::DbOnly);
+        }
+    });
+    ui.add_space(4.0);
+    let active = *filter;
+    egui::ScrollArea::vertical()
+        .max_height(260.0)
+        .auto_shrink([false, false])
+        .id_salt("verify_samples")
+        .show(ui, |ui| {
+            egui::Grid::new("verify_sample_grid")
+                .striped(true)
+                .num_columns(3)
+                .spacing([12.0, 3.0])
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("種別").color(MUTED));
+                    ui.label(egui::RichText::new("主キー").color(MUTED));
+                    ui.label(egui::RichText::new("詳細").color(MUTED));
+                    ui.end_row();
+                    for s in res
+                        .samples
+                        .iter()
+                        .filter(|s| active.is_none_or(|f| f == s.kind))
+                    {
+                        let (lbl, c) = match s.kind {
+                            VerifyKind::ValueMismatch => {
+                                ("値差異", egui::Color32::from_rgb(251, 191, 36))
+                            }
+                            VerifyKind::CsvOnly => {
+                                ("CSVのみ", egui::Color32::from_rgb(96, 165, 250))
+                            }
+                            VerifyKind::DbOnly => {
+                                ("DBのみ", egui::Color32::from_rgb(248, 113, 113))
+                            }
+                        };
+                        ui.label(egui::RichText::new(lbl).color(c));
+                        ui.label(egui::RichText::new(&s.key).monospace());
+                        ui.label(egui::RichText::new(&s.detail).monospace().small());
+                        ui.end_row();
+                    }
+                });
+        });
+    if res.samples_truncated {
+        ui.label(
+            egui::RichText::new(format!(
+                "（サンプルは最大 {} 件まで。総数は上のカウントを参照）",
+                fmt_count(res.samples.len())
+            ))
+            .color(MUTED)
+            .small(),
+        );
+    }
+}
+
+/// 照合サマリーの 1 カード（ラベル + 件数）。
+fn verify_stat(ui: &mut egui::Ui, label: &str, n: usize, color: egui::Color32) {
+    egui::Frame::NONE
+        .fill(ELEVATED)
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new(label).color(MUTED).small());
+                ui.label(egui::RichText::new(fmt_count(n)).color(color).size(18.0).strong());
+            });
+        });
+}
+
 /// 未割当の主キー列名を返す（空なら OK）。
 fn unmapped_pks(table_columns: &[query::Column], mapping: &[Option<usize>]) -> Vec<String> {
     table_columns
@@ -7994,6 +8713,8 @@ mod tests {
         let (_e, import_res_rx) = channel();
         let (gcs_req_tx, _f) = unbounded_channel();
         let (_g, gcs_res_rx) = channel();
+        let (verify_req_tx, _vf) = unbounded_channel();
+        let (_vg, verify_res_rx) = channel();
         let (_h, schema_rx) = channel();
         let (_i, kube_metrics_rx) = channel();
         let (kube_topo_req_tx, _j) = unbounded_channel();
@@ -8031,6 +8752,8 @@ mod tests {
             Box::new(_s),
             Box::new(_t),
             Box::new(_u),
+            Box::new(_vf),
+            Box::new(_vg),
         ] {
             Box::leak(far);
         }
@@ -8042,6 +8765,8 @@ mod tests {
             import_res_rx,
             gcs_req_tx,
             gcs_res_rx,
+            verify_req_tx,
+            verify_res_rx,
             schema_rx,
             kube_metrics_rx,
             kube_topo_req_tx,
@@ -8099,6 +8824,76 @@ mod tests {
                 Err(e) => eprintln!("[render] {name} 失敗（wgpu アダプタ無し?）: {e}"),
             }
         }
+
+        // 照合タブ: マッピング画面 + サンプル結果を注入して描画する。
+        {
+            let app = harness.state_mut();
+            app.section = Section::Spanner;
+            app.view = View::Verify;
+            app.settings_open = false;
+            app.verify = Some(VerifyState {
+                table: "Users".into(),
+                table_columns: vec![
+                    query::Column { name: "Id".into(), ty: "INT64".into(), pk: true },
+                    query::Column { name: "Name".into(), ty: "STRING(MAX)".into(), pk: false },
+                    query::Column { name: "Email".into(), ty: "STRING(MAX)".into(), pk: false },
+                ],
+                source: query::ImportSource::File("users.csv".into()),
+                source_name: "users.csv".into(),
+                preview_bytes: b"Id,Name,Email\n1,a,a@x\n".to_vec(),
+                records: vec![
+                    vec!["Id".into(), "Name".into(), "Email".into()],
+                    vec!["1".into(), "a".into(), "a@x".into()],
+                ],
+                csv_headers: vec!["Id".into(), "Name".into(), "Email".into()],
+                encoding: query::Encoding::Utf8,
+                delimiter: b',',
+                has_header: true,
+                empty_as_null: true,
+                null_token: String::new(),
+                mapping: vec![Some(0), Some(1), Some(2)],
+                note: None,
+                config_msg: None,
+            });
+            app.verify_result = Some(query::VerifyOutcome {
+                table: "Users".into(),
+                csv_rows: 10_000,
+                db_rows: 9_998,
+                matched: 9_980,
+                value_mismatch: 3,
+                csv_only: 12,
+                db_only: 5,
+                csv_dup: 0,
+                samples: vec![
+                    query::VerifySample {
+                        kind: query::VerifyKind::ValueMismatch,
+                        key: "43".into(),
+                        detail: "Name: 'Tanaka'(csv) ≠ 'Tanaca'(db)".into(),
+                    },
+                    query::VerifySample {
+                        kind: query::VerifyKind::CsvOnly,
+                        key: "99".into(),
+                        detail: String::new(),
+                    },
+                    query::VerifySample {
+                        kind: query::VerifyKind::DbOnly,
+                        key: "12".into(),
+                        detail: String::new(),
+                    },
+                ],
+                samples_truncated: false,
+                db_truncated: false,
+                elapsed_ms: 1234,
+                error: None,
+                note: None,
+            });
+        }
+        harness.run();
+        match harness.render() {
+            Ok(img) => img.save(dir.join("07_verify.png")).unwrap(),
+            Err(e) => eprintln!("[render] 07_verify 失敗: {e}"),
+        }
+
         eprintln!("[render] PNG 出力先: {}", dir.display());
     }
 

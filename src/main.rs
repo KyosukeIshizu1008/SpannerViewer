@@ -68,6 +68,9 @@ fn main() -> eframe::Result<()> {
     // GCS インポート: 要求（取得 / 一覧）UI → 背景、結果 背景 → UI
     let (gcs_req_tx, gcs_req_rx) = tokio::sync::mpsc::unbounded_channel::<query::GcsRequest>();
     let (gcs_res_tx, gcs_res_rx) = mpsc::channel::<query::GcsResponse>();
+    // CSV↔DB 照合: 要求 UI → 背景、進捗/結果 背景 → UI
+    let (verify_req_tx, verify_req_rx) = tokio::sync::mpsc::unbounded_channel::<query::VerifyRequest>();
+    let (verify_res_tx, verify_res_rx) = mpsc::channel::<query::VerifyProgress>();
     // スキーマ図: 背景 → UI
     let (schema_tx, schema_rx) = mpsc::channel::<query::SchemaGraph>();
     // k8s 監視: 背景 → UI
@@ -116,7 +119,8 @@ fn main() -> eframe::Result<()> {
                 )),
                 tokio::spawn(query::query_loop(q_cfg.clone(), req_rx, res_tx, schema_tx)),
                 tokio::spawn(query::import_loop(q_cfg.clone(), import_req_rx, import_res_tx)),
-                tokio::spawn(query::gcs_loop(q_cfg, gcs_req_rx, gcs_res_tx)),
+                tokio::spawn(query::gcs_loop(q_cfg.clone(), gcs_req_rx, gcs_res_tx)),
+                tokio::spawn(query::verify_loop(q_cfg, verify_req_rx, verify_res_tx)),
                 tokio::spawn(k8s::monitor_loop(
                     k8s::Config { mock },
                     bg_interval,
@@ -177,6 +181,8 @@ fn main() -> eframe::Result<()> {
                     import_res_rx,
                     gcs_req_tx,
                     gcs_res_rx,
+                    verify_req_tx,
+                    verify_res_rx,
                     schema_rx,
                     kube_metrics_rx,
                     kube_topo_req_tx,
