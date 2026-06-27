@@ -6080,9 +6080,9 @@ fn usage_bar(ui: &mut egui::Ui, label: &str, pct: f64, color: egui::Color32) {
 fn draw_gear_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
     let stroke = egui::Stroke::new(1.6, color);
     let c = r.center();
-    let outer = r.width() * 0.42;
-    let inner = r.width() * 0.18;
-    p.circle_stroke(c, outer * 0.62, stroke);
+    let outer = r.width() * 0.40;
+    let inner = r.width() * 0.16;
+    p.circle_stroke(c, outer * 0.6, stroke);
     p.circle_filled(c, inner, color);
     // 歯（8 本の短い棒）
     for i in 0..8 {
@@ -6098,7 +6098,7 @@ fn draw_gear_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
 fn draw_k8s_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
     let stroke = egui::Stroke::new(1.6, color);
     let c = r.center();
-    let rad = r.width() * 0.44;
+    let rad = r.width() * 0.40;
     let pts: Vec<egui::Pos2> = (0..7)
         .map(|i| {
             let a = -std::f32::consts::FRAC_PI_2 + i as f32 / 7.0 * std::f32::consts::TAU;
@@ -6114,12 +6114,14 @@ fn draw_k8s_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
 
 /// アプリのマーク: データベース（シリンダー）。
 fn draw_db_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
-    let stroke = egui::Stroke::new(1.7, color);
+    let stroke = egui::Stroke::new(1.6, color);
     let cx = r.center().x;
-    let rx = r.width() * 0.40;
-    let ry = r.height() * 0.14;
-    let top = r.top() + ry + 1.0;
-    let bot = r.bottom() - ry - 1.0;
+    let cy = r.center().y;
+    let half = r.height() * 0.40; // 全アイコン共通の半径目安（箱の約80%）
+    let rx = r.width() * 0.34;
+    let ry = r.height() * 0.11;
+    let top = cy - half + ry;
+    let bot = cy + half - ry;
     p.line_segment([egui::pos2(cx - rx, top), egui::pos2(cx - rx, bot)], stroke);
     p.line_segment([egui::pos2(cx + rx, top), egui::pos2(cx + rx, bot)], stroke);
     p.add(egui::Shape::closed_line(
@@ -6139,9 +6141,8 @@ fn draw_db_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
 /// アプリのマーク: CSV（表＋グリッド線）。
 fn draw_csv_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
     let stroke = egui::Stroke::new(1.6, color);
-    let w = r.width() * 0.66;
-    let h = r.height() * 0.6;
-    let rect = egui::Rect::from_center_size(r.center(), egui::vec2(w, h));
+    let s = r.width() * 0.74; // 他アイコンと同等の見た目サイズに
+    let rect = egui::Rect::from_center_size(r.center(), egui::vec2(s, s * 0.92));
     p.rect_stroke(rect, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
     // 横線2本・縦線2本でセル感を出す。
     for f in [1.0 / 3.0, 2.0 / 3.0] {
