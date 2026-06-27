@@ -13,9 +13,11 @@ use crate::query::{self, EdgeKind, QueryOutcome, SchemaGraph, TableNode, Target}
 
 // ── カラーパレット（モダンダーク） ──
 // VS Code Dark+ 配色
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0, 122, 204); // VS Code blue #007acc
-const CPU_COLOR: egui::Color32 = egui::Color32::from_rgb(206, 145, 120); // 文字列っぽい橙
-const STORAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(78, 201, 176); // teal
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0, 122, 204); // VS Code blue #007acc（クローム用）
+// 図/グラフの配色（見やすい明るめの色に戻す）
+const DIAGRAM_ACCENT: egui::Color32 = egui::Color32::from_rgb(56, 189, 248); // 明るい青（図のヘッダ/辺）
+const CPU_COLOR: egui::Color32 = egui::Color32::from_rgb(251, 146, 60); // amber/orange
+const STORAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(56, 189, 248); // sky
 const TEXT: egui::Color32 = egui::Color32::from_rgb(204, 204, 204); // #cccccc
 const MUTED: egui::Color32 = egui::Color32::from_rgb(133, 133, 133); // #858585
 
@@ -5484,7 +5486,7 @@ impl MonitorApp {
                     }
                 }
                 ui.separator();
-                legend(ui, ACCENT, "インターリーブ");
+                legend(ui, DIAGRAM_ACCENT, "インターリーブ");
                 legend(ui, CPU_COLOR, "外部キー");
                 legend(ui, PK_COLOR, "PK");
                 ui.separator();
@@ -5679,7 +5681,7 @@ impl MonitorApp {
             }
 
             let base_color = match e.kind {
-                EdgeKind::Interleave => ACCENT,
+                EdgeKind::Interleave => DIAGRAM_ACCENT,
                 EdgeKind::ForeignKey => CPU_COLOR,
             };
             let active = sel.as_deref().is_none_or(|s| e.from == s || e.to == s);
@@ -5728,7 +5730,7 @@ impl MonitorApp {
             let rounding = egui::CornerRadius::ZERO;
             painter.rect_filled(screen, rounding, dim(ELEVATED));
             let border = if is_sel {
-                egui::Stroke::new(2.0, ACCENT)
+                egui::Stroke::new(2.0, DIAGRAM_ACCENT)
             } else {
                 egui::Stroke::new(1.0, dim(BORDER))
             };
@@ -5739,7 +5741,7 @@ impl MonitorApp {
                 screen.min,
                 egui::pos2(screen.max.x, screen.min.y + HEADER_H * z),
             );
-            painter.rect_filled(header, rounding, dim(ACCENT.gamma_multiply(0.85)));
+            painter.rect_filled(header, rounding, dim(DIAGRAM_ACCENT.gamma_multiply(0.85)));
             pc.text(
                 header.left_center() + egui::vec2(8.0 * z, 0.0),
                 egui::Align2::LEFT_CENTER,
@@ -5863,7 +5865,7 @@ impl MonitorApp {
                         rid,
                         idx,
                         egui::FontId::monospace(fs(11.0)),
-                        dim(ACCENT),
+                        dim(DIAGRAM_ACCENT),
                         z,
                     ) {
                         ui.ctx().copy_text(idx.clone());
@@ -6506,7 +6508,7 @@ fn draw_topology(
             egui::Align2::CENTER_TOP,
             *h,
             egui::FontId::proportional((11.0 * z).clamp(7.0, 18.0)),
-            ACCENT,
+            DIAGRAM_ACCENT,
         );
     }
 
@@ -6520,7 +6522,7 @@ fn draw_topology(
         let midx = (p_from.x + p_to.x) * 0.5;
         let hi = selected.as_deref() == Some(from.as_str())
             || selected.as_deref() == Some(to.as_str());
-        let col = if hi { ACCENT } else { egui::Color32::from_gray(110) };
+        let col = if hi { DIAGRAM_ACCENT } else { egui::Color32::from_gray(110) };
         let stroke = egui::Stroke::new((1.5 * z).max(1.0), col);
         painter.add(egui::Shape::line(
             vec![
@@ -6546,7 +6548,7 @@ fn draw_topology(
     // ノード。
     let kind_color = |k: k8s::ArchKind| match k {
         k8s::ArchKind::Ingress => egui::Color32::from_rgb(167, 139, 250),
-        k8s::ArchKind::Service => ACCENT,
+        k8s::ArchKind::Service => DIAGRAM_ACCENT,
         k8s::ArchKind::Workload => egui::Color32::from_rgb(52, 211, 153),
         k8s::ArchKind::Pod => egui::Color32::from_rgb(125, 211, 252),
     };
@@ -7009,19 +7011,20 @@ fn setup_style(ctx: &egui::Context) {
     ctx.set_visuals(v);
 
     ctx.all_styles_mut(|s| {
-        // フォントを少し小さく＋余白も合わせて詰める。
-        s.spacing.item_spacing = egui::vec2(7.0, 6.0);
-        s.spacing.button_padding = egui::vec2(10.0, 6.0);
-        s.spacing.interact_size.y = 25.0;
-        s.spacing.window_margin = egui::Margin::same(11);
-        s.spacing.menu_margin = egui::Margin::same(8);
+        // VS Code に合わせる: UI は 13px、コンパクトな余白。
+        s.spacing.item_spacing = egui::vec2(6.0, 4.0);
+        s.spacing.button_padding = egui::vec2(8.0, 3.0);
+        s.spacing.interact_size.y = 22.0;
+        s.spacing.window_margin = egui::Margin::same(10);
+        s.spacing.menu_margin = egui::Margin::same(6);
         s.spacing.scroll.bar_width = 10.0;
         s.spacing.scroll.floating = false;
         s.text_styles = [
-            (TextStyle::Heading, FontId::new(18.0, Proportional)),
+            // VS Code は大きな見出しを使わない。見出しも 13px（強調は bold）。
+            (TextStyle::Heading, FontId::new(13.0, Proportional)),
             (TextStyle::Body, FontId::new(13.0, Proportional)),
             (TextStyle::Button, FontId::new(13.0, Proportional)),
-            (TextStyle::Monospace, FontId::new(12.5, Monospace)),
+            (TextStyle::Monospace, FontId::new(12.0, Monospace)),
             (TextStyle::Small, FontId::new(11.0, Proportional)),
         ]
         .into_iter()
@@ -7035,18 +7038,25 @@ fn install_japanese_font(ctx: &egui::Context) {
     use std::sync::Arc;
     let mut fonts = egui::FontDefinitions::default();
 
-    // 欧文・数字は macOS 標準の Helvetica を最優先にして、見慣れたネイティブな
-    // 字面にする（egui バンドル既定だと一般的でない見た目になる）。
-    let latin: [&str; 1] = ["/System/Library/Fonts/Helvetica.ttc"];
-    // 和文は macOS 標準のヒラギノ角ゴシックを使う（Arial Unicode より自然）。
+    // 欧文・数字は VS Code と同じく macOS のシステムフォント San Francisco を最優先。
+    // 無ければ Helvetica。
+    let latin: [&str; 2] = [
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ];
+    // 和文は macOS 標準のヒラギノ角ゴシック。
     let jp: [&str; 3] = [
         "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
         "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
     ];
+    // 等幅は VS Code の既定 Menlo（無ければ SF Mono）。
+    let mono: [&str; 2] = [
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/SFNSMono.ttf",
+    ];
 
-    // Proportional の先頭に [latin, jp] を差し込む（先頭ほど優先。欧文は Helvetica、
-    // 未収録の和文はヒラギノが埋める。それも無ければ egui 既定）。
+    // Proportional の先頭に [latin, jp] を差し込む（先頭優先）。
     let mut front: Vec<String> = Vec::new();
     if let Some(b) = latin.iter().find_map(|p| std::fs::read(p).ok()) {
         fonts
@@ -7063,6 +7073,14 @@ fn install_japanese_font(ctx: &egui::Context) {
     } else {
         false
     };
+    let have_mono = if let Some(b) = mono.iter().find_map(|p| std::fs::read(p).ok()) {
+        fonts
+            .font_data
+            .insert("mono".to_owned(), Arc::new(egui::FontData::from_owned(b)));
+        true
+    } else {
+        false
+    };
 
     let prop = fonts
         .families
@@ -7071,13 +7089,16 @@ fn install_japanese_font(ctx: &egui::Context) {
     for (i, name) in front.iter().enumerate() {
         prop.insert(i, name.clone());
     }
-    // 等幅は整列を崩さないよう既定の等幅フォントを主にしたまま、和文だけ補う。
+    // 等幅は Menlo を主にし、和文はヒラギノで補う。
+    let monof = fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default();
+    if have_mono {
+        monof.insert(0, "mono".to_owned());
+    }
     if have_jp {
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .push("jp".to_owned());
+        monof.push("jp".to_owned());
     }
     ctx.set_fonts(fonts);
 }
