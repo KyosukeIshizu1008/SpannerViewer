@@ -74,7 +74,7 @@ fn main() -> eframe::Result<()> {
     // k8s 構成図: 要求 UI → 背景（対象 namespace）、結果 背景 → UI
     let (kube_topo_req_tx, kube_topo_req_rx) =
         tokio::sync::mpsc::unbounded_channel::<Option<String>>();
-    let (kube_topo_tx, kube_topo_rx) = mpsc::channel::<k8s::KubeTopology>();
+    let (kube_topo_tx, kube_topo_rx) = mpsc::channel::<k8s::ArchGraph>();
     // k8s ログ追従: 要求 → ストリームイベント
     let (kube_log_req_tx, kube_log_req_rx) = tokio::sync::mpsc::unbounded_channel::<k8s::LogReq>();
     let (kube_log_tx, kube_log_rx) = mpsc::channel::<k8s::LogEvent>();

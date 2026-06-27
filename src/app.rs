@@ -16,8 +16,6 @@ const CPU_COLOR: egui::Color32 = egui::Color32::from_rgb(251, 146, 60); // amber
 const STORAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(56, 189, 248); // sky
 const TEXT: egui::Color32 = egui::Color32::from_rgb(226, 232, 240); // 明るいテキスト
 const MUTED: egui::Color32 = egui::Color32::from_rgb(148, 163, 184); // 補助テキスト
-/// 構成図の通信矢印（Service→Pod）。
-const COMM_COLOR: egui::Color32 = egui::Color32::from_rgb(52, 211, 153); // emerald
 
 /// 背景ワーカーへの送信失敗時に表示するメッセージ。
 const WORKER_GONE: &str = "バックグラウンド処理が停止しています。アプリを再起動してください。";
@@ -365,7 +363,7 @@ pub struct Channels {
     pub schema_rx: Receiver<SchemaGraph>,
     pub kube_metrics_rx: Receiver<k8s::KubeMetrics>,
     pub kube_topo_req_tx: UnboundedSender<Option<String>>,
-    pub kube_topo_rx: Receiver<k8s::KubeTopology>,
+    pub kube_topo_rx: Receiver<k8s::ArchGraph>,
     pub kube_log_req_tx: UnboundedSender<k8s::LogReq>,
     pub kube_log_rx: Receiver<k8s::LogEvent>,
     pub kube_ev_req_tx: UnboundedSender<Option<String>>,
@@ -434,8 +432,8 @@ pub struct MonitorApp {
     kube_metrics_rx: Receiver<k8s::KubeMetrics>,
     kube_metrics: Option<k8s::KubeMetrics>,
     kube_req_tx: UnboundedSender<Option<String>>,
-    kube_graph_rx: Receiver<k8s::KubeTopology>,
-    kube_graph: Option<k8s::KubeTopology>,
+    kube_graph_rx: Receiver<k8s::ArchGraph>,
+    kube_graph: Option<k8s::ArchGraph>,
     kube_pending: bool,
     kube_selected: Option<String>,
     kube_pan: egui::Vec2,
@@ -4453,7 +4451,7 @@ impl MonitorApp {
         egui::Panel::top("kube_topo_bar").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("クラスタ構成図").strong());
+                ui.label(egui::RichText::new("アーキテクチャ図").strong());
                 if ui
                     .add_enabled(!self.kube_pending, egui::Button::new("更新"))
                     .clicked()
@@ -4471,18 +4469,17 @@ impl MonitorApp {
                     if g.error.is_none() {
                         ui.label(
                             egui::RichText::new(format!(
-                                "{} Pod / {} Service",
-                                g.pods.len(),
-                                g.services.len()
+                                "{} ノード / {} 接続",
+                                g.nodes.len(),
+                                g.edges.len()
                             ))
                             .color(MUTED),
                         );
                     }
                 }
                 ui.separator();
-                legend(ui, COMM_COLOR, "通信 (Service→Pod)");
                 ui.label(
-                    egui::RichText::new("Pod クリックで関連通信を強調")
+                    egui::RichText::new("Ingress → Service → Workload → Pod の通信フロー")
                         .color(MUTED)
                         .small(),
                 );
@@ -5076,33 +5073,6 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 4.5, color);
 }
 
-/// コンテナの使用率テキスト。limit があれば「CPU 45% Mem 60%」、無ければ絶対値、
-/// どちらも無ければ空文字（metrics-server 無し等）。
-fn usage_text(c: &k8s::ContainerInfo) -> String {
-    let cpu = if c.cpu_limit_milli > 0.0 {
-        Some(format!(
-            "CPU {:.0}%",
-            c.cpu_milli / c.cpu_limit_milli * 100.0
-        ))
-    } else if c.cpu_milli > 0.0 {
-        Some(format!("{:.0}m", c.cpu_milli))
-    } else {
-        None
-    };
-    let mem = if c.mem_limit_mib > 0.0 {
-        Some(format!("Mem {:.0}%", c.mem_mib / c.mem_limit_mib * 100.0))
-    } else if c.mem_mib > 0.0 {
-        Some(format!("{:.0}Mi", c.mem_mib))
-    } else {
-        None
-    };
-    match (cpu, mem) {
-        (Some(a), Some(b)) => format!("{a}  {b}"),
-        (Some(a), None) => a,
-        (None, Some(b)) => b,
-        (None, None) => String::new(),
-    }
-}
 
 fn phase_color(phase: &str) -> egui::Color32 {
     match phase {
@@ -5456,31 +5426,34 @@ fn layout_nodes(graph: &SchemaGraph, widths: &HashMap<String, f32>) -> HashMap<S
 
 /// クラスタ構成図を入れ子ボックス（Cluster > Node > Pod > コンテナ）で描く。
 /// 矢印は Service → 背後 Pod（通信経路）。パン/ズーム対応。
+/// k8s 通信フロー型アーキテクチャ図を描く。
+/// 左→右に Ingress → Service → Workload → Pod の列で並べ、namespace ごとに枠で囲む。
+/// 矢印は通信/所有の流れ。ドラッグでパン、ホイールでズーム、ノードクリックで選択。
 fn draw_topology(
     ui: &mut egui::Ui,
-    topo: Option<&k8s::KubeTopology>,
+    graph: Option<&k8s::ArchGraph>,
     pan: &mut egui::Vec2,
     zoom: &mut f32,
     selected: &mut Option<String>,
 ) {
-    let Some(topo) = topo else {
+    let Some(graph) = graph else {
         centered_hint(ui, "読み込み中…");
         return;
     };
-    if let Some(e) = &topo.error {
+    if let Some(e) = &graph.error {
         ui.colored_label(
             egui::Color32::from_rgb(248, 113, 113),
             format!("エラー: {e}"),
         );
         return;
     }
-    if topo.pods.is_empty() {
-        centered_hint(ui, "Pod がありません");
+    if graph.nodes.is_empty() {
+        centered_hint(ui, "リソースがありません");
         return;
     }
 
     let rect = ui.available_rect_before_wrap();
-    let bg = ui.interact(rect, ui.id().with("topo_bg"), egui::Sense::click_and_drag());
+    let bg = ui.interact(rect, ui.id().with("arch_bg"), egui::Sense::click_and_drag());
     if bg.dragged() {
         *pan += bg.drag_delta();
     }
@@ -5494,288 +5467,178 @@ fn draw_topology(
             *zoom = (*zoom * f).clamp(0.3, 3.0);
         }
     }
+    let z = *zoom;
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, BASE);
 
     // ── レイアウト定数（ワールド座標） ──
-    let (cw, ch, cgap) = (210.0_f32, 24.0_f32, 6.0_f32); // コンテナ（名前+使用量を表示）
-    let (pod_pad, pod_head, pod_gap) = (8.0_f32, 22.0_f32, 12.0_f32);
-    let (node_pad, node_head, node_gap) = (12.0_f32, 26.0_f32, 18.0_f32);
-    let (cl_pad, cl_head) = (16.0_f32, 34.0_f32);
-    let (svc_w, svc_h, svc_gap) = (160.0_f32, 30.0_f32, 12.0_f32);
-    let budget = 1700.0_f32;
+    let nw = 188.0_f32;
+    let nh = 48.0_f32;
+    let col_gap = 64.0_f32;
+    let row_gap = 14.0_f32;
+    let ns_pad = 16.0_f32;
+    let ns_head = 30.0_f32;
+    let ns_gap = 34.0_f32;
+    let col_x = |c: usize| ns_pad + c as f32 * (nw + col_gap);
+    let inner_w = col_x(3) + nw + ns_pad;
 
-    // Pod を所属ノードでまとめる
-    let mut by_node: std::collections::BTreeMap<String, Vec<&k8s::PodInfo>> = Default::default();
-    for p in &topo.pods {
-        let key = if p.node.is_empty() {
-            "(未スケジュール)".to_string()
-        } else {
-            p.node.clone()
-        };
-        by_node.entry(key).or_default().push(p);
+    // namespace ごとにまとめる。
+    use std::collections::BTreeMap;
+    let mut by_ns: BTreeMap<String, Vec<&k8s::ArchNode>> = BTreeMap::new();
+    for n in &graph.nodes {
+        by_ns.entry(n.ns.clone()).or_default().push(n);
     }
 
-    let pod_size = |p: &k8s::PodInfo| -> egui::Vec2 {
-        let n = p.containers.len();
-        let inner = if n == 0 {
-            0.0
-        } else {
-            n as f32 * ch + (n as f32 - 1.0) * cgap
-        };
-        egui::vec2(cw + pod_pad * 2.0, pod_head + pod_pad + inner + pod_pad)
-    };
-
-    // 各ノードのサイズ（Pod は横並び）
-    struct NodeLayout<'a> {
-        name: String,
-        pods: Vec<(&'a k8s::PodInfo, egui::Vec2)>,
-        size: egui::Vec2,
-    }
-    let mut nodes: Vec<NodeLayout> = Vec::new();
-    for (nname, pods) in &by_node {
-        let sizes: Vec<(&k8s::PodInfo, egui::Vec2)> =
-            pods.iter().map(|p| (*p, pod_size(p))).collect();
-        let tot: f32 = sizes.iter().map(|(_, s)| s.x).sum();
-        let k = sizes.len().max(1) as f32;
-        let w = node_pad * 2.0 + tot + pod_gap * (k - 1.0);
-        let maxh = sizes.iter().map(|(_, s)| s.y).fold(0.0, f32::max);
-        let h = node_head + node_pad * 2.0 + maxh;
-        nodes.push(NodeLayout {
-            name: nname.clone(),
-            pods: sizes,
-            size: egui::vec2(w, h),
-        });
-    }
-
-    // Service 行を上部に折り返し配置
-    let mut svc_rects: Vec<(usize, egui::Rect)> = Vec::new();
-    let (mut cx, mut cy, mut max_x) = (cl_pad, cl_head, cl_pad);
-    for i in 0..topo.services.len() {
-        if cx > cl_pad && cx + svc_w > cl_pad + budget {
-            cx = cl_pad;
-            cy += svc_h + svc_gap;
+    // 各ノードのワールド矩形と、namespace ブロック矩形を決める。
+    let mut rects: std::collections::HashMap<String, egui::Rect> = Default::default();
+    let mut blocks: Vec<(String, egui::Rect)> = Vec::new();
+    let mut cursor_y = ns_pad + 22.0; // 列見出しのぶん少し下げる
+    for (ns, nodes) in &by_ns {
+        let mut col_counts = [0usize; 4];
+        for n in nodes {
+            col_counts[n.kind.column()] += 1;
         }
-        svc_rects.push((
-            i,
-            egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(svc_w, svc_h)),
-        ));
-        cx += svc_w + svc_gap;
-        max_x = max_x.max(cx - svc_gap);
-    }
-    let nodes_top = if topo.services.is_empty() {
-        cl_head
-    } else {
-        cy + svc_h + node_gap
-    };
-
-    // ノードを折り返し配置し、各 Pod・コンテナの矩形を確定
-    let mut node_rects: Vec<(String, egui::Rect)> = Vec::new();
-    let mut pod_draw: Vec<(&k8s::PodInfo, egui::Rect)> = Vec::new();
-    let mut pod_rect_by_key: HashMap<(String, String), egui::Rect> = HashMap::new();
-    let (mut nx, mut ny, mut row_h) = (cl_pad, nodes_top, 0.0_f32);
-    for nl in &nodes {
-        let size = nl.size;
-        if nx > cl_pad && nx + size.x > cl_pad + budget {
-            nx = cl_pad;
-            ny += row_h + node_gap;
-            row_h = 0.0;
+        let max_rows = col_counts.iter().copied().max().unwrap_or(1).max(1);
+        let body_h = max_rows as f32 * nh + (max_rows as f32 - 1.0).max(0.0) * row_gap;
+        let block_h = ns_head + ns_pad + body_h + ns_pad;
+        let block_top = cursor_y;
+        let mut next_row = [0usize; 4];
+        for n in nodes {
+            let c = n.kind.column();
+            let x = col_x(c);
+            let y = block_top + ns_head + ns_pad + next_row[c] as f32 * (nh + row_gap);
+            next_row[c] += 1;
+            rects.insert(
+                n.id.clone(),
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(nw, nh)),
+            );
         }
-        let nrect = egui::Rect::from_min_size(egui::pos2(nx, ny), size);
-        node_rects.push((nl.name.clone(), nrect));
-        // Pod を横並び
-        let mut px = nx + node_pad;
-        let py = ny + node_head + node_pad;
-        for (p, ps) in &nl.pods {
-            let prect = egui::Rect::from_min_size(egui::pos2(px, py), *ps);
-            pod_draw.push((p, prect));
-            pod_rect_by_key.insert((p.ns.clone(), p.name.clone()), prect);
-            px += ps.x + pod_gap;
-        }
-        nx += size.x + node_gap;
-        row_h = row_h.max(size.y);
-        max_x = max_x.max(nx - node_gap);
-    }
-    let content_bottom = ny + row_h;
-    let cluster = egui::Rect::from_min_size(
-        egui::pos2(0.0, 0.0),
-        egui::vec2(max_x + cl_pad, content_bottom + cl_pad),
-    );
-
-    // ── ワールド→スクリーン変換 ──
-    let z = *zoom;
-    let zt = (z * 8.0).round() / 8.0; // フォントサイズだけ離散化（アトラス再生成抑制）
-    let origin = rect.min + *pan;
-    let tf = |p: egui::Pos2| origin + (p.to_vec2() * z);
-    let tr = |r: egui::Rect| egui::Rect::from_min_max(tf(r.min), tf(r.max));
-    let fs = |s: f32| (s * zt).max(6.0);
-    let round = |r: f32| egui::CornerRadius::same((r * z) as u8);
-
-    // 選択 Pod（"ns/name"）に関係する通信だけ強調するための集合
-    let sel = selected.clone();
-
-    // Cluster
-    let clr = tr(cluster);
-    painter.rect_filled(clr, round(10.0), egui::Color32::from_rgb(24, 33, 48));
-    painter.rect_stroke(clr, round(10.0), egui::Stroke::new(1.5, ACCENT), egui::StrokeKind::Middle);
-    painter.text(
-        clr.left_top() + egui::vec2(12.0 * z, (cl_head * 0.5) * z),
-        egui::Align2::LEFT_CENTER,
-        "Cluster",
-        egui::FontId::proportional(fs(15.0)),
-        TEXT,
-    );
-
-    // Nodes
-    for (nname, nrect) in &node_rects {
-        let r = tr(*nrect);
-        let pc = painter.with_clip_rect(r.intersect(rect));
-        painter.rect_filled(r, round(8.0), egui::Color32::from_rgb(28, 52, 70));
-        painter.rect_stroke(
-            r,
-            round(8.0),
-            egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.7)),
-            egui::StrokeKind::Middle,
-        );
-        pc.text(
-            r.left_top() + egui::vec2(10.0 * z, (node_head * 0.5) * z),
-            egui::Align2::LEFT_CENTER,
-            format!("Node · {nname}"),
-            egui::FontId::proportional(fs(13.0)),
-            TEXT,
-        );
-    }
-
-    // Pods + コンテナ（クリックで選択トグル）
-    for (p, prect) in &pod_draw {
-        let r = tr(*prect);
-        if !rect.intersects(r) {
-            continue;
-        }
-        let key = format!("{}/{}", p.ns, p.name);
-        let is_sel = sel.as_deref() == Some(key.as_str());
-        let pc = painter.with_clip_rect(r.intersect(rect));
-        painter.rect_filled(r, round(6.0), egui::Color32::from_rgb(34, 68, 90));
-        let border = if is_sel {
-            egui::Stroke::new(2.0, COMM_COLOR)
-        } else {
-            egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.5))
-        };
-        painter.rect_stroke(r, round(6.0), border, egui::StrokeKind::Middle);
-        // ヘッダ（Pod 名）＋クリック判定
-        let header = egui::Rect::from_min_max(r.min, egui::pos2(r.max.x, r.min.y + pod_head * z));
-        pc.text(
-            header.left_center() + egui::vec2(8.0 * z, 0.0),
-            egui::Align2::LEFT_CENTER,
-            &p.name,
-            egui::FontId::proportional(fs(12.0)),
-            phase_color(&p.phase),
-        );
-        // Pod 合計の使用率（limit 比。ヘッダ右）
-        let cpu_lim: f64 = p.containers.iter().map(|c| c.cpu_limit_milli).sum();
-        let mem_lim: f64 = p.containers.iter().map(|c| c.mem_limit_mib).sum();
-        let total = match (cpu_lim > 0.0, mem_lim > 0.0) {
-            (true, true) => format!(
-                "Σ CPU {:.0}% Mem {:.0}%",
-                p.cpu_milli / cpu_lim * 100.0,
-                p.mem_mib / mem_lim * 100.0
+        blocks.push((
+            ns.clone(),
+            egui::Rect::from_min_size(
+                egui::pos2(0.0, block_top),
+                egui::vec2(inner_w, block_h),
             ),
-            _ if p.cpu_milli > 0.0 || p.mem_mib > 0.0 => {
-                format!("Σ {:.0}m {:.0}Mi", p.cpu_milli, p.mem_mib)
-            }
-            _ => String::new(),
-        };
-        if !total.is_empty() {
-            pc.text(
-                header.right_center() - egui::vec2(8.0 * z, 0.0),
-                egui::Align2::RIGHT_CENTER,
-                total,
-                egui::FontId::monospace(fs(10.0)),
-                MUTED,
-            );
-        }
-        let pid = ui.id().with(("topo_pod", key.as_str()));
-        if ui.interact(header, pid, egui::Sense::click()).clicked() {
-            *selected = if is_sel { None } else { Some(key.clone()) };
-        }
-        // コンテナ
-        let mut y = r.min.y + (pod_head + pod_pad) * z;
-        for c in &p.containers {
-            let crect = egui::Rect::from_min_size(
-                egui::pos2(r.min.x + pod_pad * z, y),
-                egui::vec2(cw * z, ch * z),
-            );
-            pc.rect_filled(crect, round(4.0), egui::Color32::from_rgb(226, 232, 240));
-            pc.rect_stroke(crect, round(4.0), egui::Stroke::new(1.0, BORDER), egui::StrokeKind::Middle);
-            let label = if c.init {
-                format!("{} (init)", c.name)
-            } else {
-                c.name.clone()
-            };
-            pc.text(
-                crect.left_center() + egui::vec2(6.0 * z, 0.0),
-                egui::Align2::LEFT_CENTER,
-                label,
-                egui::FontId::monospace(fs(11.0)),
-                egui::Color32::from_rgb(12, 18, 30),
-            );
-            // CPU / メモリ使用率（limit 比、右寄せ）。limit 未設定や metrics 無しは絶対値/—
-            let usage = usage_text(c);
-            if !usage.is_empty() {
-                pc.text(
-                    crect.right_center() - egui::vec2(6.0 * z, 0.0),
-                    egui::Align2::RIGHT_CENTER,
-                    usage,
-                    egui::FontId::monospace(fs(10.0)),
-                    egui::Color32::from_rgb(71, 85, 105),
-                );
-            }
-            y += (ch + cgap) * z;
-        }
+        ));
+        cursor_y = block_top + block_h + ns_gap;
     }
 
-    // Services + 通信矢印
-    for (i, srect) in &svc_rects {
-        let svc = &topo.services[*i];
-        let r = tr(*srect);
-        // この Service が選択 Pod に関係するか
-        let related = sel
-            .as_deref()
-            .is_none_or(|s| svc.pods.iter().any(|pn| format!("{}/{}", svc.ns, pn) == s));
-        let svc_fill = if related {
-            egui::Color32::from_rgb(20, 60, 50)
-        } else {
-            egui::Color32::from_rgb(20, 60, 50).gamma_multiply(0.4)
-        };
-        painter.rect_filled(r, round(6.0), svc_fill);
-        painter.rect_stroke(r, round(6.0), egui::Stroke::new(1.0, COMM_COLOR), egui::StrokeKind::Middle);
-        painter.with_clip_rect(r.intersect(rect)).text(
-            r.center(),
-            egui::Align2::CENTER_CENTER,
-            format!("svc/{}", svc.name),
-            egui::FontId::proportional(fs(12.0)),
-            COMM_COLOR,
+    // ワールド → スクリーン変換。
+    let tf = |p: egui::Pos2| -> egui::Pos2 { rect.min + *pan + (p.to_vec2() * z) };
+    let tr = |r: egui::Rect| -> egui::Rect { egui::Rect::from_min_max(tf(r.min), tf(r.max)) };
+
+    // namespace ブロック枠。
+    for (ns, br) in &blocks {
+        painter.rect(
+            tr(*br),
+            egui::CornerRadius::same(6),
+            ELEVATED,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+            egui::StrokeKind::Inside,
         );
-        // 背後 Pod へ矢印
-        let from = egui::pos2(r.center().x, r.bottom());
-        for pn in &svc.pods {
-            let Some(prect) = pod_rect_by_key.get(&(svc.ns.clone(), pn.clone())) else {
-                continue;
-            };
-            let pr = tr(*prect);
-            let to = egui::pos2(pr.center().x, pr.top());
-            let active = sel.as_deref().is_none_or(|s| {
-                s == format!("{}/{}", svc.ns, pn)
-                    || svc.pods.iter().any(|x| format!("{}/{}", svc.ns, x) == s)
-            });
-            let color = if active {
-                COMM_COLOR
-            } else {
-                COMM_COLOR.gamma_multiply(0.18)
-            };
-            let bend_y = (from.y + to.y) * 0.5;
-            draw_arrow(&painter, from, to, bend_y, color, z);
+        painter.text(
+            tf(br.min + egui::vec2(10.0, 8.0)),
+            egui::Align2::LEFT_TOP,
+            format!("namespace: {ns}"),
+            egui::FontId::proportional((12.0 * z).clamp(8.0, 20.0)),
+            MUTED,
+        );
+    }
+
+    // 列見出し。
+    let headers = ["Ingress", "Service", "Workload", "Pod"];
+    for (c, h) in headers.iter().enumerate() {
+        let p = tf(egui::pos2(col_x(c) + nw * 0.5, 6.0));
+        painter.text(
+            p,
+            egui::Align2::CENTER_TOP,
+            *h,
+            egui::FontId::proportional((11.0 * z).clamp(7.0, 18.0)),
+            ACCENT,
+        );
+    }
+
+    // エッジ（左→右の elbow + 右向き矢じり）。
+    for (from, to) in &graph.edges {
+        let (Some(a), Some(b)) = (rects.get(from), rects.get(to)) else {
+            continue;
+        };
+        let p_from = tf(egui::pos2(a.max.x, a.center().y));
+        let p_to = tf(egui::pos2(b.min.x, b.center().y));
+        let midx = (p_from.x + p_to.x) * 0.5;
+        let hi = selected.as_deref() == Some(from.as_str())
+            || selected.as_deref() == Some(to.as_str());
+        let col = if hi { ACCENT } else { egui::Color32::from_gray(110) };
+        let stroke = egui::Stroke::new((1.5 * z).max(1.0), col);
+        painter.add(egui::Shape::line(
+            vec![
+                p_from,
+                egui::pos2(midx, p_from.y),
+                egui::pos2(midx, p_to.y),
+                p_to,
+            ],
+            stroke,
+        ));
+        let size = (8.0 * z).max(5.0);
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                p_to,
+                egui::pos2(p_to.x - size, p_to.y - size * 0.5),
+                egui::pos2(p_to.x - size, p_to.y + size * 0.5),
+            ],
+            col,
+            egui::Stroke::NONE,
+        ));
+    }
+
+    // ノード。
+    let kind_color = |k: k8s::ArchKind| match k {
+        k8s::ArchKind::Ingress => egui::Color32::from_rgb(167, 139, 250),
+        k8s::ArchKind::Service => ACCENT,
+        k8s::ArchKind::Workload => egui::Color32::from_rgb(52, 211, 153),
+        k8s::ArchKind::Pod => egui::Color32::from_rgb(125, 211, 252),
+    };
+    for n in &graph.nodes {
+        let Some(r) = rects.get(&n.id) else {
+            continue;
+        };
+        let s = tr(*r);
+        let sel = selected.as_deref() == Some(n.id.as_str());
+        let c = kind_color(n.kind);
+        let resp = ui.interact(s, ui.id().with(("arch", &n.id)), egui::Sense::click());
+        if resp.clicked() {
+            *selected = Some(n.id.clone());
         }
+        let bw = if sel || resp.hovered() { 2.0 } else { 1.0 };
+        painter.rect(
+            s,
+            egui::CornerRadius::same(6),
+            egui::Color32::from_gray(28),
+            egui::Stroke::new(bw, c),
+            egui::StrokeKind::Inside,
+        );
+        // 左の色帯。
+        let bar = egui::Rect::from_min_max(
+            s.min,
+            egui::pos2(s.min.x + (4.0 * z).max(2.0), s.max.y),
+        );
+        painter.rect_filled(bar, egui::CornerRadius::same(6), c);
+        let name_fs = (12.5 * z).clamp(7.0, 22.0);
+        let sub_fs = (10.0 * z).clamp(6.0, 18.0);
+        painter.text(
+            tf(r.min + egui::vec2(10.0, 8.0)),
+            egui::Align2::LEFT_TOP,
+            &n.name,
+            egui::FontId::proportional(name_fs),
+            egui::Color32::from_gray(230),
+        );
+        painter.text(
+            tf(r.min + egui::vec2(10.0, 28.0)),
+            egui::Align2::LEFT_TOP,
+            &n.sub,
+            egui::FontId::proportional(sub_fs),
+            MUTED,
+        );
     }
 }
 
@@ -6951,6 +6814,30 @@ mod tests {
         harness.step();
         match harness.render() {
             Ok(img) => img.save(dir.join("07_import_progress.png")).unwrap(),
+            Err(e) => eprintln!("[render] 失敗: {e}"),
+        }
+    }
+
+    /// k8s 通信フロー型アーキテクチャ図を描画して PNG 出力（視覚確認用）。
+    #[ignore = "wgpu アダプタが必要。視覚確認時のみ手動実行する"]
+    #[test]
+    fn render_arch_diagram_to_png() {
+        use egui_kittest::Harness;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dir = std::path::Path::new("target/ui_shots");
+        std::fs::create_dir_all(dir).unwrap();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 560.0))
+            .build_eframe(|cc| MonitorApp::new(make_test_channels(), cc));
+        {
+            let app = harness.state_mut();
+            app.section = Section::Kube;
+            app.kube_view = KubeView::Diagram;
+            app.kube_graph = Some(k8s::sample_arch_graph());
+        }
+        harness.step();
+        match harness.render() {
+            Ok(img) => img.save(dir.join("08_arch_diagram.png")).unwrap(),
             Err(e) => eprintln!("[render] 失敗: {e}"),
         }
     }

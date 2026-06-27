@@ -77,8 +77,6 @@ pub struct ContainerInfo {
     pub init: bool,
     pub cpu_milli: f64,
     pub mem_mib: f64,
-    pub cpu_limit_milli: f64, // limit（無ければ request）。0 = 未設定
-    pub mem_limit_mib: f64,
 }
 
 /// Pod（展開すると containers が見える）
@@ -210,22 +208,308 @@ pub struct EventsResult {
     pub error: Option<String>,
 }
 
-// ── クラスタ構成図（入れ子レイアウト用） ──
 
-/// Service とその背後 Pod（通信矢印のソース）。
-#[derive(Clone, Debug, Default)]
-pub struct TopoService {
-    pub ns: String,
-    pub name: String,
-    pub pods: Vec<String>, // Endpoints から得た背後 Pod 名
+// ── アーキテクチャ図（通信フロー型: Ingress → Service → Workload → Pod） ──
+
+/// アーキ図のノード種別。左→右の列順でもある。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchKind {
+    Ingress,
+    Service,
+    Workload,
+    Pod,
 }
 
-/// 構成図のデータ。Pod は所属ノード・コンテナを持つ（KubeMetrics の PodInfo を再利用）。
+impl ArchKind {
+    /// 左→右の列インデックス。
+    pub fn column(self) -> usize {
+        match self {
+            ArchKind::Ingress => 0,
+            ArchKind::Service => 1,
+            ArchKind::Workload => 2,
+            ArchKind::Pod => 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ArchNode {
+    pub id: String, // 一意キー "ns\u{1}kind\u{1}name"
+    pub ns: String,
+    pub kind: ArchKind,
+    pub name: String,
+    pub sub: String, // 補足（Workload 種別 / Pod phase / Service type 等）
+}
+
+/// 通信フロー型アーキテクチャ図のデータ。namespace ごとに描画側でグループ化する。
 #[derive(Clone, Debug, Default)]
-pub struct KubeTopology {
-    pub pods: Vec<PodInfo>,
-    pub services: Vec<TopoService>,
+pub struct ArchGraph {
+    pub nodes: Vec<ArchNode>,
+    pub edges: Vec<(String, String)>, // (from_id, to_id) 左→右
     pub error: Option<String>,
+}
+
+fn arch_id(ns: &str, kind: &str, name: &str) -> String {
+    format!("{ns}\u{1}{kind}\u{1}{name}")
+}
+
+/// selector の (k,v) がすべて labels に含まれるか（空 selector は不一致扱い）。
+fn selector_matches(
+    selector: &serde_json::Map<String, Value>,
+    labels: &serde_json::Map<String, Value>,
+) -> bool {
+    !selector.is_empty() && selector.iter().all(|(k, v)| labels.get(k) == Some(v))
+}
+
+fn as_label_map(v: &Value) -> serde_json::Map<String, Value> {
+    v.as_object().cloned().unwrap_or_default()
+}
+
+/// kubectl の各 JSON から通信フロー型グラフを組み立てる（純ロジック・テスト可能）。
+fn build_arch(
+    pods_json: &str,
+    svc_json: &str,
+    ing_json: &str,
+    workload_jsons: &[(&str, &str)], // (kind表示名, json)
+) -> ArchGraph {
+    let items = |s: &str| -> Vec<Value> {
+        serde_json::from_str::<Value>(s)
+            .ok()
+            .and_then(|v| v["items"].as_array().cloned())
+            .unwrap_or_default()
+    };
+    let meta = |it: &Value| {
+        (
+            it["metadata"]["namespace"].as_str().unwrap_or("").to_string(),
+            it["metadata"]["name"].as_str().unwrap_or("").to_string(),
+        )
+    };
+
+    let mut nodes: Vec<ArchNode> = Vec::new();
+    let ids: std::cell::RefCell<std::collections::HashSet<String>> = Default::default();
+    let mut edges: Vec<(String, String)> = Vec::new();
+
+    // Pod（ラベル保持）
+    struct Pod {
+        id: String,
+        ns: String,
+        labels: serde_json::Map<String, Value>,
+    }
+    let mut pods: Vec<Pod> = Vec::new();
+    for it in items(pods_json) {
+        let (ns, name) = meta(&it);
+        if name.is_empty() {
+            continue;
+        }
+        let id = arch_id(&ns, "Pod", &name);
+        let phase = it["status"]["phase"].as_str().unwrap_or("").to_string();
+        ids.borrow_mut().insert(id.clone());
+        nodes.push(ArchNode {
+            id: id.clone(),
+            ns: ns.clone(),
+            kind: ArchKind::Pod,
+            name,
+            sub: phase,
+        });
+        pods.push(Pod {
+            id,
+            ns,
+            labels: as_label_map(&it["metadata"]["labels"]),
+        });
+    }
+
+    // Workload（Deployment/StatefulSet/DaemonSet）
+    struct Wl {
+        id: String,
+        ns: String,
+        match_labels: serde_json::Map<String, Value>,
+    }
+    let mut workloads: Vec<Wl> = Vec::new();
+    for (kind, json) in workload_jsons {
+        for it in items(json) {
+            let (ns, name) = meta(&it);
+            if name.is_empty() {
+                continue;
+            }
+            let id = arch_id(&ns, kind, &name);
+            let ml = as_label_map(&it["spec"]["selector"]["matchLabels"]);
+            ids.borrow_mut().insert(id.clone());
+            nodes.push(ArchNode {
+                id: id.clone(),
+                ns: ns.clone(),
+                kind: ArchKind::Workload,
+                name,
+                sub: (*kind).to_string(),
+            });
+            // Workload → Pod（selector がラベルに一致）
+            for p in &pods {
+                if p.ns == ns && selector_matches(&ml, &p.labels) {
+                    edges.push((id.clone(), p.id.clone()));
+                }
+            }
+            workloads.push(Wl {
+                id,
+                ns,
+                match_labels: ml,
+            });
+        }
+    }
+
+    // Service（selector で Workload / Pod に接続）
+    for it in items(svc_json) {
+        let (ns, name) = meta(&it);
+        if name.is_empty() {
+            continue;
+        }
+        let id = arch_id(&ns, "Service", &name);
+        let sel = as_label_map(&it["spec"]["selector"]);
+        let svc_type = it["spec"]["type"].as_str().unwrap_or("ClusterIP").to_string();
+        ids.borrow_mut().insert(id.clone());
+        nodes.push(ArchNode {
+            id: id.clone(),
+            ns: ns.clone(),
+            kind: ArchKind::Service,
+            name,
+            sub: svc_type,
+        });
+        // Service → Workload（あれば）。無ければ Service → Pod に直結。
+        let mut linked_wl = false;
+        for w in &workloads {
+            if w.ns == ns && !sel.is_empty() && selector_matches(&sel, &w.match_labels) {
+                edges.push((id.clone(), w.id.clone()));
+                linked_wl = true;
+            }
+        }
+        if !linked_wl {
+            for p in &pods {
+                if p.ns == ns && selector_matches(&sel, &p.labels) {
+                    edges.push((id.clone(), p.id.clone()));
+                }
+            }
+        }
+    }
+
+    // Ingress → Service（backend.service.name）
+    for it in items(ing_json) {
+        let (ns, name) = meta(&it);
+        if name.is_empty() {
+            continue;
+        }
+        let id = arch_id(&ns, "Ingress", &name);
+        ids.borrow_mut().insert(id.clone());
+        nodes.push(ArchNode {
+            id: id.clone(),
+            ns: ns.clone(),
+            kind: ArchKind::Ingress,
+            name,
+            sub: "Ingress".into(),
+        });
+        let mut backends: Vec<String> = Vec::new();
+        if let Some(b) = it["spec"]["defaultBackend"]["service"]["name"].as_str() {
+            backends.push(b.to_string());
+        }
+        for rule in it["spec"]["rules"].as_array().into_iter().flatten() {
+            for path in rule["http"]["paths"].as_array().into_iter().flatten() {
+                if let Some(b) = path["backend"]["service"]["name"].as_str() {
+                    backends.push(b.to_string());
+                }
+            }
+        }
+        for b in backends {
+            let target = arch_id(&ns, "Service", &b);
+            if ids.borrow().contains(&target) {
+                edges.push((id.clone(), target));
+            }
+        }
+    }
+
+    edges.sort();
+    edges.dedup();
+    ArchGraph {
+        nodes,
+        edges,
+        error: None,
+    }
+}
+
+async fn fetch_arch(ns: &Option<String>) -> ArchGraph {
+    async fn getj(sc: &[String], kind: &str) -> Result<String, String> {
+        let mut argv: Vec<String> = vec!["get".into(), kind.into()];
+        argv.extend(sc.iter().cloned());
+        argv.push("-o".into());
+        argv.push("json".into());
+        run(&argv.iter().map(|s| s.as_str()).collect::<Vec<_>>()).await
+    }
+    let sc = scope_args(ns);
+    // Pod 取得失敗＝接続不可として扱う（他は失敗しても線が出ないだけ）。
+    let pods_json = match getj(&sc, "pods").await {
+        Ok(o) => o,
+        Err(e) => {
+            return ArchGraph {
+                error: Some(e),
+                ..Default::default()
+            }
+        }
+    };
+    let svc_json = getj(&sc, "services").await.unwrap_or_default();
+    let ing_json = getj(&sc, "ingresses").await.unwrap_or_default();
+    let dep_json = getj(&sc, "deployments").await.unwrap_or_default();
+    let sts_json = getj(&sc, "statefulsets").await.unwrap_or_default();
+    let ds_json = getj(&sc, "daemonsets").await.unwrap_or_default();
+    build_arch(
+        &pods_json,
+        &svc_json,
+        &ing_json,
+        &[
+            ("Deployment", &dep_json),
+            ("StatefulSet", &sts_json),
+            ("DaemonSet", &ds_json),
+        ],
+    )
+}
+
+/// テスト用の通信フロー型グラフ（描画の視覚確認に使う）。
+#[cfg(test)]
+pub fn sample_arch_graph() -> ArchGraph {
+    mock_arch()
+}
+
+/// モック用の通信フロー型グラフ（Ingress→Service→Deployment→Pod×2）。
+fn mock_arch() -> ArchGraph {
+    let ns = "app";
+    let n = |kind: ArchKind, name: &str, sub: &str, k: &str| ArchNode {
+        id: arch_id(ns, k, name),
+        ns: ns.into(),
+        kind,
+        name: name.into(),
+        sub: sub.into(),
+    };
+    let nodes = vec![
+        n(ArchKind::Ingress, "web-ingress", "Ingress", "Ingress"),
+        n(ArchKind::Service, "web", "ClusterIP", "Service"),
+        n(ArchKind::Service, "db", "ClusterIP", "Service"),
+        n(ArchKind::Workload, "web", "Deployment", "Deployment"),
+        n(ArchKind::Workload, "db", "StatefulSet", "StatefulSet"),
+        n(ArchKind::Pod, "web-7d9c-aaaaa", "Running", "Pod"),
+        n(ArchKind::Pod, "web-7d9c-bbbbb", "Running", "Pod"),
+        n(ArchKind::Pod, "db-0", "Running", "Pod"),
+    ];
+    let e = |a: (&str, &str), b: (&str, &str)| {
+        (arch_id(ns, a.0, a.1), arch_id(ns, b.0, b.1))
+    };
+    let edges = vec![
+        e(("Ingress", "web-ingress"), ("Service", "web")),
+        e(("Service", "web"), ("Deployment", "web")),
+        e(("Deployment", "web"), ("Pod", "web-7d9c-aaaaa")),
+        e(("Deployment", "web"), ("Pod", "web-7d9c-bbbbb")),
+        e(("Service", "db"), ("StatefulSet", "db")),
+        e(("StatefulSet", "db"), ("Pod", "db-0")),
+    ];
+    ArchGraph {
+        nodes,
+        edges,
+        error: None,
+    }
 }
 
 // ── 汎用リソースブラウザ ──
@@ -1046,13 +1330,13 @@ pub async fn events_loop(
 pub async fn topology_loop(
     cfg: Config,
     mut req_rx: UnboundedReceiver<Option<String>>,
-    tx: std::sync::mpsc::Sender<KubeTopology>,
+    tx: std::sync::mpsc::Sender<ArchGraph>,
 ) {
     while let Some(ns) = req_rx.recv().await {
         let g = if cfg.mock {
-            mock_topology()
+            mock_arch()
         } else {
-            fetch_topology(&ns).await
+            fetch_arch(&ns).await
         };
         if tx.send(g).is_err() {
             break;
@@ -1289,16 +1573,6 @@ fn parse_pods(pj: &str, cusage: &HashMap<(String, String, String), (f64, f64)>) 
                     .get(&(ns.clone(), name.clone(), cname.clone()))
                     .copied()
                     .unwrap_or((0.0, 0.0));
-                // limit を優先、無ければ request を上限値に使う
-                let res = &c["resources"];
-                let cpu_str = res["limits"]["cpu"]
-                    .as_str()
-                    .or_else(|| res["requests"]["cpu"].as_str());
-                let mem_str = res["limits"]["memory"]
-                    .as_str()
-                    .or_else(|| res["requests"]["memory"].as_str());
-                let cpu_limit_milli = cpu_str.map(parse_cpu_milli).unwrap_or(0.0);
-                let mem_limit_mib = mem_str.map(parse_mem_mib).unwrap_or(0.0);
                 containers.push(ContainerInfo {
                     name: cname,
                     image,
@@ -1308,8 +1582,6 @@ fn parse_pods(pj: &str, cusage: &HashMap<(String, String, String), (f64, f64)>) 
                     init,
                     cpu_milli,
                     mem_mib,
-                    cpu_limit_milli,
-                    mem_limit_mib,
                 });
             }
         };
@@ -1337,92 +1609,6 @@ fn parse_pods(pj: &str, cusage: &HashMap<(String, String, String), (f64, f64)>) 
 }
 
 // ── 構成図 ──
-
-async fn fetch_topology(ns: &Option<String>) -> KubeTopology {
-    let sc = scope_args(ns);
-    let getj = |kind: &str| {
-        let mut argv: Vec<String> = vec!["get".into(), kind.into()];
-        argv.extend(sc.iter().cloned());
-        argv.push("-o".into());
-        argv.push("json".into());
-        argv
-    };
-    let pa = getj("pods");
-    let pods_json = match run(&pa.iter().map(|s| s.as_str()).collect::<Vec<_>>()).await {
-        Ok(o) => o,
-        Err(e) => {
-            return KubeTopology {
-                error: Some(e),
-                ..Default::default()
-            }
-        }
-    };
-    // Service / Endpoints は取得失敗しても致命的でない（矢印が出ないだけ）
-    let sa = getj("services");
-    let svc_json = run(&sa.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-        .await
-        .unwrap_or_default();
-    let ea = getj("endpoints");
-    let ep_json = run(&ea.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-        .await
-        .unwrap_or_default();
-    // コンテナ単位の CPU/メモリ使用量（metrics-server 無しなら空 → 0 表示）
-    let mut tp: Vec<String> = vec!["top".into(), "pods".into()];
-    tp.extend(sc.iter().cloned());
-    tp.extend(["--containers".into(), "--no-headers".into()]);
-    let cusage = run(&tp.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-        .await
-        .map(|o| parse_container_usage(&o))
-        .unwrap_or_default();
-    KubeTopology {
-        pods: parse_pods(&pods_json, &cusage),
-        services: parse_services(&svc_json, &ep_json),
-        error: None,
-    }
-}
-
-/// Service と Endpoints を突き合わせ、各 Service の背後 Pod 名を集める。
-fn parse_services(svc_json: &str, ep_json: &str) -> Vec<TopoService> {
-    // Endpoints: (ns, name) → 背後 Pod 名
-    let mut ep: HashMap<(String, String), Vec<String>> = HashMap::new();
-    if let Ok(v) = serde_json::from_str::<Value>(ep_json) {
-        for it in v["items"].as_array().into_iter().flatten() {
-            let ns = it["metadata"]["namespace"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let name = it["metadata"]["name"].as_str().unwrap_or("").to_string();
-            let mut pods = Vec::new();
-            for ss in it["subsets"].as_array().into_iter().flatten() {
-                for a in ss["addresses"].as_array().into_iter().flatten() {
-                    if a["targetRef"]["kind"].as_str() == Some("Pod") {
-                        if let Some(pn) = a["targetRef"]["name"].as_str() {
-                            pods.push(pn.to_string());
-                        }
-                    }
-                }
-            }
-            ep.insert((ns, name), pods);
-        }
-    }
-    let mut out = Vec::new();
-    if let Ok(v) = serde_json::from_str::<Value>(svc_json) {
-        for it in v["items"].as_array().into_iter().flatten() {
-            let ns = it["metadata"]["namespace"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let name = it["metadata"]["name"].as_str().unwrap_or("").to_string();
-            // ヘッドレス/外部などで Endpoints が無い Service は矢印なし
-            let pods = ep
-                .get(&(ns.clone(), name.clone()))
-                .cloned()
-                .unwrap_or_default();
-            out.push(TopoService { ns, name, pods });
-        }
-    }
-    out
-}
 
 // ── イベント ──
 
@@ -1521,8 +1707,6 @@ fn mock_metrics() -> KubeMetrics {
                 init,
                 cpu_milli: cpu,
                 mem_mib: mem,
-                cpu_limit_milli: 0.0,
-                mem_limit_mib: 0.0,
             }
         };
     let pods = vec![
@@ -1653,58 +1837,46 @@ fn mock_metrics() -> KubeMetrics {
     }
 }
 
-fn mock_topology() -> KubeTopology {
-    let pod = |ns: &str, name: &str, node: &str, ctrs: &[&str]| PodInfo {
-        ns: ns.into(),
-        name: name.into(),
-        phase: "Running".into(),
-        node: node.into(),
-        age: "3d".into(),
-        restarts: 0,
-        cpu_milli: 0.0,
-        mem_mib: 0.0,
-        containers: ctrs
-            .iter()
-            .enumerate()
-            .map(|(i, c)| ContainerInfo {
-                name: (*c).into(),
-                state: "Running".into(),
-                ready: true,
-                cpu_milli: 35.0 + (i as f64) * 22.0,
-                mem_mib: 64.0 + (i as f64) * 48.0,
-                cpu_limit_milli: 200.0,
-                mem_limit_mib: 256.0,
-                ..Default::default()
-            })
-            .collect(),
-    };
-    KubeTopology {
-        pods: vec![
-            pod("default", "api-7c9-abc", "node-1", &["api", "sidecar"]),
-            pod("default", "api-7c9-def", "node-1", &["api", "sidecar"]),
-            pod("default", "web-5d-xyz", "node-2", &["web"]),
-            pod("default", "worker-1", "node-2", &["worker", "agent"]),
-            pod("kube-system", "coredns-xyz", "node-1", &["coredns"]),
-        ],
-        services: vec![
-            TopoService {
-                ns: "default".into(),
-                name: "api".into(),
-                pods: vec!["api-7c9-abc".into(), "api-7c9-def".into()],
-            },
-            TopoService {
-                ns: "default".into(),
-                name: "web".into(),
-                pods: vec!["web-5d-xyz".into()],
-            },
-        ],
-        error: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// build_arch: Ingress→Service→Workload→Pod のエッジがラベル一致で張られる。
+    #[test]
+    fn build_arch_edges() {
+        let pods = r#"{"items":[
+            {"metadata":{"namespace":"app","name":"web-1","labels":{"app":"web"}},"status":{"phase":"Running"}},
+            {"metadata":{"namespace":"app","name":"web-2","labels":{"app":"web"}},"status":{"phase":"Running"}}
+        ]}"#;
+        let svcs = r#"{"items":[
+            {"metadata":{"namespace":"app","name":"web"},"spec":{"selector":{"app":"web"},"type":"ClusterIP"}}
+        ]}"#;
+        let ings = r#"{"items":[
+            {"metadata":{"namespace":"app","name":"web-ing"},"spec":{"rules":[{"http":{"paths":[{"backend":{"service":{"name":"web"}}}]}}]}}
+        ]}"#;
+        let deps = r#"{"items":[
+            {"metadata":{"namespace":"app","name":"web"},"spec":{"selector":{"matchLabels":{"app":"web"}}}}
+        ]}"#;
+        let g = build_arch(pods, svcs, ings, &[("Deployment", deps)]);
+        let id = |k: &str, n: &str| arch_id("app", k, n);
+        let has = |a: String, b: String| g.edges.iter().any(|(x, y)| *x == a && *y == b);
+        assert!(has(id("Ingress", "web-ing"), id("Service", "web")), "ingress→service");
+        assert!(has(id("Service", "web"), id("Deployment", "web")), "service→workload");
+        assert!(has(id("Deployment", "web"), id("Pod", "web-1")), "workload→pod1");
+        assert!(has(id("Deployment", "web"), id("Pod", "web-2")), "workload→pod2");
+        // Service→Pod の直結は張らない（Workload があるので）。
+        assert!(!has(id("Service", "web"), id("Pod", "web-1")), "service→pod は張らない");
+        assert_eq!(g.nodes.len(), 5);
+    }
+
+    /// selector_matches: 部分集合一致、空 selector は不一致。
+    #[test]
+    fn selector_subset() {
+        let m = |s: &str| serde_json::from_str::<serde_json::Map<String, Value>>(s).unwrap();
+        assert!(selector_matches(&m(r#"{"app":"web"}"#), &m(r#"{"app":"web","x":"y"}"#)));
+        assert!(!selector_matches(&m(r#"{"app":"web"}"#), &m(r#"{"app":"db"}"#)));
+        assert!(!selector_matches(&m("{}"), &m(r#"{"app":"web"}"#)), "空 selector は不一致");
+    }
 
     #[test]
     fn cpu_parsing() {
