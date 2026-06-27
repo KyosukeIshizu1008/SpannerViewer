@@ -1069,9 +1069,23 @@ async fn run(args: &[&str]) -> Result<String, String> {
         .map_err(|e| format!("kubectl 実行失敗: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
+        // 接続不可（クラスタ未起動・コンテキスト誤り等）は分かりやすい文言にする。
+        if err.contains("connection refused")
+            || err.contains("The connection to the server")
+            || err.contains("couldn't get current server API group list")
+            || err.contains("did you specify the right host or port")
+            || err.contains("no such host")
+        {
+            return Err(
+                "クラスタに接続できません。Kubernetes が起動しているか、kubectl の\
+                 コンテキストが正しいか確認してください（例: OrbStack/Docker Desktop の \
+                 Kubernetes を有効化）。"
+                    .into(),
+            );
+        }
         let line = err.lines().last().unwrap_or("").trim();
         return Err(if line.is_empty() {
-            "kubectl エラー（クラスタに接続できません）".into()
+            "kubectl エラー".into()
         } else {
             line.to_string()
         });
@@ -1082,15 +1096,12 @@ async fn run(args: &[&str]) -> Result<String, String> {
 // ── 監視 ──
 
 async fn fetch_metrics() -> KubeMetrics {
-    let mut nodes = match run(&["top", "nodes", "--no-headers"]).await {
-        Ok(o) => parse_nodes(&o),
-        Err(e) => {
-            return KubeMetrics {
-                error: Some(e),
-                ..Default::default()
-            }
-        }
-    };
+    // ノード使用量は metrics-server が無いクラスタでは取れない。取れなくても
+    // 致命的にせず空のまま続行する（接続可否は get pods で判定する）。
+    let mut nodes = run(&["top", "nodes", "--no-headers"])
+        .await
+        .map(|o| parse_nodes(&o))
+        .unwrap_or_default();
 
     // コンテナ単位の使用量（metrics-server がなければ空）
     let cusage = run(&["top", "pods", "-A", "--containers", "--no-headers"])

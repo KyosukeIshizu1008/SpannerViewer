@@ -1978,14 +1978,8 @@ impl MonitorApp {
                                         self.tree_expanded.insert(node.name.clone());
                                     }
                                 }
-                                // 名前の右に小さなインポートボタン。
-                                if ui
-                                    .small_button("⬆")
-                                    .on_hover_text(format!("{} に CSV をインポート", node.name))
-                                    .clicked()
-                                {
-                                    import_open = Some(node.clone());
-                                }
+                                // CSV インポートは専用「インポート」タブ・右クリックメニュー
+                                // から行うため、ここの ⬆ ボタンは廃止。
                             })
                             .response
                             .context_menu(|ui| {
