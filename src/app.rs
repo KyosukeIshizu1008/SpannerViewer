@@ -5462,7 +5462,8 @@ impl MonitorApp {
                                 g.nodes.len(),
                                 g.edges.len()
                             ))
-                            .color(MUTED),
+                            .color(MUTED)
+                            .small(),
                         );
                     }
                 }
@@ -7075,15 +7076,20 @@ fn install_japanese_font(ctx: &egui::Context) {
     // Proportional の先頭に [latin, jp] を差し込む（先頭優先）。
     let mut front: Vec<String> = Vec::new();
     if let Some(b) = latin.iter().find_map(|p| std::fs::read(p).ok()) {
-        fonts
-            .font_data
-            .insert("latin".to_owned(), Arc::new(egui::FontData::from_owned(b)));
+        // SF は行間が大きくグリフが行の上側に寄るため、少し下げて上下中央に補正する。
+        let data = egui::FontData::from_owned(b).tweak(egui::FontTweak {
+            y_offset_factor: 0.06,
+            ..Default::default()
+        });
+        fonts.font_data.insert("latin".to_owned(), Arc::new(data));
         front.push("latin".to_owned());
     }
     let have_jp = if let Some(b) = jp.iter().find_map(|p| std::fs::read(p).ok()) {
-        fonts
-            .font_data
-            .insert("jp".to_owned(), Arc::new(egui::FontData::from_owned(b)));
+        let data = egui::FontData::from_owned(b).tweak(egui::FontTweak {
+            y_offset_factor: 0.06,
+            ..Default::default()
+        });
+        fonts.font_data.insert("jp".to_owned(), Arc::new(data));
         front.push("jp".to_owned());
         true
     } else {
