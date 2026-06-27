@@ -247,7 +247,10 @@ pub fn split_fields(b: &[u8], delim: u8) -> Vec<Vec<u8>> {
                 field.push(c);
                 k += 1;
             }
-        } else if c == b'"' {
+        } else if c == b'"' && field.is_empty() {
+            // " はフィールド先頭のときだけ引用開始（RFC 4180）。フィールド途中の "
+            // はデータとして扱う（例: 5'10"）。こうしないと以降のカンマ・改行を
+            // 引用内として飲み込み、列ズレ・文字列の途切れ・余計な " が起きる。
             in_q = true;
             k += 1;
         } else if c == delim {
@@ -284,6 +287,8 @@ mod tests {
         assert_eq!(f(b"a,b,c", b','), vec!["a", "b", "c"]);
         assert_eq!(f(b"\"a,1\",b,\"c\"\"x\"", b','), vec!["a,1", "b", "c\"x"]);
         assert_eq!(f(b"x;y;z", b';'), vec!["x", "y", "z"]);
+        // フィールド途中の " はデータ（5'10"）。以降のカンマを飲み込まない。
+        assert_eq!(f(b"O'Brien,5'10\" tall,z", b','), vec!["O'Brien", "5'10\" tall", "z"]);
     }
 
     /// Shift-JIS のバイト列でも、区切りで正しく分割しデコードできる。

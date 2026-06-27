@@ -2223,7 +2223,11 @@ impl CsvStreamer {
             return;
         }
         match b {
-            b'"' => {
+            // " はフィールド先頭のときだけ引用開始（RFC 4180）。フィールド途中の
+            // " はデータ（例: 5'10" / インチ表記）として literal に扱う。こうしないと
+            // 途中の " 以降のカンマ・改行まで引用内として飲み込み、行が結合して
+            // 列数ズレ・文字列の途切れを起こす。
+            b'"' if self.field.is_empty() => {
                 self.in_quotes = true;
                 self.started = true;
             }
@@ -3127,6 +3131,13 @@ mod tests {
             stream_all(b"a\r\n\r\nb\n"),
             vec![vec!["a"], vec!["b"]]
         );
+        // フィールド途中の " はデータ（5'10"）。以降のカンマ・改行を飲み込まない。
+        assert_eq!(
+            stream_all(b"O'Brien,5'10\" tall,z\nnext,row,!\n"),
+            vec![vec!["O'Brien", "5'10\" tall", "z"], vec!["next", "row", "!"]]
+        );
+        // 先頭が " のフィールドは従来どおり引用（カンマを保持・外側 " を除去）。
+        assert_eq!(stream_all(b"\"a,b\",c\n"), vec![vec!["a,b", "c"]]);
     }
 
     /// Shift-JIS デコードとタブ区切りに対応する。
@@ -3758,6 +3769,63 @@ mod tests {
         assert!(create.contains("CREATE TABLE ImportTest"), "DDL: {create}");
         assert!(create.contains("PRIMARY KEY"), "DDL: {create}");
         assert!(create.trim_end().ends_with(';'), "末尾に ; が無い: {create}");
+    }
+
+    /// クォート/カンマ/改行/途中のクォートを含む実データが、欠落・結合・余計な
+    /// クォート無しで正しく取り込まれる（emulator 前提）。
+    #[tokio::test]
+    async fn import_messy_quoted_csv_roundtrip() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _guard = EMU_LOCK.lock().await;
+        create_import_table().await;
+        let client = client().await;
+
+        // 1: クォート内カンマ / 2: エスケープ "" / 3: フィールド途中の " (5'10") / 4: クォート内改行
+        let csv = "Id,Name,Note\n\
+                   1,\"Smith, John\",plain\n\
+                   2,\"she said \"\"hi\"\"\",ok\n\
+                   3,O'Brien,5'10\" tall\n\
+                   4,\"multi\nline\",last\n";
+        let path = write_temp_csv("messy_quoted", csv);
+        let req = ImportRequest {
+            table: "ImportTest".into(),
+            columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)"), ("Note", "STRING(MAX)")]),
+            source: ImportSource::File(path),
+            has_header: true,
+            mode: ImportMode::InsertOrUpdate,
+            empty_as_null: true,
+            fresh: true,
+            encoding: Encoding::Utf8,
+            delimiter: b',',
+            skip_bad_rows: false,
+            dry_run: false,
+            null_token: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (ptx, _prx) = std::sync::mpsc::channel::<ImportProgress>();
+        let out = run_streaming_import(&test_env(), &req, false, &ptx).await;
+        assert_eq!(out.error, None, "import error: {:?}", out.error);
+        assert_eq!(out.written, 4, "4 行すべて取り込まれるはず");
+
+        let (_, rows, _) = try_query(&client, "SELECT Id, Name, Note FROM ImportTest ORDER BY Id")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        // クォート内カンマは 1 フィールドのまま、外側クォートは除去。
+        assert_eq!(rows[0][1], "Smith, John");
+        assert_eq!(rows[0][2], "plain");
+        // エスケープ "" は " 1 個に。
+        assert_eq!(rows[1][1], "she said \"hi\"");
+        // フィールド途中の " はデータとして保持（行結合・欠落を起こさない）。
+        assert_eq!(rows[2][1], "O'Brien");
+        assert_eq!(rows[2][2], "5'10\" tall");
+        // クォート内改行は 1 フィールド内に保持。
+        assert_eq!(rows[3][1], "multi\nline");
+        assert_eq!(rows[3][2], "last");
     }
 
     /// CSV↔DB 照合: 一致 / 値差異 / CSVのみ / DBのみ を正しく数える（emulator 前提）。
