@@ -7078,7 +7078,7 @@ fn install_japanese_font(ctx: &egui::Context) {
     if let Some(b) = latin.iter().find_map(|p| std::fs::read(p).ok()) {
         // SF は行間が大きくグリフが行の上側に寄るため、少し下げて上下中央に補正する。
         let data = egui::FontData::from_owned(b).tweak(egui::FontTweak {
-            y_offset_factor: 0.06,
+            y_offset_factor: 0.15,
             ..Default::default()
         });
         fonts.font_data.insert("latin".to_owned(), Arc::new(data));
@@ -7086,7 +7086,7 @@ fn install_japanese_font(ctx: &egui::Context) {
     }
     let have_jp = if let Some(b) = jp.iter().find_map(|p| std::fs::read(p).ok()) {
         let data = egui::FontData::from_owned(b).tweak(egui::FontTweak {
-            y_offset_factor: 0.06,
+            y_offset_factor: 0.15,
             ..Default::default()
         });
         fonts.font_data.insert("jp".to_owned(), Arc::new(data));
