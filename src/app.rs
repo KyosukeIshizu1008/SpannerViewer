@@ -6219,26 +6219,50 @@ fn setup_style(ctx: &egui::Context) {
 /// 日本語対応のシステムフォントを読み込み、既定フォントのフォールバックに追加する。
 /// 見つからなければ何もしない（英数字は既定フォントで表示される）。
 fn install_japanese_font(ctx: &egui::Context) {
-    // 単一フェイスの .ttf を優先し、無ければヒラギノ(.ttc)へフォールバック
-    const CANDIDATES: [&str; 4] = [
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        "/Library/Fonts/Arial Unicode.ttf",
+    use std::sync::Arc;
+    let mut fonts = egui::FontDefinitions::default();
+
+    // 欧文・数字は macOS 標準の Helvetica を最優先にして、見慣れたネイティブな
+    // 字面にする（egui バンドル既定だと一般的でない見た目になる）。
+    let latin: [&str; 1] = ["/System/Library/Fonts/Helvetica.ttc"];
+    // 和文は macOS 標準のヒラギノ角ゴシックを使う（Arial Unicode より自然）。
+    let jp: [&str; 3] = [
         "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
     ];
-    let Some(bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) else {
-        return;
+
+    // Proportional の先頭に [latin, jp] を差し込む（先頭ほど優先。欧文は Helvetica、
+    // 未収録の和文はヒラギノが埋める。それも無ければ egui 既定）。
+    let mut front: Vec<String> = Vec::new();
+    if let Some(b) = latin.iter().find_map(|p| std::fs::read(p).ok()) {
+        fonts
+            .font_data
+            .insert("latin".to_owned(), Arc::new(egui::FontData::from_owned(b)));
+        front.push("latin".to_owned());
+    }
+    let have_jp = if let Some(b) = jp.iter().find_map(|p| std::fs::read(p).ok()) {
+        fonts
+            .font_data
+            .insert("jp".to_owned(), Arc::new(egui::FontData::from_owned(b)));
+        front.push("jp".to_owned());
+        true
+    } else {
+        false
     };
 
-    let mut fonts = egui::FontDefinitions::default();
-    fonts
-        .font_data
-        .insert("jp".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-    // 既定（英数）フォントの後ろに足すことで、未収録の和文だけ JP フォントが埋める
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+    let prop = fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default();
+    for (i, name) in front.iter().enumerate() {
+        prop.insert(i, name.clone());
+    }
+    // 等幅は整列を崩さないよう既定の等幅フォントを主にしたまま、和文だけ補う。
+    if have_jp {
         fonts
             .families
-            .entry(family)
+            .entry(egui::FontFamily::Monospace)
             .or_default()
             .push("jp".to_owned());
     }
