@@ -32,6 +32,11 @@ impl CsvIndex {
     /// ファイルを mmap して改行を走査し、疎な行オフセット索引を作る。
     /// progress には走査済みバイト数を随時書き込む（UI の進捗表示用）。
     pub fn build(path: &Path, progress: Arc<AtomicU64>) -> io::Result<Self> {
+        Self::build_inner(path, progress, MAX_ENTRIES)
+    }
+
+    /// 索引エントリ上限を指定できる本体（テストで間引きを強制するため分離）。
+    fn build_inner(path: &Path, progress: Arc<AtomicU64>, max_entries: usize) -> io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         let data: &[u8] = &mmap;
@@ -50,7 +55,7 @@ impl CsvIndex {
                 // 次の行が存在する。stride の倍数の行頭だけ記録。
                 if line.is_multiple_of(stride) {
                     offsets.push(next_off);
-                    if offsets.len() >= MAX_ENTRIES {
+                    if offsets.len() >= max_entries {
                         // 間引き: 偶数番だけ残してストライドを倍に。
                         let mut keep = true;
                         offsets.retain(|_| {
@@ -332,6 +337,47 @@ mod tests {
             10,
         );
         assert_eq!(hits.len(), 10, "cap で打ち切る");
+    }
+
+    /// 索引を強制的に間引かせ（stride>1）、長さがバラバラな行でも全行を正しく
+    /// 解決できることを検証する（100GB を支える核心パスのテスト）。
+    #[test]
+    fn forced_decimation_resolves_all_rows() {
+        // 行ごとに長さを変える（疎索引はスキャンで解決するため可変長が本番に近い）。
+        let n = 3000u64;
+        let mut body = Vec::new();
+        let mut expected: Vec<String> = Vec::new();
+        for i in 0..n {
+            let pad = "x".repeat((i % 17) as usize); // 0〜16 文字の可変長
+            let row = format!("{i},{pad},end{i}");
+            expected.push(row.clone());
+            body.extend_from_slice(row.as_bytes());
+            body.push(b'\n');
+        }
+        let p = write_tmp("decim.csv", &body);
+        // 上限を極小(=8)にして何度も間引かせる → stride は 1 より十分大きくなる。
+        let idx = CsvIndex::build_inner(&p, Arc::new(AtomicU64::new(0)), 8).unwrap();
+        assert_eq!(idx.total_rows, n);
+        assert!(idx.stride > 1, "間引きで stride>1 になるはず: {}", idx.stride);
+        assert!(idx.offsets.len() <= 8, "索引は上限内: {}", idx.offsets.len());
+        // 全行を順に検証（ストライド境界・スキャンの正しさ）。
+        for i in 0..n {
+            let got = String::from_utf8(idx.row_bytes(i).unwrap().to_vec()).unwrap();
+            assert_eq!(got, expected[i as usize], "row {i}");
+        }
+        // パースも正しい。
+        assert_eq!(idx.parse_row(2999, b',')[0], "2999");
+        assert_eq!(idx.parse_row(2999, b',')[2], "end2999");
+        assert!(idx.row_bytes(n).is_none());
+    }
+
+    #[test]
+    fn empty_file_is_zero_rows() {
+        let p = write_tmp("empty.csv", b"");
+        let idx = CsvIndex::build(&p, Arc::new(AtomicU64::new(0))).unwrap();
+        assert_eq!(idx.total_rows, 0);
+        assert!(idx.row_bytes(0).is_none());
+        assert_eq!(idx.column_count(b','), 0);
     }
 
     /// 疎索引を強制的に間引かせても正しい行に解決できる（ストライド境界の検証）。
