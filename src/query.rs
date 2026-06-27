@@ -1703,7 +1703,7 @@ fn strip_bom(bytes: &mut Vec<u8>) {
 }
 
 /// GCS オブジェクトをストリーミング取得する（本文を一括バッファしない）。
-async fn gcs_get_stream(uri: &str) -> anyhow::Result<reqwest::Response> {
+pub async fn gcs_get_stream(uri: &str) -> anyhow::Result<reqwest::Response> {
     let (bucket, object) = parse_gs_uri(uri).map_err(|e| anyhow::anyhow!(e))?;
     let provider = gcp_auth::provider().await?;
     let token = provider.token(&[GCS_SCOPE]).await?;
@@ -1717,31 +1717,6 @@ async fn gcs_get_stream(uri: &str) -> anyhow::Result<reqwest::Response> {
         .await?
         .error_for_status()?;
     Ok(resp)
-}
-
-/// GCS オブジェクトを一時ファイルへストリーミング保存する（巨大 CSV ビューア用）。
-/// content-length が分かれば `total` に、ダウンロード済みバイト数を `progress` に書く。
-pub async fn download_gcs_to_file(
-    uri: &str,
-    dest: &std::path::Path,
-    progress: &std::sync::atomic::AtomicU64,
-    total: &std::sync::atomic::AtomicU64,
-) -> anyhow::Result<()> {
-    use std::sync::atomic::Ordering;
-    use tokio::io::AsyncWriteExt;
-    let mut resp = gcs_get_stream(uri).await?;
-    if let Some(len) = resp.content_length() {
-        total.store(len, Ordering::Relaxed);
-    }
-    let mut file = tokio::fs::File::create(dest).await?;
-    let mut done: u64 = 0;
-    while let Some(chunk) = resp.chunk().await? {
-        file.write_all(&chunk).await?;
-        done += chunk.len() as u64;
-        progress.store(done, Ordering::Relaxed);
-    }
-    file.flush().await?;
-    Ok(())
 }
 
 // ── ストリーミング CSV パーサ（バイト単位・全行を溜めない） ──

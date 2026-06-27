@@ -1800,6 +1800,16 @@ impl eframe::App for MonitorApp {
 
 /// CSV ビューアの1ファイル分の状態（VS Code のタブ相当）。読み込み/絞り込みは
 /// タブごとに独立した背景タスクで行う。
+/// GCS ストリーミングプレビューの蓄積バッファ（生バイト行を順次ためる）。
+#[derive(Default)]
+struct PreviewBuf {
+    lines: Vec<Vec<u8>>, // CRLF 除去済みの生バイト行
+    bytes_read: u64,
+    complete: bool, // 末尾まで読み切った
+    capped: bool,   // 上限に達して打ち切った
+    error: Option<String>,
+}
+
 struct CsvTab {
     path: std::path::PathBuf,
     title: String,
@@ -1808,10 +1818,10 @@ struct CsvTab {
     progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     total_bytes: u64,
     loading: bool,
-    // GCS 取得: phase 1=ダウンロード / 0=索引作成。dl_total は content-length。
-    phase: std::sync::Arc<std::sync::atomic::AtomicU8>,
-    dl_total: std::sync::Arc<std::sync::atomic::AtomicU64>,
     err: Option<String>,
+    // GCS ストリーミングプレビュー（ローカルに落とさず逐次表示）。Some ならプレビュー。
+    preview: Option<std::sync::Arc<std::sync::Mutex<PreviewBuf>>>,
+    stream_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     first_row: u64,
     col_off: f32,
     delim: u8,
@@ -1844,9 +1854,9 @@ impl CsvTab {
             progress: Arc::new(AtomicU64::new(0)),
             total_bytes,
             loading: false,
-            phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-            dl_total: Arc::new(AtomicU64::new(0)),
             err: None,
+            preview: None,
+            stream_cancel: Arc::new(AtomicBool::new(false)),
             first_row: 0,
             col_off: 0.0,
             delim: b',',
@@ -1880,66 +1890,161 @@ impl CsvTab {
         });
     }
 
-    /// GCS から一時ファイルへ取得し、続けて索引化する（巨大ファイル対応）。
-    /// self.path をダウンロード先（一時ファイル）として使う。
-    fn start_gcs(&mut self, uri: String, ctx: &egui::Context) {
+    /// GCS をストリーミングして逐次プレビュー表示する（ローカルに保存しない）。
+    /// 即時に先頭から表示し、上限（行数/バイト数）まで読み進める。
+    fn start_gcs_preview(&mut self, uri: String, ctx: &egui::Context) {
         use std::sync::atomic::Ordering;
-        self.loading = true;
-        self.phase.store(1, Ordering::Relaxed); // download
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(PreviewBuf::default()));
+        self.preview = Some(buf.clone());
+        self.loading = false; // 即表示（ローディング画面にしない）
         self.progress.store(0, Ordering::Relaxed);
-        self.dl_total.store(0, Ordering::Relaxed);
-        *self.result.lock().unwrap() = None;
+        self.stream_cancel.store(false, Ordering::Relaxed);
         let prog = self.progress.clone();
-        let dlt = self.dl_total.clone();
-        let phase = self.phase.clone();
-        let slot = self.result.clone();
-        let dest = self.path.clone();
+        let stop = self.stream_cancel.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            const ROW_CAP: usize = 2_000_000; // メモリ保護
+            const BYTE_CAP: u64 = 256 * 1024 * 1024;
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("rt");
-            let dl =
-                rt.block_on(crate::query::download_gcs_to_file(&uri, &dest, &prog, &dlt));
-            match dl {
-                Err(e) => *slot.lock().unwrap() = Some(Err(format!("GCS 取得失敗: {e}"))),
-                Ok(()) => {
-                    phase.store(0, Ordering::Relaxed); // 索引作成へ
-                    prog.store(0, Ordering::Relaxed);
-                    let r = csvview::CsvIndex::build(&dest, prog.clone()).map_err(|e| e.to_string());
-                    *slot.lock().unwrap() = Some(r);
+            rt.block_on(async move {
+                let mut resp = match crate::query::gcs_get_stream(&uri).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let mut b = buf.lock().unwrap();
+                        b.error = Some(format!("GCS 取得失敗: {e}"));
+                        b.complete = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                };
+                let mut carry: Vec<u8> = Vec::new();
+                let mut total: u64 = 0;
+                let mut first = true;
+                let mut reached_eof = true;
+                loop {
+                    let chunk = match resp.chunk().await {
+                        Ok(Some(c)) => c,
+                        Ok(None) => break,
+                        Err(e) => {
+                            buf.lock().unwrap().error = Some(format!("読み込み中断: {e}"));
+                            reached_eof = false;
+                            break;
+                        }
+                    };
+                    total += chunk.len() as u64;
+                    prog.store(total, Ordering::Relaxed);
+                    let mut bytes: &[u8] = chunk.as_ref();
+                    if first {
+                        if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                            bytes = &bytes[3..];
+                        }
+                        first = false;
+                    }
+                    carry.extend_from_slice(bytes);
+                    // carry から完成行を切り出す。
+                    let mut newlines: Vec<Vec<u8>> = Vec::new();
+                    let mut s = 0usize;
+                    while let Some(p) = memchr::memchr(b'\n', &carry[s..]) {
+                        let mut line = carry[s..s + p].to_vec();
+                        if line.last() == Some(&b'\r') {
+                            line.pop();
+                        }
+                        newlines.push(line);
+                        s += p + 1;
+                    }
+                    carry.drain(0..s);
+                    let mut capped = false;
+                    if !newlines.is_empty() {
+                        let mut b = buf.lock().unwrap();
+                        b.lines.extend(newlines);
+                        b.bytes_read = total;
+                        if b.lines.len() >= ROW_CAP || total >= BYTE_CAP {
+                            b.capped = true;
+                            capped = true;
+                        }
+                    }
+                    ctx.request_repaint();
+                    if capped || stop.load(Ordering::Relaxed) {
+                        reached_eof = false;
+                        break;
+                    }
                 }
-            }
-            ctx.request_repaint();
+                let mut b = buf.lock().unwrap();
+                if reached_eof && !carry.is_empty() {
+                    let mut line = carry;
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    b.lines.push(line);
+                }
+                b.complete = reached_eof;
+                ctx.request_repaint();
+            });
         });
     }
 
     /// 検索/絞り込みを背景スレッドで実行（全件スキャン・進捗・キャンセル可）。
+    /// 索引（mmap）はファイルを走査、プレビューは読み込み済みバッファを走査。
     fn start_filter(&mut self, ctx: &egui::Context) {
         use std::sync::atomic::Ordering;
-        let Some(idx) = self.index.clone() else {
-            return;
-        };
         let needle = self.filter.trim().to_string();
         let col = self.filter_col;
         let delim = self.delim;
         let has_header = self.has_header;
         let enc = self.encoding;
-        self.filtering = true;
-        self.filter_cancel.store(false, Ordering::Relaxed);
-        self.filter_progress.store(0, Ordering::Relaxed);
-        *self.filter_result.lock().unwrap() = None;
         let cancel = self.filter_cancel.clone();
         let prog = self.filter_progress.clone();
         let slot = self.filter_result.clone();
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let cap = 5_000_000; // 一致件数の上限（メモリ保護）
-            let v = idx.scan_filter(&needle, col, delim, has_header, enc, &cancel, &prog, cap);
-            *slot.lock().unwrap() = Some(v);
-            ctx.request_repaint();
-        });
+        const CAP: usize = 5_000_000; // 一致件数の上限（メモリ保護）
+
+        if let Some(idx) = self.index.clone() {
+            self.filtering = true;
+            self.filter_cancel.store(false, Ordering::Relaxed);
+            self.filter_progress.store(0, Ordering::Relaxed);
+            *self.filter_result.lock().unwrap() = None;
+            std::thread::spawn(move || {
+                let v = idx.scan_filter(&needle, col, delim, has_header, enc, &cancel, &prog, CAP);
+                *slot.lock().unwrap() = Some(v);
+                ctx.request_repaint();
+            });
+        } else if let Some(pv) = self.preview.clone() {
+            self.filtering = true;
+            self.filter_cancel.store(false, Ordering::Relaxed);
+            *self.filter_result.lock().unwrap() = None;
+            // 読み込み済みの行スナップショットを走査（ストリームを止めない）。
+            let lines = pv.lock().unwrap().lines.clone();
+            std::thread::spawn(move || {
+                let needle_l = needle.to_lowercase();
+                let mut out: Vec<u64> = Vec::new();
+                for (i, line) in lines.iter().enumerate() {
+                    if has_header && i == 0 {
+                        continue;
+                    }
+                    let hit = match col {
+                        None => enc.decode(line).to_lowercase().contains(&needle_l),
+                        Some(c) => csvview::split_fields(line, delim)
+                            .get(c)
+                            .map(|f| enc.decode(f).to_lowercase().contains(&needle_l))
+                            .unwrap_or(false),
+                    };
+                    if hit {
+                        out.push(i as u64);
+                        if out.len() >= CAP {
+                            break;
+                        }
+                    }
+                    if i % (1 << 16) == 0 && cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                *slot.lock().unwrap() = Some(out);
+                ctx.request_repaint();
+            });
+        }
     }
 
     /// 背景タスクの結果を取り込む（毎フレーム全タブで呼ぶ）。
@@ -1963,29 +2068,70 @@ impl CsvTab {
     }
 
     /// 表示するヘッダのセル（ヘッダ有: 先頭行をデコード / 無: 列1,列2…）。
-    fn header_cells(&self) -> Vec<String> {
-        let Some(idx) = &self.index else {
-            return Vec::new();
-        };
-        if self.has_header {
-            idx.parse_row_enc(0, self.delim, self.encoding)
+    /// データ表示の準備ができているか（索引 or プレビュー）。
+    fn ready(&self) -> bool {
+        self.index.is_some() || self.preview.is_some()
+    }
+
+    /// ファイル行の総数（ヘッダ込み）。プレビューはこれまで読み込めた行数。
+    fn total_lines(&self) -> u64 {
+        if let Some(pv) = &self.preview {
+            pv.lock().unwrap().lines.len() as u64
+        } else if let Some(idx) = &self.index {
+            idx.total_rows
         } else {
-            (1..=idx.column_count(self.delim))
-                .map(|i| format!("列{i}"))
-                .collect()
+            0
+        }
+    }
+
+    /// ファイル行 i の生バイト列（所有）。索引/プレビューの両方を吸収する。
+    fn line_at(&self, i: u64) -> Option<Vec<u8>> {
+        if let Some(pv) = &self.preview {
+            pv.lock().unwrap().lines.get(i as usize).cloned()
+        } else if let Some(idx) = &self.index {
+            idx.row_bytes(i).map(|b| b.to_vec())
+        } else {
+            None
+        }
+    }
+
+    /// 列数（先頭行のフィールド数）。
+    fn ncols(&self) -> usize {
+        self.line_at(0)
+            .map(|l| csvview::split_fields(&l, self.delim).len())
+            .unwrap_or(0)
+            .max(1)
+    }
+
+    fn header_cells(&self) -> Vec<String> {
+        if !self.ready() {
+            return Vec::new();
+        }
+        if self.has_header {
+            self.line_at(0)
+                .map(|l| {
+                    csvview::split_fields(&l, self.delim)
+                        .iter()
+                        .map(|f| self.encoding.decode(f))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            (1..=self.ncols()).map(|i| format!("列{i}")).collect()
         }
     }
 
     /// 表示対象の `first` 行目から `count` 行分の、画面に出すセル列を返す。
     /// ヘッダ除外・絞り込み（matches）・エンコーディングを反映する（テスト可能）。
     fn visible_rows(&self, first: u64, count: u64) -> Vec<Vec<String>> {
-        let Some(idx) = &self.index else {
+        if !self.ready() {
             return Vec::new();
-        };
-        let header_off: u64 = if self.has_header && idx.total_rows > 0 { 1 } else { 0 };
+        }
+        let total = self.total_lines();
+        let header_off: u64 = if self.has_header && total > 0 { 1 } else { 0 };
         let data_rows: u64 = match &self.matches {
             Some(m) => m.len() as u64,
-            None => idx.total_rows - header_off,
+            None => total.saturating_sub(header_off),
         };
         let mut out = Vec::new();
         for di in first..first.saturating_add(count) {
@@ -1996,7 +2142,14 @@ impl CsvTab {
                 Some(m) => m[di as usize],
                 None => header_off + di,
             };
-            out.push(idx.parse_row_enc(file_row, self.delim, self.encoding));
+            if let Some(l) = self.line_at(file_row) {
+                out.push(
+                    csvview::split_fields(&l, self.delim)
+                        .iter()
+                        .map(|f| self.encoding.decode(f))
+                        .collect(),
+                );
+            }
         }
         out
     }
@@ -2035,7 +2188,7 @@ impl CsvTab {
                         "Shift-JIS",
                     );
                 });
-            if self.index.is_some() {
+            if self.ready() {
                 ui.separator();
                 ui.label("行へ移動:");
                 let r = ui.add(
@@ -2069,7 +2222,7 @@ impl CsvTab {
         }
 
         // ── 検索 / 絞り込み行 ──
-        if self.index.is_some() {
+        if self.ready() {
             let header_names: Vec<String> = self.header_cells();
             let mut do_filter = false;
             let mut do_clear = false;
@@ -2136,45 +2289,55 @@ impl CsvTab {
             }
         }
 
+        // ローカルの索引作成中（プレビューは即表示するのでここを通らない）。
         if self.loading {
             let done = self.progress.load(Ordering::Relaxed);
-            let downloading = self.phase.load(Ordering::Relaxed) == 1;
-            // GCS は dl_total（content-length）、ローカルは total_bytes を分母に。
-            let total = if downloading || self.dl_total.load(Ordering::Relaxed) > 0 {
-                self.dl_total.load(Ordering::Relaxed)
-            } else {
-                self.total_bytes
-            };
-            let frac = if total > 0 {
-                (done as f32 / total as f32).clamp(0.0, 1.0)
+            let frac = if self.total_bytes > 0 {
+                (done as f32 / self.total_bytes as f32).clamp(0.0, 1.0)
             } else {
                 0.0
             };
-            let label = if downloading {
-                "GCS 取得中…"
-            } else {
-                "索引作成中…"
-            };
             ui.add_space(6.0);
-            let mut bar = egui::ProgressBar::new(frac)
-                .text(format!(
-                    "{label} {} / {}",
-                    human_bytes(done as f64),
-                    human_bytes(total as f64)
-                ))
-                .desired_width(f32::INFINITY);
-            if total == 0 {
-                bar = bar.animate(true); // 総量不明時はアニメーション
-            }
-            ui.add(bar);
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .text(format!(
+                        "索引作成中… {} / {}",
+                        human_bytes(done as f64),
+                        human_bytes(self.total_bytes as f64)
+                    ))
+                    .desired_width(f32::INFINITY),
+            );
             ui.ctx().request_repaint();
             return;
+        }
+        // プレビュー（GCS ストリーミング）のエラー/取得状況。
+        if let Some(pv) = &self.preview {
+            let b = pv.lock().unwrap();
+            if let Some(e) = &b.error {
+                ui.colored_label(egui::Color32::from_rgb(248, 113, 113), format!("エラー: {e}"));
+            }
+            let n = b.lines.len();
+            let complete = b.complete;
+            let capped = b.capped;
+            let read = b.bytes_read;
+            drop(b);
+            let status = if let Some(_e) = &self.err {
+                String::new()
+            } else if complete {
+                format!("{} 行（完了）", fmt_count(n))
+            } else if capped {
+                format!("{} 行（上限まで・以降は省略）", fmt_count(n))
+            } else {
+                ui.ctx().request_repaint();
+                format!("≥ {} 行 取得中… {}", fmt_count(n), human_bytes(read as f64))
+            };
+            ui.label(egui::RichText::new(status).color(MUTED).small());
         }
         if let Some(e) = &self.err {
             ui.colored_label(egui::Color32::from_rgb(248, 113, 113), format!("エラー: {e}"));
             return;
         }
-        if self.index.is_none() {
+        if !self.ready() {
             return;
         }
         ui.add_space(4.0);
@@ -2184,12 +2347,9 @@ impl CsvTab {
     /// 行インデックスで仮想化したカスタムグリッド（f32 の限界に縛られず数十億行でも可）。
     fn grid_ui(&mut self, ui: &mut egui::Ui) {
         let salt = self.title.clone();
-        let delim = self.delim;
         let has_header = self.has_header;
-        let (total, ncols) = {
-            let idx = self.index.as_ref().unwrap();
-            (idx.total_rows, idx.column_count(delim).max(1))
-        };
+        let total = self.total_lines();
+        let ncols = self.ncols();
         let header_off: u64 = if has_header && total > 0 { 1 } else { 0 };
         let matches = self.matches.clone();
         let data_rows: u64 = match &matches {
@@ -2379,7 +2539,7 @@ impl MonitorApp {
             .find(|s| !s.is_empty())
             .unwrap_or(uri.as_str())
             .to_string();
-        tab.start_gcs(uri, ctx);
+        tab.start_gcs_preview(uri, ctx);
         self.csv_tabs.push(tab);
         self.csv_active = self.csv_tabs.len() - 1;
     }

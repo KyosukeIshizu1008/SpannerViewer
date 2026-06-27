@@ -114,24 +114,23 @@ impl CsvIndex {
     }
 
     /// 行 i を区切り文字で分割して文字列ベクタにする（引用符対応・UTF-8）。
+    /// アプリ側は split_fields + line_at を直接使うため、テスト用 API。
+    #[cfg(test)]
     pub fn parse_row(&self, i: u64, delim: u8) -> Vec<String> {
         self.parse_row_enc(i, delim, Encoding::Utf8)
     }
 
-    /// 行 i を分割し、各フィールドを指定エンコーディングでデコードする。
-    /// 構造文字（区切り/改行/"）はすべて 0x40 未満なので、Shift-JIS のバイト列でも
-    /// バイト単位で安全に分割できる（後続バイトと衝突しない）。
+    /// 行 i を分割し、各フィールドを指定エンコーディングでデコードする（テスト用）。
+    #[cfg(test)]
     pub fn parse_row_enc(&self, i: u64, delim: u8, enc: Encoding) -> Vec<String> {
         match self.row_bytes(i) {
-            Some(b) => split_fields(b, delim)
-                .iter()
-                .map(|f| enc.decode(f))
-                .collect(),
+            Some(b) => split_fields(b, delim).iter().map(|f| enc.decode(f)).collect(),
             None => Vec::new(),
         }
     }
 
-    /// 列数の推定（先頭行のフィールド数）。
+    /// 列数の推定（先頭行のフィールド数）（テスト用）。
+    #[cfg(test)]
     pub fn column_count(&self, delim: u8) -> usize {
         self.parse_row(0, delim).len()
     }
