@@ -7992,22 +7992,16 @@ fn install_japanese_font(ctx: &egui::Context) {
         "/System/Library/Fonts/SFNSMono.ttf",
     ];
 
-    // Proportional の先頭に [latin, jp] を差し込む（先頭優先）。
+    // 欧文・和文ともヒラギノ角ゴシックで統一する。SF Pro と 2 フォント混在にすると
+    // 欧文が和文より小さく/細く見えて「英語と漢字の高さが違う」不揃いになるため、
+    // 設計上調和した単一フォントにする。SF はヒラギノに無いグリフ用のフォールバック。
+    // 単一フォント前提なので欧文/和文の相互ベースラインずれは原理的に発生しない。
+    // y_offset はボタン等での上下中央寄せの微調整（render_font_alignment_check で確認）。
+    const PROP_Y_OFFSET: f32 = 0.06;
     let mut front: Vec<String> = Vec::new();
-    if let Some(b) = latin.iter().find_map(|p| std::fs::read(p).ok()) {
-        // SF は行間が大きくグリフが行の上側に寄るため、少し下げて上下中央に補正する。
-        let data = egui::FontData::from_owned(b).tweak(egui::FontTweak {
-            y_offset_factor: 0.15,
-            ..Default::default()
-        });
-        fonts.font_data.insert("latin".to_owned(), Arc::new(data));
-        front.push("latin".to_owned());
-    }
     let have_jp = if let Some(b) = jp.iter().find_map(|p| std::fs::read(p).ok()) {
-        // ヒラギノは SF より下に沈むため、欧文（SF=0.15）のベースラインに合わせて
-        // 和文の下げ幅を控えめにする。0.08 が欧文と最も揃う（render_font_alignment_check で実測）。
         let data = egui::FontData::from_owned(b).tweak(egui::FontTweak {
-            y_offset_factor: 0.08,
+            y_offset_factor: PROP_Y_OFFSET,
             ..Default::default()
         });
         fonts.font_data.insert("jp".to_owned(), Arc::new(data));
@@ -8016,6 +8010,14 @@ fn install_japanese_font(ctx: &egui::Context) {
     } else {
         false
     };
+    if let Some(b) = latin.iter().find_map(|p| std::fs::read(p).ok()) {
+        let data = egui::FontData::from_owned(b).tweak(egui::FontTweak {
+            y_offset_factor: PROP_Y_OFFSET,
+            ..Default::default()
+        });
+        fonts.font_data.insert("latin".to_owned(), Arc::new(data));
+        front.push("latin".to_owned()); // ヒラギノの後ろ＝フォールバック
+    }
     let have_mono = if let Some(b) = mono.iter().find_map(|p| std::fs::read(p).ok()) {
         fonts
             .font_data
@@ -8949,6 +8951,35 @@ mod tests {
         match h.render() {
             Ok(img) => img.save("target/ui_shots/font_check.png").unwrap(),
             Err(e) => eprintln!("[render] font_check 失敗: {e}"),
+        }
+
+        // 比較用: ヒラギノ単一フォント（欧文も和文も同一フォント＝設計上の調和した高さ）。
+        let mut h2 = Harness::builder()
+            .with_size(egui::vec2(720.0, 460.0))
+            .build_eframe(|cc| {
+                use std::sync::Arc;
+                let mut fonts = egui::FontDefinitions::default();
+                let jp = std::fs::read("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc").unwrap();
+                fonts.font_data.insert(
+                    "hira".into(),
+                    Arc::new(egui::FontData::from_owned(jp).tweak(egui::FontTweak {
+                        y_offset_factor: 0.05,
+                        ..Default::default()
+                    })),
+                );
+                fonts
+                    .families
+                    .get_mut(&egui::FontFamily::Proportional)
+                    .unwrap()
+                    .insert(0, "hira".into());
+                cc.egui_ctx.set_fonts(fonts);
+                setup_style(&cc.egui_ctx);
+                FontApp
+            });
+        h2.run();
+        match h2.render() {
+            Ok(img) => img.save("target/ui_shots/font_hiragino.png").unwrap(),
+            Err(e) => eprintln!("[render] font_hiragino 失敗: {e}"),
         }
     }
 
