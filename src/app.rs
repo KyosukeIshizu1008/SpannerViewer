@@ -1627,7 +1627,7 @@ impl eframe::App for MonitorApp {
                             } else {
                                 self.pick_project.clone()
                             };
-                            ui.label(egui::RichText::new(proj_text).color(MUTED).small())
+                            ui.label(egui::RichText::new(proj_text).color(MUTED))
                                 .on_hover_text(
                                     "プロジェクトの変更は「設定 → 接続先を選択（ADC）」から",
                                 );
@@ -1641,7 +1641,7 @@ impl eframe::App for MonitorApp {
                             } else {
                                 MUTED
                             };
-                            let resp = ui.label(egui::RichText::new(label).color(color).small());
+                            let resp = ui.label(egui::RichText::new(label).color(color));
                             if emu {
                                 resp.on_hover_text(
                                     "エミュレータ接続中。プロジェクト/インスタンス/DB の一覧取得には\
