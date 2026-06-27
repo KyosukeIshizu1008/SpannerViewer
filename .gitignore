@@ -2,3 +2,5 @@
 .env
 schema_layout.json
 .claude/worktrees/
+# アイコン生成の中間ファイル (.icns は assets/ にコミット)
+assets/*.iconset/

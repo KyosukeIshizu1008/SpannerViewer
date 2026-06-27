@@ -27,6 +27,23 @@ export POLL_INTERVAL_SECS=30   # 省略時 30。Monitoring の最小粒度は約
 cargo run --release
 ```
 
+## 配布 (.dmg のビルド) — macOS
+
+署名なしの配布用ディスクイメージを作成します（標準の `hdiutil` のみ使用）。
+
+```sh
+scripts/build-dmg.sh
+# => target/dist/Spanner Viewer <version>.dmg
+```
+
+`.app` バンドルにリリースビルドのバイナリとアイコンを同梱し、ドラッグ&ドロップ用に
+`/Applications` へのリンクを並べた DMG を生成します。アイコン (`assets/AppIcon.icns`)
+は `scripts/make-icon.py` で生成されます（リポジトリにコミット済みなので python3 が
+無くても DMG は作れます）。
+
+> 署名していないため、受け取った側は初回のみ Finder でアプリを右クリック →「開く」で
+> Gatekeeper の警告を許可してください。
+
 ## モックモード（実 Spanner / 認証 不要）
 
 UI・グラフの開発やデモ用。合成データ（CPU は波形＋擬似ノイズ、ストレージは漸増）を流します。
