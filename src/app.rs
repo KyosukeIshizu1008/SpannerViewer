@@ -117,7 +117,7 @@ enum JobStatus {
     Cancelled,
 }
 
-/// 順次キューの 1 ジョブ。複数テーブルを並べて投入できる。
+/// インポートキューの 1 ジョブ。別テーブルは並列・同一テーブルは直列で実行する。
 struct ImportJob {
     /// 正規リクエスト（送信時はこれを clone する。cancel は送信クローンと共有）。
     req: query::ImportRequest,
@@ -481,8 +481,10 @@ pub struct MonitorApp {
     import_res_rx: Receiver<query::ImportProgress>,
     import_dialog: Option<ImportDialog>,
     import_pending: bool,
-    /// 順次インポートキュー（複数テーブルを順番に処理）。
+    /// インポートキュー（別テーブルは並列・同一テーブルは直列で処理）。
     import_jobs: Vec<ImportJob>,
+    /// 次に発番するジョブ id（進捗/完了の紐付けに使う。1 から増やす）。
+    import_next_id: u64,
     /// 証跡レポートの保存先（スクショ受信待ち。受信したら PNG を書いて Finder で開く）。
     pending_report_dir: Option<std::path::PathBuf>,
     /// スクショ応答を待つ残りフレーム数。0 で諦めて pending を解放する
@@ -710,6 +712,7 @@ impl MonitorApp {
             import_dialog: None,
             import_pending: false,
             import_jobs: Vec::new(),
+            import_next_id: 1,
             pending_report_dir: None,
             pending_report_wait: 0,
             pending_bulk: None,
@@ -1132,20 +1135,16 @@ impl MonitorApp {
             self.schema_graph = Some(g);
         }
         while let Ok(ev) = self.import_res_rx.try_recv() {
-            // 背景は逐次処理なので、進捗/完了は「実行中ジョブ」に属する。
-            let running = self
-                .import_jobs
-                .iter_mut()
-                .find(|j| j.status == JobStatus::Running);
+            // ジョブは並列実行されうるので、進捗/完了は id で正しいジョブ行に紐付ける。
             match ev {
                 query::ImportProgress::Progress {
+                    id,
                     written,
                     bytes_done,
                     bytes_total,
-                    ..
                 } => {
                     let frac = progress_fraction(bytes_done, bytes_total);
-                    if let Some(j) = running {
+                    if let Some(j) = self.import_jobs.iter_mut().find(|j| j.req.id == id) {
                         j.progress = Some(ImportProg {
                             frac,
                             written,
@@ -1156,7 +1155,7 @@ impl MonitorApp {
                 }
                 query::ImportProgress::Done(out) => {
                     let msg = format_import_result(&out);
-                    if let Some(j) = running {
+                    if let Some(j) = self.import_jobs.iter_mut().find(|j| j.req.id == out.id) {
                         j.status = if out.cancelled {
                             JobStatus::Cancelled
                         } else if out.error.is_some() {
@@ -1169,7 +1168,7 @@ impl MonitorApp {
                         j.outcome = Some(out); // レポート用に件数を保持
                     }
                     self.copy_note = Some(msg);
-                    // 次のジョブへ。
+                    // 空いた枠で次の待機ジョブを動かす。
                     self.pump_import_queue();
                 }
             }
@@ -3608,6 +3607,7 @@ impl MonitorApp {
         }
         let null_token = (!d.null_token.is_empty()).then(|| d.null_token.clone());
         Ok(query::ImportRequest {
+            id: 0,
             table: d.table.clone(),
             columns,
             source: d.source.clone(),
@@ -3675,7 +3675,10 @@ impl MonitorApp {
     }
 
     /// リクエストを 1 ジョブとしてキューに積み、キューを進める。
-    fn push_job(&mut self, req: query::ImportRequest, source_name: String) {
+    fn push_job(&mut self, mut req: query::ImportRequest, source_name: String) {
+        // 一意な id を発番（進捗/完了の紐付けに使う）。
+        req.id = self.import_next_id;
+        self.import_next_id += 1;
         self.import_jobs.push(ImportJob {
             req,
             source_name,
@@ -3689,39 +3692,53 @@ impl MonitorApp {
         self.pump_import_queue();
     }
 
-    /// キューを進める: 実行中が無ければ先頭の待機ジョブを背景へ送る。
+    /// 同時に走らせるインポートジョブ数の上限（リソース保護）。
+    const MAX_PARALLEL_IMPORTS: usize = 3;
+
+    /// キューを進める: 別テーブルなら並列、同一テーブルは直列で待機ジョブを送る。
+    /// 同時実行は MAX_PARALLEL_IMPORTS まで。
     fn pump_import_queue(&mut self) {
-        let any_running = self
+        loop {
+            // 現在実行中のジョブ数と、実行中テーブルの集合を集める。
+            let running_tables: std::collections::HashSet<String> = self
+                .import_jobs
+                .iter()
+                .filter(|j| j.status == JobStatus::Running)
+                .map(|j| j.req.table.clone())
+                .collect();
+            if running_tables.len() >= Self::MAX_PARALLEL_IMPORTS {
+                break;
+            }
+            // 次に送れる待機ジョブ: 同一テーブルが実行中でないもの（同一テーブルは直列化）。
+            let max = Self::MAX_PARALLEL_IMPORTS;
+            let next = self.import_jobs.iter_mut().find(|j| {
+                j.status == JobStatus::Queued
+                    && !j.sent
+                    && can_dispatch(&running_tables, &j.req.table, max)
+            });
+            let Some(job) = next else {
+                break;
+            };
+            // cancel は送信クローンと共有されるので、後から job.req.cancel で中断できる。
+            if self.import_req_tx.send(job.req.clone()).is_ok() {
+                job.sent = true;
+                job.status = JobStatus::Running;
+                job.started = Some(std::time::Instant::now());
+                job.progress = Some(ImportProg {
+                    frac: Some(0.0),
+                    written: 0,
+                    bytes_done: 0,
+                    bytes_total: None,
+                });
+            } else {
+                job.status = JobStatus::Failed;
+                job.result = Some(WORKER_GONE.into());
+            }
+        }
+        self.import_pending = self
             .import_jobs
             .iter()
-            .any(|j| j.status == JobStatus::Running);
-        if any_running {
-            return;
-        }
-        let Some(job) = self
-            .import_jobs
-            .iter_mut()
-            .find(|j| j.status == JobStatus::Queued && !j.sent)
-        else {
-            self.import_pending = false;
-            return;
-        };
-        // cancel は送信クローンと共有されるので、後から job.req.cancel で中断できる。
-        if self.import_req_tx.send(job.req.clone()).is_ok() {
-            job.sent = true;
-            job.status = JobStatus::Running;
-            job.started = Some(std::time::Instant::now());
-            job.progress = Some(ImportProg {
-                frac: Some(0.0),
-                written: 0,
-                bytes_done: 0,
-                bytes_total: None,
-            });
-            self.import_pending = true;
-        } else {
-            job.status = JobStatus::Failed;
-            job.result = Some(WORKER_GONE.into());
-        }
+            .any(|j| j.status == JobStatus::Running || j.status == JobStatus::Queued);
     }
 
     /// GCS の URI を入力して CSV を取得するダイアログ。
@@ -3947,12 +3964,16 @@ impl MonitorApp {
                 );
             }
 
-            // ── ジョブ一覧（順次キュー） ──
+            // ── ジョブ一覧（別テーブルは並列・同一テーブルは直列） ──
             if !self.import_jobs.is_empty() {
                 ui.add_space(16.0);
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("インポートジョブ").strong());
+                    ui.label(egui::RichText::new("インポートジョブ").strong())
+                        .on_hover_text(
+                            "別テーブルへのジョブは並列実行（最大3）。\
+                             同一テーブルへのジョブは順番に直列実行します。",
+                        );
                     if ui
                         .button("証跡レポート出力")
                         .on_hover_text(
@@ -7870,6 +7891,17 @@ fn progress_fraction(bytes_done: u64, bytes_total: Option<u64>) -> Option<f32> {
         .map(|t| (bytes_done as f32 / t as f32).clamp(0.0, 1.0))
 }
 
+/// 並列インポートのディスパッチ判定。実行中テーブル集合 `running` に対し、
+/// `table` を新たに動かしてよいか。別テーブルなら並列可・同一テーブルは直列・
+/// 同時実行は `max` まで。
+fn can_dispatch(
+    running: &std::collections::HashSet<String>,
+    table: &str,
+    max: usize,
+) -> bool {
+    running.len() < max && !running.contains(table)
+}
+
 /// 取込中の総件数を推定する（書込済 行数 × 全体バイト / 読込済バイト）。
 /// バイト情報が無い / まだ読めていないときは None。推定は最低でも written 以上にする。
 fn import_total_estimate(p: &ImportProg) -> Option<usize> {
@@ -8620,6 +8652,7 @@ mod tests {
         let path = std::env::temp_dir().join("spanner_viewer_e2e.csv");
         std::fs::write(&path, csv).unwrap();
         let req = query::ImportRequest {
+            id: 0,
             table: table.into(),
             columns: vec![
                 query::ImportColumn { name: "Id".into(), ty: "INT64".into(), src_index: 0 },
@@ -8780,6 +8813,7 @@ mod tests {
             app.section = Section::Spanner;
             app.view = View::Import;
             let req = query::ImportRequest {
+                id: 0,
                 table: "Users".into(),
                 columns: vec![],
                 source: query::ImportSource::File("/tmp/users.csv".into()),
@@ -9211,6 +9245,26 @@ mod tests {
         assert_eq!(fmt_count(1_234_567), "1,234,567");
     }
 
+    /// 並列ディスパッチ判定: 別テーブルは並列・同一テーブルは直列・上限まで。
+    #[test]
+    fn can_dispatch_rules() {
+        use std::collections::HashSet;
+        let mut running: HashSet<String> = HashSet::new();
+        // 何も走っていなければ送れる。
+        assert!(can_dispatch(&running, "A", 3));
+        running.insert("A".into());
+        // 別テーブルは並列で送れる。
+        assert!(can_dispatch(&running, "B", 3));
+        // 同一テーブルは直列（送れない）。
+        assert!(!can_dispatch(&running, "A", 3));
+        running.insert("B".into());
+        running.insert("C".into());
+        // 上限(3)に達したら別テーブルでも送れない。
+        assert!(!can_dispatch(&running, "D", 3));
+        // 上限が大きければ送れる。
+        assert!(can_dispatch(&running, "D", 5));
+    }
+
     /// 総件数の推定（書込済 × 全体/読込済）。情報不足なら None。
     #[test]
     fn import_total_estimate_cases() {
@@ -9308,6 +9362,7 @@ mod tests {
         ) -> ImportJob {
             ImportJob {
                 req: query::ImportRequest {
+                    id: 0,
                     table: table.into(),
                     columns: vec![],
                     source: query::ImportSource::File("/tmp/x.csv".into()),

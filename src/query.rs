@@ -188,6 +188,8 @@ impl Encoding {
 /// 行データは持たず、`source` から逐次読み出す（ローカルに全行を溜めない）。
 #[derive(Clone, Debug)]
 pub struct ImportRequest {
+    /// ジョブ識別子（UI が進捗/完了を正しいジョブ行へ紐付けるために使う）。
+    pub id: u64,
     pub table: String,
     /// 書き込む列（各列が対応する CSV 列インデックスを持つ）。
     pub columns: Vec<ImportColumn>,
@@ -217,6 +219,8 @@ pub struct ImportRequest {
 /// インポート結果（UI へ返す）。
 #[derive(Clone, Debug, Default)]
 pub struct ImportOutcome {
+    /// 対応するジョブ識別子（UI がジョブ行へ紐付ける）。
+    pub id: u64,
     pub table: String,
     /// 書き込めた行数（ドライランでは「書き込める」と判定した行数）。
     pub written: usize,
@@ -248,6 +252,8 @@ pub enum ImportProgress {
     /// バウンドチャネルにより読み出しは書き込みに追従するので、
     /// bytes ベースの割合は実際の取込進捗とほぼ一致する。
     Progress {
+        /// 対応するジョブ識別子。
+        id: u64,
         /// これまでに書き込めた行数。
         written: usize,
         /// 読み出した累積バイト数。
@@ -556,14 +562,16 @@ pub async fn import_loop(
     });
     let mock = cfg.mock;
 
+    // 各要求は独立タスクで実行し、await で待たずに次を受け付ける。これにより
+    // 別テーブルへのジョブを並列実行できる（同一テーブルの直列化は UI 側の投入で担保）。
+    // 進捗/完了は req.id を載せて返すので、UI は正しいジョブ行へ紐付けられる。
     while let Some(req) = req_rx.recv().await {
         let res_tx_task = res_tx.clone();
         let res_tx_err = res_tx.clone();
+        let id = req.id;
         let table = req.table.clone();
 
-        // 各要求は独立タスクで実行する。万一パニックしてもループ自体は生き残り、
-        // 次のインポート要求を受け付けられるようにする。
-        let handle = tokio::spawn(async move {
+        let inner = tokio::spawn(async move {
             let start = Instant::now();
             let env = current_spanner_env();
             let mut out = if !mock && !env.configured() {
@@ -576,18 +584,24 @@ pub async fn import_loop(
                 // 途中経過は res_tx_task に Progress として流す。
                 run_streaming_import(&env, &req, mock, &res_tx_task).await
             };
+            out.id = req.id;
             out.table = req.table.clone();
             out.elapsed_ms = start.elapsed().as_millis();
             let _ = res_tx_task.send(ImportProgress::Done(out));
         });
 
-        if let Err(join_err) = handle.await {
-            let _ = res_tx_err.send(ImportProgress::Done(ImportOutcome {
-                table,
-                error: Some(panic_message(join_err)),
-                ..Default::default()
-            }));
-        }
+        // パニック時も必ず Done を返してジョブが Running のまま残らないようにする。
+        // 監視タスクで join するので、本ループは次の要求をすぐ受け付けられる。
+        tokio::spawn(async move {
+            if let Err(join_err) = inner.await {
+                let _ = res_tx_err.send(ImportProgress::Done(ImportOutcome {
+                    id,
+                    table,
+                    error: Some(panic_message(join_err)),
+                    ..Default::default()
+                }));
+            }
+        });
     }
 }
 
@@ -1756,6 +1770,7 @@ async fn run_streaming_import(
                             abort.store(true, Ordering::Relaxed);
                         }
                         let _ = progress.send(ImportProgress::Progress {
+                            id: req.id,
                             written: written.load(Ordering::Relaxed),
                             bytes_done: bytes_done.load(Ordering::Relaxed),
                             bytes_total,
@@ -1797,6 +1812,7 @@ async fn run_streaming_import(
     // 書き込みに追従するため実際の取込進捗とほぼ一致する。
     let emit = || {
         let _ = progress.send(ImportProgress::Progress {
+            id: req.id,
             written: written.load(Ordering::Relaxed),
             bytes_done: bytes_done.load(Ordering::Relaxed),
             bytes_total,
@@ -1961,6 +1977,7 @@ async fn dry_run_import(
 
     let emit = |valid: usize, bytes_done: u64| {
         let _ = progress.send(ImportProgress::Progress {
+            id: req.id,
             written: valid,
             bytes_done,
             bytes_total,
@@ -3193,6 +3210,7 @@ mod tests {
         use google_cloud_googleapis::spanner::v1::mutation::Operation;
         // テーブル列順 [Name, Id] に対し、CSV は [Id, Name] 並び（src_index で逆引き）。
         let req = ImportRequest {
+            id: 0,
             table: "T".into(),
             columns: vec![
                 ImportColumn { name: "Name".into(), ty: "STRING(MAX)".into(), src_index: 1 },
@@ -3273,6 +3291,7 @@ mod tests {
     #[test]
     fn import_signature_distinguishes() {
         let base = ImportRequest {
+            id: 0,
             table: "T".into(),
             columns: cols(&[("Id", "INT64")]),
             source: ImportSource::Gcs("gs://b/o".into()),
@@ -3307,6 +3326,7 @@ mod tests {
         let csv = "Id,Name\n1,a\n2,b\nx,c\n";
         let path = write_temp_csv("dryrun", csv);
         let req = ImportRequest {
+            id: 0,
             table: "T".into(),
             columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)")]),
             source: ImportSource::File(path),
@@ -3685,6 +3705,7 @@ mod tests {
                    2,bob,2.0,false,hi\n";
         let path = write_temp_csv("typed", csv);
         let req = ImportRequest {
+            id: 0,
             table: "ImportTest".into(),
             columns: cols(&[
                 ("Id", "INT64"),
@@ -3729,6 +3750,7 @@ mod tests {
         let csv2 = "Id,Name\n1,alice2\n";
         let path2 = write_temp_csv("upsert", csv2);
         let upsert = ImportRequest {
+            id: 0,
             table: "ImportTest".into(),
             columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)")]),
             source: ImportSource::File(path2),
@@ -3792,6 +3814,7 @@ mod tests {
                    4,\"multi\nline\",last\n";
         let path = write_temp_csv("messy_quoted", csv);
         let req = ImportRequest {
+            id: 0,
             table: "ImportTest".into(),
             columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)"), ("Note", "STRING(MAX)")]),
             source: ImportSource::File(path),
@@ -3846,6 +3869,7 @@ mod tests {
                     3,carol,3.0,true,x\n";
         let seed_path = write_temp_csv("verify_seed", seed);
         let import = ImportRequest {
+            id: 0,
             table: "ImportTest".into(),
             columns: cols(&[
                 ("Id", "INT64"),
@@ -3929,6 +3953,7 @@ mod tests {
         let csv = "alice,1\nbob,2\n";
         let path = write_temp_csv("reorder", csv);
         let req = ImportRequest {
+            id: 0,
             table: table.into(),
             columns: vec![
                 ImportColumn { name: "Id".into(), ty: "INT64".into(), src_index: 1 },
@@ -3976,6 +4001,7 @@ mod tests {
         let run = |csv: &str, tag: &str| {
             let path = write_temp_csv(tag, csv);
             ImportRequest {
+                id: 0,
                 table: table.into(),
                 columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)")]),
                 source: ImportSource::File(path),
@@ -4026,6 +4052,7 @@ mod tests {
         let csv = "Id,Name,Score\n1,alice,9.5\n2\n";
         let path = write_temp_csv("mismatch_strict", csv);
         let req = ImportRequest {
+            id: 0,
             table: table.into(),
             columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)"), ("Score", "FLOAT64")]),
             source: ImportSource::File(path),
@@ -4072,6 +4099,7 @@ mod tests {
         let csv = "Id,Name,Score\n1,alice,9.5\n2\n3,carol,7.0,EXTRA\n4,dave,8.0\n";
         let path = write_temp_csv("mismatch_skip", csv);
         let req = ImportRequest {
+            id: 0,
             table: table.into(),
             columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)"), ("Score", "FLOAT64")]),
             source: ImportSource::File(path),
@@ -4113,6 +4141,7 @@ mod tests {
         let csv = "Id,Note\n1,\n";
         let path = write_temp_csv("emptystr", csv);
         let req = ImportRequest {
+            id: 0,
             table: table.into(),
             columns: cols(&[("Id", "INT64"), ("Note", "STRING(MAX)")]),
             source: ImportSource::File(path),
@@ -4156,6 +4185,7 @@ mod tests {
         // 先に Id=1 を入れておく。
         let p0 = write_temp_csv("partial_pre", "Id,Name\n1,pre\n");
         let seed = ImportRequest {
+            id: 0,
             table: table.into(),
             columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)")]),
             source: ImportSource::File(p0),
@@ -4177,6 +4207,7 @@ mod tests {
         let csv = "Id,Name\n1,dup\n2,ok\n";
         let path = write_temp_csv("partial", csv);
         let req = ImportRequest {
+            id: 0,
             table: table.into(),
             columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)")]),
             source: ImportSource::File(path),
@@ -4227,6 +4258,7 @@ mod tests {
         }
         let path = write_temp_csv("multi", &csv);
         let req = ImportRequest {
+            id: 0,
             table: table.into(),
             columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)")]),
             source: ImportSource::File(path),
@@ -4281,6 +4313,7 @@ mod tests {
         let csv = "Id,Name\n1,a\n2,b\n3,c\n";
         let path = write_temp_csv("resume", csv);
         let req = ImportRequest {
+            id: 0,
             table: table.into(),
             columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)")]),
             source: ImportSource::File(path),
