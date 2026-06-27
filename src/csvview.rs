@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 
+use crate::query::Encoding;
+
 /// 疎な行オフセット索引つきの CSV。
 pub struct CsvIndex {
     mmap: Mmap,
@@ -111,10 +113,20 @@ impl CsvIndex {
         Some(&data[off..e])
     }
 
-    /// 行 i を区切り文字で分割して文字列ベクタにする（引用符対応）。
+    /// 行 i を区切り文字で分割して文字列ベクタにする（引用符対応・UTF-8）。
     pub fn parse_row(&self, i: u64, delim: u8) -> Vec<String> {
+        self.parse_row_enc(i, delim, Encoding::Utf8)
+    }
+
+    /// 行 i を分割し、各フィールドを指定エンコーディングでデコードする。
+    /// 構造文字（区切り/改行/"）はすべて 0x40 未満なので、Shift-JIS のバイト列でも
+    /// バイト単位で安全に分割できる（後続バイトと衝突しない）。
+    pub fn parse_row_enc(&self, i: u64, delim: u8, enc: Encoding) -> Vec<String> {
         match self.row_bytes(i) {
-            Some(b) => split_csv_line(b, delim),
+            Some(b) => split_fields(b, delim)
+                .iter()
+                .map(|f| enc.decode(f))
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -135,12 +147,13 @@ impl CsvIndex {
         col: Option<usize>,
         delim: u8,
         has_header: bool,
+        enc: Encoding,
         cancel: &AtomicBool,
         progress: &AtomicU64,
         cap: usize,
     ) -> Vec<u64> {
         let data: &[u8] = &self.mmap;
-        let needle_l = needle.to_ascii_lowercase();
+        let needle_l = needle.to_lowercase();
         let nl_bytes = needle_l.as_bytes();
         let mut out: Vec<u64> = Vec::new();
         let mut line: u64 = 0;
@@ -151,11 +164,14 @@ impl CsvIndex {
             if has_header && line_idx == 0 {
                 return;
             }
-            let hit = match col {
-                None => contains_ascii_ci(bytes, nl_bytes),
-                Some(c) => split_csv_line(bytes, delim)
+            let hit = match (col, enc) {
+                // UTF-8 全列は生バイトで高速一致（ASCII大小無視）。
+                (None, Encoding::Utf8) => contains_ascii_ci(bytes, nl_bytes),
+                // それ以外（列指定 or 非UTF-8）はデコードしてから一致。
+                (None, _) => enc.decode(bytes).to_lowercase().contains(&needle_l),
+                (Some(c), _) => split_fields(bytes, delim)
                     .get(c)
-                    .map(|s| contains_ascii_ci(s.as_bytes(), nl_bytes))
+                    .map(|f| enc.decode(f).to_lowercase().contains(&needle_l))
                     .unwrap_or(false),
             };
             if hit {
@@ -210,8 +226,9 @@ fn contains_ascii_ci(hay: &[u8], needle_lower: &[u8]) -> bool {
     false
 }
 
-/// CSV 1 行を区切り文字で分割する（RFC4180 風の引用符対応）。1 行ぶんなので軽量。
-pub fn split_csv_line(b: &[u8], delim: u8) -> Vec<String> {
+/// CSV 1 行を区切り文字で分割し、各フィールドを生バイトで返す（RFC4180 風の
+/// 引用符対応）。エンコーディングに依存しない（デコードは呼び出し側）。
+pub fn split_fields(b: &[u8], delim: u8) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut field: Vec<u8> = Vec::new();
     let mut in_q = false;
@@ -235,17 +252,17 @@ pub fn split_csv_line(b: &[u8], delim: u8) -> Vec<String> {
             in_q = true;
             k += 1;
         } else if c == delim {
-            out.push(String::from_utf8_lossy(&field).into_owned());
-            field.clear();
+            out.push(std::mem::take(&mut field));
             k += 1;
         } else {
             field.push(c);
             k += 1;
         }
     }
-    out.push(String::from_utf8_lossy(&field).into_owned());
+    out.push(field);
     out
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -259,12 +276,46 @@ mod tests {
 
     #[test]
     fn split_quoted() {
-        assert_eq!(split_csv_line(b"a,b,c", b','), vec!["a", "b", "c"]);
+        let f = |b: &[u8], d: u8| -> Vec<String> {
+            split_fields(b, d)
+                .iter()
+                .map(|x| String::from_utf8_lossy(x).into_owned())
+                .collect()
+        };
+        assert_eq!(f(b"a,b,c", b','), vec!["a", "b", "c"]);
+        assert_eq!(f(b"\"a,1\",b,\"c\"\"x\"", b','), vec!["a,1", "b", "c\"x"]);
+        assert_eq!(f(b"x;y;z", b';'), vec!["x", "y", "z"]);
+    }
+
+    /// Shift-JIS のバイト列でも、区切りで正しく分割しデコードできる。
+    #[test]
+    fn shift_jis_decode() {
+        // "名前,値\nあ,1\n" を Shift-JIS で書き出す。
+        let (sjis, _, _) = encoding_rs::SHIFT_JIS.encode("名前,値\nあ,1\n");
+        let p = write_tmp("sjis.csv", &sjis);
+        let idx = CsvIndex::build(&p, Arc::new(AtomicU64::new(0))).unwrap();
+        assert_eq!(idx.total_rows, 2);
+        // UTF-8 として読むと壊れるが、Shift-JIS 指定で正しく読める。
         assert_eq!(
-            split_csv_line(b"\"a,1\",b,\"c\"\"x\"", b','),
-            vec!["a,1", "b", "c\"x"]
+            idx.parse_row_enc(0, b',', Encoding::ShiftJis),
+            vec!["名前", "値"]
         );
-        assert_eq!(split_csv_line(b"x;y;z", b';'), vec!["x", "y", "z"]);
+        assert_eq!(
+            idx.parse_row_enc(1, b',', Encoding::ShiftJis),
+            vec!["あ", "1"]
+        );
+        // 絞り込み（Shift-JIS、日本語）も一致する。
+        let hits = idx.scan_filter(
+            "あ",
+            None,
+            b',',
+            true,
+            Encoding::ShiftJis,
+            &AtomicBool::new(false),
+            &AtomicU64::new(0),
+            100,
+        );
+        assert_eq!(hits, vec![1]);
     }
 
     #[test]
@@ -306,16 +357,16 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let prog = AtomicU64::new(0);
         // 全列・大小無視で "tokyo" → 行1(Tokyo) と 行3(TOKYO)、ヘッダ除外。
-        let hits = idx.scan_filter("tokyo", None, b',', true, &cancel, &prog, 1000);
+        let hits = idx.scan_filter("tokyo", None, b',', true, Encoding::Utf8, &cancel, &prog, 1000);
         assert_eq!(hits, vec![1, 3]);
         // name 列(=1)で "carol"
-        let hits = idx.scan_filter("carol", Some(1), b',', true, &cancel, &prog, 1000);
+        let hits = idx.scan_filter("carol", Some(1), b',', true, Encoding::Utf8, &cancel, &prog, 1000);
         assert_eq!(hits, vec![3]);
         // city 列(=2)で "osaka"
-        let hits = idx.scan_filter("osaka", Some(2), b',', true, &cancel, &prog, 1000);
+        let hits = idx.scan_filter("osaka", Some(2), b',', true, Encoding::Utf8, &cancel, &prog, 1000);
         assert_eq!(hits, vec![2]);
         // ヘッダ含めない: "name" は本文に無いので 0 件
-        let hits = idx.scan_filter("name", None, b',', true, &cancel, &prog, 1000);
+        let hits = idx.scan_filter("name", None, b',', true, Encoding::Utf8, &cancel, &prog, 1000);
         assert!(hits.is_empty());
     }
 
@@ -332,6 +383,7 @@ mod tests {
             None,
             b',',
             false,
+            Encoding::Utf8,
             &AtomicBool::new(false),
             &AtomicU64::new(0),
             10,

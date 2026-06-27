@@ -1808,6 +1808,7 @@ struct CsvTab {
     first_row: u64,
     col_off: f32,
     delim: u8,
+    encoding: query::Encoding,
     has_header: bool,
     goto: String,
     filter: String,
@@ -1840,6 +1841,7 @@ impl CsvTab {
             first_row: 0,
             col_off: 0.0,
             delim: b',',
+            encoding: query::Encoding::Utf8,
             has_header: true,
             goto: String::new(),
             filter: String::new(),
@@ -1879,6 +1881,7 @@ impl CsvTab {
         let col = self.filter_col;
         let delim = self.delim;
         let has_header = self.has_header;
+        let enc = self.encoding;
         self.filtering = true;
         self.filter_cancel.store(false, Ordering::Relaxed);
         self.filter_progress.store(0, Ordering::Relaxed);
@@ -1889,7 +1892,7 @@ impl CsvTab {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let cap = 5_000_000; // 一致件数の上限（メモリ保護）
-            let v = idx.scan_filter(&needle, col, delim, has_header, &cancel, &prog, cap);
+            let v = idx.scan_filter(&needle, col, delim, has_header, enc, &cancel, &prog, cap);
             *slot.lock().unwrap() = Some(v);
             ctx.request_repaint();
         });
@@ -1915,6 +1918,45 @@ impl CsvTab {
         }
     }
 
+    /// 表示するヘッダのセル（ヘッダ有: 先頭行をデコード / 無: 列1,列2…）。
+    fn header_cells(&self) -> Vec<String> {
+        let Some(idx) = &self.index else {
+            return Vec::new();
+        };
+        if self.has_header {
+            idx.parse_row_enc(0, self.delim, self.encoding)
+        } else {
+            (1..=idx.column_count(self.delim))
+                .map(|i| format!("列{i}"))
+                .collect()
+        }
+    }
+
+    /// 表示対象の `first` 行目から `count` 行分の、画面に出すセル列を返す。
+    /// ヘッダ除外・絞り込み（matches）・エンコーディングを反映する（テスト可能）。
+    fn visible_rows(&self, first: u64, count: u64) -> Vec<Vec<String>> {
+        let Some(idx) = &self.index else {
+            return Vec::new();
+        };
+        let header_off: u64 = if self.has_header && idx.total_rows > 0 { 1 } else { 0 };
+        let data_rows: u64 = match &self.matches {
+            Some(m) => m.len() as u64,
+            None => idx.total_rows - header_off,
+        };
+        let mut out = Vec::new();
+        for di in first..first.saturating_add(count) {
+            if di >= data_rows {
+                break;
+            }
+            let file_row = match &self.matches {
+                Some(m) => m[di as usize],
+                None => header_off + di,
+            };
+            out.push(idx.parse_row_enc(file_row, self.delim, self.encoding));
+        }
+        out
+    }
+
     /// アクティブタブの中身（操作行＋グリッド）を描画する。
     fn show(&mut self, ui: &mut egui::Ui) {
         use std::sync::atomic::Ordering;
@@ -1935,6 +1977,19 @@ impl CsvTab {
                     ui.selectable_value(&mut self.delim, b'\t', "タブ");
                     ui.selectable_value(&mut self.delim, b';', "セミコロン");
                     ui.selectable_value(&mut self.delim, b'|', "パイプ");
+                });
+            egui::ComboBox::from_id_salt(("csv_enc", &salt))
+                .selected_text(match self.encoding {
+                    query::Encoding::ShiftJis => "Shift-JIS",
+                    _ => "UTF-8",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.encoding, query::Encoding::Utf8, "UTF-8");
+                    ui.selectable_value(
+                        &mut self.encoding,
+                        query::Encoding::ShiftJis,
+                        "Shift-JIS",
+                    );
                 });
             if self.index.is_some() {
                 ui.separator();
@@ -1971,16 +2026,7 @@ impl CsvTab {
 
         // ── 検索 / 絞り込み行 ──
         if self.index.is_some() {
-            let header_names: Vec<String> = {
-                let idx = self.index.as_ref().unwrap();
-                if self.has_header {
-                    idx.parse_row(0, self.delim)
-                } else {
-                    (1..=idx.column_count(self.delim))
-                        .map(|i| format!("列{i}"))
-                        .collect()
-                }
-            };
+            let header_names: Vec<String> = self.header_cells();
             let mut do_filter = false;
             let mut do_clear = false;
             ui.add_space(2.0);
@@ -2148,7 +2194,8 @@ impl CsvTab {
 
         let first = self.first_row;
         let coloff = self.col_off;
-        let idx = self.index.as_ref().unwrap();
+        let header_cells = self.header_cells();
+        let rows = self.visible_rows(first, visible);
         let painter = ui.painter_at(full);
         painter.rect_filled(full, 0.0, BASE);
 
@@ -2194,26 +2241,13 @@ impl CsvTab {
             0.0,
             ELEVATED,
         );
-        let header_cells: Vec<String> = if has_header {
-            idx.parse_row(0, delim)
-        } else {
-            (1..=ncols).map(|i| format!("列{i}")).collect()
-        };
         draw_cells(&header_cells, grid.top(), true, egui::Color32::from_gray(230));
         painter.line_segment(
             [egui::pos2(grid.left(), body_top), egui::pos2(grid.right(), body_top)],
             egui::Stroke::new(1.0, ACCENT),
         );
 
-        for vr in 0..visible {
-            let di = first + vr;
-            if di >= data_rows {
-                break;
-            }
-            let file_row = match &matches {
-                Some(m) => m[di as usize],
-                None => header_off + di,
-            };
+        for (vr, cells) in rows.iter().enumerate() {
             let y = body_top + vr as f32 * row_h;
             if !vr.is_multiple_of(2) {
                 painter.rect_filled(
@@ -2225,8 +2259,7 @@ impl CsvTab {
                     egui::Color32::from_gray(24),
                 );
             }
-            let cells = idx.parse_row(file_row, delim);
-            draw_cells(&cells, y, false, egui::Color32::from_gray(210));
+            draw_cells(cells, y, false, egui::Color32::from_gray(210));
         }
 
         let vbar_bg = egui::Color32::from_gray(30);
@@ -7489,6 +7522,43 @@ mod tests {
             Ok(img) => img.save(dir.join("08_arch_diagram.png")).unwrap(),
             Err(e) => eprintln!("[render] 失敗: {e}"),
         }
+    }
+
+    /// CSV グリッドが「実際に表示する内容」を検証する（ヘッダ/仮想化窓/絞り込み/
+    /// ヘッダ無しを通す統合テスト。GPU 不要）。
+    #[test]
+    fn csv_tab_visible_rows_and_filter() {
+        let p = std::env::temp_dir().join("spanner_viewer_tabtest.csv");
+        std::fs::write(&p, b"Id,Name\n1,alice\n2,bob\n3,carol\n").unwrap();
+        let idx = csvview::CsvIndex::build(
+            &p,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+        .unwrap();
+        let mut tab = CsvTab::new(p);
+        tab.index = Some(std::sync::Arc::new(idx));
+
+        // ヘッダ。
+        assert_eq!(tab.header_cells(), vec!["Id", "Name"]);
+        // 仮想化窓: 先頭から全データ行。
+        assert_eq!(
+            tab.visible_rows(0, 10),
+            vec![
+                vec!["1", "alice"],
+                vec!["2", "bob"],
+                vec!["3", "carol"]
+            ]
+        );
+        // 途中から1行だけ。
+        assert_eq!(tab.visible_rows(1, 1), vec![vec!["2", "bob"]]);
+        // 絞り込み（ファイル行3=carol のみ表示）。
+        tab.matches = Some(std::sync::Arc::new(vec![3]));
+        assert_eq!(tab.visible_rows(0, 10), vec![vec!["3", "carol"]]);
+        // ヘッダ無し: 列名は 列1,列2、先頭行もデータ扱い。
+        tab.matches = None;
+        tab.has_header = false;
+        assert_eq!(tab.header_cells(), vec!["列1", "列2"]);
+        assert_eq!(tab.visible_rows(0, 1), vec![vec!["Id", "Name"]]);
     }
 
     /// テスト用に Channels を作る（背景ループは無いので送受信端は捨てる）。
