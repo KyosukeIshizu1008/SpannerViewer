@@ -550,6 +550,8 @@ pub struct MonitorApp {
     // CSV ビューア（複数タブ・巨大ファイル: mmap + 行仮想化）
     csv_tabs: Vec<CsvTab>,
     csv_active: usize,
+    csv_gcs_open: bool,   // GCS URI 入力ウィンドウの表示
+    csv_gcs_uri: String,
 
     section: Section,
     view: View,
@@ -713,6 +715,8 @@ impl MonitorApp {
             databases_loaded_for: None,
             csv_tabs: Vec::new(),
             csv_active: 0,
+            csv_gcs_open: false,
+            csv_gcs_uri: String::new(),
 
             section: Section::Spanner,
             view: View::Monitor,
@@ -1804,6 +1808,9 @@ struct CsvTab {
     progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     total_bytes: u64,
     loading: bool,
+    // GCS 取得: phase 1=ダウンロード / 0=索引作成。dl_total は content-length。
+    phase: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    dl_total: std::sync::Arc<std::sync::atomic::AtomicU64>,
     err: Option<String>,
     first_row: u64,
     col_off: f32,
@@ -1837,6 +1844,8 @@ impl CsvTab {
             progress: Arc::new(AtomicU64::new(0)),
             total_bytes,
             loading: false,
+            phase: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            dl_total: Arc::new(AtomicU64::new(0)),
             err: None,
             first_row: 0,
             col_off: 0.0,
@@ -1867,6 +1876,41 @@ impl CsvTab {
         std::thread::spawn(move || {
             let r = csvview::CsvIndex::build(&path, prog).map_err(|e| e.to_string());
             *slot.lock().unwrap() = Some(r);
+            ctx.request_repaint();
+        });
+    }
+
+    /// GCS から一時ファイルへ取得し、続けて索引化する（巨大ファイル対応）。
+    /// self.path をダウンロード先（一時ファイル）として使う。
+    fn start_gcs(&mut self, uri: String, ctx: &egui::Context) {
+        use std::sync::atomic::Ordering;
+        self.loading = true;
+        self.phase.store(1, Ordering::Relaxed); // download
+        self.progress.store(0, Ordering::Relaxed);
+        self.dl_total.store(0, Ordering::Relaxed);
+        *self.result.lock().unwrap() = None;
+        let prog = self.progress.clone();
+        let dlt = self.dl_total.clone();
+        let phase = self.phase.clone();
+        let slot = self.result.clone();
+        let dest = self.path.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            let dl =
+                rt.block_on(crate::query::download_gcs_to_file(&uri, &dest, &prog, &dlt));
+            match dl {
+                Err(e) => *slot.lock().unwrap() = Some(Err(format!("GCS 取得失敗: {e}"))),
+                Ok(()) => {
+                    phase.store(0, Ordering::Relaxed); // 索引作成へ
+                    prog.store(0, Ordering::Relaxed);
+                    let r = csvview::CsvIndex::build(&dest, prog.clone()).map_err(|e| e.to_string());
+                    *slot.lock().unwrap() = Some(r);
+                }
+            }
             ctx.request_repaint();
         });
     }
@@ -2094,21 +2138,35 @@ impl CsvTab {
 
         if self.loading {
             let done = self.progress.load(Ordering::Relaxed);
-            let frac = if self.total_bytes > 0 {
-                (done as f32 / self.total_bytes as f32).clamp(0.0, 1.0)
+            let downloading = self.phase.load(Ordering::Relaxed) == 1;
+            // GCS は dl_total（content-length）、ローカルは total_bytes を分母に。
+            let total = if downloading || self.dl_total.load(Ordering::Relaxed) > 0 {
+                self.dl_total.load(Ordering::Relaxed)
+            } else {
+                self.total_bytes
+            };
+            let frac = if total > 0 {
+                (done as f32 / total as f32).clamp(0.0, 1.0)
             } else {
                 0.0
             };
+            let label = if downloading {
+                "GCS 取得中…"
+            } else {
+                "索引作成中…"
+            };
             ui.add_space(6.0);
-            ui.add(
-                egui::ProgressBar::new(frac)
-                    .text(format!(
-                        "索引作成中… {} / {}",
-                        human_bytes(done as f64),
-                        human_bytes(self.total_bytes as f64)
-                    ))
-                    .desired_width(f32::INFINITY),
-            );
+            let mut bar = egui::ProgressBar::new(frac)
+                .text(format!(
+                    "{label} {} / {}",
+                    human_bytes(done as f64),
+                    human_bytes(total as f64)
+                ))
+                .desired_width(f32::INFINITY);
+            if total == 0 {
+                bar = bar.animate(true); // 総量不明時はアニメーション
+            }
+            ui.add(bar);
             ui.ctx().request_repaint();
             return;
         }
@@ -2304,6 +2362,28 @@ impl MonitorApp {
         self.csv_active = self.csv_tabs.len() - 1;
     }
 
+    /// GCS の CSV を新しいタブで開く（一時ファイルへ取得 → 索引化）。
+    fn open_gcs_csv(&mut self, uri: String, ctx: &egui::Context) {
+        use std::hash::{Hash, Hasher};
+        let uri = uri.trim().to_string();
+        if uri.is_empty() {
+            return;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        uri.hash(&mut h);
+        let dest =
+            std::env::temp_dir().join(format!("spanner_viewer_gcs_{:016x}.csv", h.finish()));
+        let mut tab = CsvTab::new(dest);
+        tab.title = uri
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .unwrap_or(uri.as_str())
+            .to_string();
+        tab.start_gcs(uri, ctx);
+        self.csv_tabs.push(tab);
+        self.csv_active = self.csv_tabs.len() - 1;
+    }
+
     fn csv_view(&mut self, ui: &mut egui::Ui) {
         for t in &mut self.csv_tabs {
             t.drain();
@@ -2314,9 +2394,13 @@ impl MonitorApp {
         let mut activate: Option<usize> = None;
         let mut close: Option<usize> = None;
         ui.add_space(4.0);
+        let mut do_gcs = false;
         ui.horizontal(|ui| {
             if ui.button("＋ CSV を開く").clicked() {
                 do_open = true;
+            }
+            if ui.button("GCS を開く…").clicked() {
+                do_gcs = true;
             }
             if !self.csv_tabs.is_empty() {
                 ui.separator();
@@ -2344,6 +2428,49 @@ impl MonitorApp {
         });
         if do_open {
             self.open_csv(ui.ctx());
+        }
+        if do_gcs {
+            self.csv_gcs_open = true;
+        }
+        // GCS URI 入力ウィンドウ。
+        if self.csv_gcs_open {
+            let ctx = ui.ctx().clone();
+            let mut open = true;
+            let mut go = false;
+            egui::Window::new("GCS の CSV を開く")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.label("gs://バケット/パス.csv を入力（認証は ADC）");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.csv_gcs_uri)
+                            .desired_width(380.0)
+                            .hint_text("gs://my-bucket/data.csv"),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("開く").clicked()
+                            || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        {
+                            go = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            open = false;
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new("一時ファイルへ取得してから表示します（巨大可）")
+                            .color(MUTED)
+                            .small(),
+                    );
+                });
+            if go {
+                let uri = self.csv_gcs_uri.clone();
+                self.open_gcs_csv(uri, &ctx);
+                self.csv_gcs_open = false;
+            } else {
+                self.csv_gcs_open = open;
+            }
         }
         if let Some(i) = activate {
             self.csv_active = i;

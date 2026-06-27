@@ -1719,6 +1719,31 @@ async fn gcs_get_stream(uri: &str) -> anyhow::Result<reqwest::Response> {
     Ok(resp)
 }
 
+/// GCS オブジェクトを一時ファイルへストリーミング保存する（巨大 CSV ビューア用）。
+/// content-length が分かれば `total` に、ダウンロード済みバイト数を `progress` に書く。
+pub async fn download_gcs_to_file(
+    uri: &str,
+    dest: &std::path::Path,
+    progress: &std::sync::atomic::AtomicU64,
+    total: &std::sync::atomic::AtomicU64,
+) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt;
+    let mut resp = gcs_get_stream(uri).await?;
+    if let Some(len) = resp.content_length() {
+        total.store(len, Ordering::Relaxed);
+    }
+    let mut file = tokio::fs::File::create(dest).await?;
+    let mut done: u64 = 0;
+    while let Some(chunk) = resp.chunk().await? {
+        file.write_all(&chunk).await?;
+        done += chunk.len() as u64;
+        progress.store(done, Ordering::Relaxed);
+    }
+    file.flush().await?;
+    Ok(())
+}
+
 // ── ストリーミング CSV パーサ（バイト単位・全行を溜めない） ──
 
 /// RFC 4180 風のインクリメンタル CSV パーサ。チャンクを `push` するたびに
