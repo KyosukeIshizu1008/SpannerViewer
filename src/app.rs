@@ -2879,6 +2879,8 @@ impl MonitorApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        // 行を密着させる（VS Code のツリーのように隙間なし）。
+                        ui.spacing_mut().item_spacing.y = 0.0;
                         if self.schema_pending && self.schema_graph.is_none() {
                             ui.label(egui::RichText::new("読み込み中…").color(MUTED));
                             return;
@@ -5938,7 +5940,7 @@ fn explorer_row(
     fg: egui::Color32,
     mono: bool,
 ) -> egui::Response {
-    let h = 22.0;
+    let h = 20.0;
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
     let p = ui.painter();
