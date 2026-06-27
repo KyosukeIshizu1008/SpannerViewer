@@ -2692,9 +2692,9 @@ impl CsvTab {
             }
         };
         let draw_cells = |cells: &[String], y: f32, strong: bool, fg: egui::Color32| {
-            for ci in 0..ncols {
+            for (ci, &cx) in col_x.iter().take(ncols).enumerate() {
                 let cw = widths.get(ci).copied().unwrap_or(120.0);
-                let x = grid.left() + col_x[ci] - coloff;
+                let x = grid.left() + cx - coloff;
                 if x + cw < grid.left() || x > grid.right() {
                     continue;
                 }
@@ -4037,9 +4037,17 @@ impl MonitorApp {
                                     });
                                     // 進捗バー（実行中）。
                                     if let Some(p) = &job.progress {
-                                        let written = fmt_count(p.written);
                                         // 速度・ETA（経過時間と進捗から算出）。
                                         let rate = import_rate_eta(job.started, p);
+                                        // 総件数の推定（バイト進捗から: written × 全体/読込済）。
+                                        let count = match import_total_estimate(p) {
+                                            Some(y) => format!(
+                                                "{} / 約{} 件",
+                                                fmt_count(p.written),
+                                                fmt_count(y)
+                                            ),
+                                            None => format!("{} 件", fmt_count(p.written)),
+                                        };
                                         match p.frac {
                                             Some(f) => {
                                                 let bytes = match p.bytes_total {
@@ -4051,22 +4059,16 @@ impl MonitorApp {
                                                     None => String::new(),
                                                 };
                                                 let text = format!(
-                                                    "{:.0}%  ·  {written} 行{bytes}{rate}",
+                                                    "{:.0}%  ·  {count}{bytes}{rate}",
                                                     f * 100.0
                                                 );
-                                                ui.add(
-                                                    egui::ProgressBar::new(f)
-                                                        .text(text)
-                                                        .fill(ACCENT)
-                                                        .desired_width(f32::INFINITY),
-                                                );
+                                                paint_import_bar(ui, Some(f), &text);
                                             }
                                             None => {
-                                                ui.add(
-                                                    egui::ProgressBar::new(0.0)
-                                                        .text(format!("取込中…  {written} 行{rate}"))
-                                                        .animate(true)
-                                                        .desired_width(f32::INFINITY),
+                                                paint_import_bar(
+                                                    ui,
+                                                    None,
+                                                    &format!("取込中…  {count}{rate}"),
                                                 );
                                             }
                                         }
@@ -7868,6 +7870,61 @@ fn progress_fraction(bytes_done: u64, bytes_total: Option<u64>) -> Option<f32> {
         .map(|t| (bytes_done as f32 / t as f32).clamp(0.0, 1.0))
 }
 
+/// 取込中の総件数を推定する（書込済 行数 × 全体バイト / 読込済バイト）。
+/// バイト情報が無い / まだ読めていないときは None。推定は最低でも written 以上にする。
+fn import_total_estimate(p: &ImportProg) -> Option<usize> {
+    let total = p.bytes_total?;
+    if p.bytes_done == 0 || total == 0 || p.written == 0 {
+        return None;
+    }
+    let est = (p.written as f64) * (total as f64) / (p.bytes_done as f64);
+    Some((est.round() as usize).max(p.written))
+}
+
+/// 取込の進捗バーを自前で描画する（egui の ProgressBar はトラック色が見分けに
+/// くく "常に満タンに見える" ため）。frac=None はインデターミネート（往復する帯）。
+fn paint_import_bar(ui: &mut egui::Ui, frac: Option<f32>, text: &str) {
+    let h = 20.0;
+    let w = ui.available_width().max(40.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter();
+    let r = egui::CornerRadius::same(4);
+    // トラック（未充填）はハッキリ暗いグレーにして充填部と区別する。
+    painter.rect_filled(rect, r, egui::Color32::from_gray(58));
+    match frac {
+        Some(f) => {
+            let fw = rect.width() * f.clamp(0.0, 1.0);
+            if fw > 1.0 {
+                let fill = egui::Rect::from_min_size(rect.min, egui::vec2(fw, rect.height()));
+                painter.rect_filled(fill, r, ACCENT);
+            }
+        }
+        None => {
+            // 30% 幅の帯を左右に往復させる（総量不明時）。
+            let t = ui.input(|i| i.time);
+            let seg = rect.width() * 0.3;
+            let span = (rect.width() - seg).max(0.0);
+            let phase = (t * 0.6).rem_euclid(1.0) as f32; // 0..1
+            let tri = 1.0 - (2.0 * phase - 1.0).abs(); // 0→1→0
+            let x = rect.left() + span * tri;
+            let fill =
+                egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(seg, rect.height()));
+            painter.rect_filled(fill, r, ACCENT.gamma_multiply(0.85));
+            ui.ctx().request_repaint();
+        }
+    }
+    painter.text(
+        egui::pos2(rect.left() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(12.0),
+        egui::Color32::WHITE,
+    );
+}
+
 /// 取込の速度（rows/s）と残り時間（ETA）の表示文字列。情報が足りなければ空。
 fn import_rate_eta(started: Option<std::time::Instant>, p: &ImportProg) -> String {
     match started {
@@ -9152,6 +9209,26 @@ mod tests {
         assert_eq!(fmt_count(1000), "1,000");
         assert_eq!(fmt_count(12_345), "12,345");
         assert_eq!(fmt_count(1_234_567), "1,234,567");
+    }
+
+    /// 総件数の推定（書込済 × 全体/読込済）。情報不足なら None。
+    #[test]
+    fn import_total_estimate_cases() {
+        let p = |written, done, total| ImportProg {
+            frac: None,
+            written,
+            bytes_done: done,
+            bytes_total: total,
+        };
+        // 42% 読込で 42 万行 → 約 100 万行。
+        assert_eq!(import_total_estimate(&p(420_000, 42, Some(100))), Some(1_000_000));
+        // 全体バイト不明。
+        assert_eq!(import_total_estimate(&p(100, 10, None)), None);
+        // まだ 0 行 / 0 バイト。
+        assert_eq!(import_total_estimate(&p(0, 10, Some(100))), None);
+        assert_eq!(import_total_estimate(&p(100, 0, Some(100))), None);
+        // 推定は最低でも written 以上（読込が書込に先行しても下回らない）。
+        assert_eq!(import_total_estimate(&p(100, 100, Some(50))), Some(100));
     }
 
     /// 残り時間の表記（h/m/s）。
