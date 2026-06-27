@@ -166,20 +166,7 @@ impl ImportDialog {
         } else {
             (0..ncols).map(|i| format!("列{}", i + 1)).collect()
         };
-        // テーブル列名 → CSV 見出し（大文字小文字・前後空白を無視）で自動対応付け。
-        let lower: Vec<String> = self
-            .csv_headers
-            .iter()
-            .map(|h| h.trim().to_lowercase())
-            .collect();
-        self.mapping = self
-            .table_columns
-            .iter()
-            .map(|c| {
-                let name = c.name.trim().to_lowercase();
-                lower.iter().position(|h| *h == name)
-            })
-            .collect();
+        self.mapping = auto_mapping(&self.table_columns, &self.csv_headers, self.has_header, ncols);
     }
 
     /// 文字コード/区切りを変えたとき、プレビューを生バイトから再パースして
@@ -279,19 +266,7 @@ impl VerifyState {
         } else {
             (0..ncols).map(|i| format!("列{}", i + 1)).collect()
         };
-        let lower: Vec<String> = self
-            .csv_headers
-            .iter()
-            .map(|h| h.trim().to_lowercase())
-            .collect();
-        self.mapping = self
-            .table_columns
-            .iter()
-            .map(|c| {
-                let name = c.name.trim().to_lowercase();
-                lower.iter().position(|h| *h == name)
-            })
-            .collect();
+        self.mapping = auto_mapping(&self.table_columns, &self.csv_headers, self.has_header, ncols);
     }
 
     /// 文字コード/区切りを変えたとき、プレビューを生バイトから再パースする。
@@ -3368,7 +3343,7 @@ impl MonitorApp {
                         .hint_text("結果を絞り込み")
                         .desired_width(200.0),
                 );
-                if ui.button("✕").on_hover_text("検索クリア").clicked() {
+                if ui.button("×").on_hover_text("検索クリア").clicked() {
                     self.data_search.clear();
                 }
                 if ui
@@ -4131,24 +4106,24 @@ impl MonitorApp {
                                                     }
                                                 }
                                                 JobStatus::Queued => {
-                                                    if ui.small_button("✕ 取消").clicked() {
+                                                    if ui.small_button("取消").clicked() {
                                                         remove_idx = Some(i);
                                                     }
                                                 }
                                                 JobStatus::Failed | JobStatus::Cancelled => {
                                                     if ui
-                                                        .small_button("↻ 再キュー")
+                                                        .small_button("⟳ 再キュー")
                                                         .on_hover_text("続きから再開します")
                                                         .clicked()
                                                     {
                                                         requeue_idx = Some(i);
                                                     }
-                                                    if ui.small_button("✕").clicked() {
+                                                    if ui.small_button("×").clicked() {
                                                         remove_idx = Some(i);
                                                     }
                                                 }
                                                 JobStatus::Done => {
-                                                    if ui.small_button("✕").clicked() {
+                                                    if ui.small_button("×").clicked() {
                                                         remove_idx = Some(i);
                                                     }
                                                 }
@@ -5793,7 +5768,7 @@ impl MonitorApp {
                             .hint_text("ログを検索")
                             .desired_width(220.0),
                     );
-                    if ui.button("✕").on_hover_text("検索をクリア").clicked() {
+                    if ui.button("×").on_hover_text("検索をクリア").clicked() {
                         self.log_search.clear();
                     }
                     ui.checkbox(&mut self.log_filter, "一致行のみ");
@@ -8358,6 +8333,32 @@ fn verify_stat(ui: &mut egui::Ui, label: &str, n: usize, color: egui::Color32) {
 }
 
 /// 未割当の主キー列名を返す（空なら OK）。
+/// 取り込み/照合のマッピング初期値を作る。
+/// ヘッダ有り: テーブル列名 ↔ CSV 見出しを大小無視で対応付け（一致しなければ None）。
+/// ヘッダ無し: 位置で対応（テーブル列 i ← CSV 列 i。CSV 列が足りなければ None）。
+fn auto_mapping(
+    table_columns: &[query::Column],
+    csv_headers: &[String],
+    has_header: bool,
+    ncols: usize,
+) -> Vec<Option<usize>> {
+    if has_header {
+        let lower: Vec<String> = csv_headers.iter().map(|h| h.trim().to_lowercase()).collect();
+        table_columns
+            .iter()
+            .map(|c| {
+                let name = c.name.trim().to_lowercase();
+                lower.iter().position(|h| *h == name)
+            })
+            .collect()
+    } else {
+        // ヘッダ無しは「列1, 列2, …」を順番にテーブル列へ割り当てる（スキップにしない）。
+        (0..table_columns.len())
+            .map(|i| if i < ncols { Some(i) } else { None })
+            .collect()
+    }
+}
+
 fn unmapped_pks(table_columns: &[query::Column], mapping: &[Option<usize>]) -> Vec<String> {
     table_columns
         .iter()
@@ -8937,6 +8938,14 @@ mod tests {
                     ui.label(egui::RichText::new("12,345").strong());
                     ui.label("行Records");
                 });
+                // UI で使う記号グリフが豆腐(□)になっていないか確認する。
+                ui.separator();
+                for s in [
+                    "⟳ 再キュー", "⏹ 中断", "取消 ×", "⟳ 更新", "✓ ✗ ⚠", "▲ ▼ ← → ↔",
+                    "🔑 📋 🔍 ● ×",
+                ] {
+                    ui.label(egui::RichText::new(s).size(20.0));
+                }
             }
         }
 
@@ -9565,6 +9574,33 @@ mod tests {
         );
         // 全割当なら空。
         assert!(unmapped_pks(&cols, &[Some(1), Some(0)]).is_empty());
+    }
+
+    /// マッピング初期値: ヘッダ有=名前一致 / ヘッダ無=位置対応（スキップにしない）。
+    #[test]
+    fn auto_mapping_header_vs_positional() {
+        let cols = vec![
+            query::Column { name: "Id".into(), ty: "INT64".into(), pk: true },
+            query::Column { name: "Name".into(), ty: "STRING(MAX)".into(), pk: false },
+            query::Column { name: "Extra".into(), ty: "STRING(MAX)".into(), pk: false },
+        ];
+        // ヘッダ有り: 名前一致（Name↔name, Id↔ID）。Extra は CSV に無いので None。
+        let headers = vec!["ID".to_string(), "name".to_string()];
+        assert_eq!(
+            auto_mapping(&cols, &headers, true, 2),
+            vec![Some(0), Some(1), None]
+        );
+        // ヘッダ無し: 位置で対応（列1→Id, 列2→Name, 列3→Extra）。CSV が 2 列なら 3 列目は None。
+        let h2 = vec!["列1".to_string(), "列2".to_string()];
+        assert_eq!(
+            auto_mapping(&cols, &h2, false, 2),
+            vec![Some(0), Some(1), None]
+        );
+        // CSV が 3 列あれば 3 列とも割り当て。
+        assert_eq!(
+            auto_mapping(&cols, &[], false, 3),
+            vec![Some(0), Some(1), Some(2)]
+        );
     }
 
     /// フォルダ一括: *.csv だけ抽出して URI と表示名を作る。

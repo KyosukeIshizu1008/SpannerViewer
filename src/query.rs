@@ -2603,13 +2603,135 @@ async fn ensure_and_run(
     env: &SpannerEnv,
     sql: &str,
 ) -> QueryOutcome {
-    match ensure_client(cache, env).await {
-        Ok(c) => run_query(c, sql).await,
-        Err(e) => QueryOutcome {
-            error: Some(e),
-            ..Default::default()
+    // 文の種類で実行経路を分ける。Spanner では DDL は Admin API、DML は読み書き
+    // トランザクション、それ以外（SELECT 等）は読み取りスナップショットで実行する。
+    match statement_kind(sql) {
+        // DDL は Admin API（UpdateDatabaseDdl）。データ用クライアントでは実行できない。
+        StatementKind::Ddl => run_ddl(env, sql).await,
+        StatementKind::Dml => match ensure_client(cache, env).await {
+            Ok(c) => run_dml(c, sql).await,
+            Err(e) => QueryOutcome {
+                error: Some(e),
+                ..Default::default()
+            },
+        },
+        StatementKind::Query => match ensure_client(cache, env).await {
+            Ok(c) => run_query(c, sql).await,
+            Err(e) => QueryOutcome {
+                error: Some(e),
+                ..Default::default()
+            },
         },
     }
+}
+
+/// SQL 文の種類（実行経路の振り分け用）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatementKind {
+    /// SELECT / WITH など読み取り。
+    Query,
+    /// CREATE / ALTER / DROP / RENAME / GRANT / REVOKE など。
+    Ddl,
+    /// INSERT / UPDATE / DELETE。
+    Dml,
+}
+
+/// 先頭キーワードから文の種類を判定する（簡易）。
+fn statement_kind(sql: &str) -> StatementKind {
+    // 先頭の語を取り出して大文字化（記号・空白・( で区切る）。
+    let word: String = sql
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    match word.as_str() {
+        "CREATE" | "ALTER" | "DROP" | "RENAME" | "GRANT" | "REVOKE" | "ANALYZE" => {
+            StatementKind::Ddl
+        }
+        "INSERT" | "UPDATE" | "DELETE" => StatementKind::Dml,
+        _ => StatementKind::Query,
+    }
+}
+
+/// 複数 DDL を `;` で分割する（空文・末尾セミコロンは無視）。
+fn split_ddl_statements(sql: &str) -> Vec<String> {
+    sql.split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// DDL を Admin API で実行する（CREATE/ALTER/DROP …）。複数文（;区切り）対応。
+async fn run_ddl(env: &SpannerEnv, sql: &str) -> QueryOutcome {
+    let start = Instant::now();
+    let statements = split_ddl_statements(sql);
+    if statements.is_empty() {
+        return QueryOutcome {
+            error: Some("実行する DDL がありません".into()),
+            ..Default::default()
+        };
+    }
+    let n = statements.len();
+    let mut out = match try_run_ddl(env, statements).await {
+        Ok(()) => QueryOutcome {
+            columns: vec!["結果".into()],
+            rows: vec![vec![format!("DDL を適用しました（{n} 文）。スキーマタブで「更新」すると反映されます。")]],
+            ..Default::default()
+        },
+        Err(e) => QueryOutcome {
+            error: Some(format!("DDL 実行エラー: {e}")),
+            ..Default::default()
+        },
+    };
+    out.elapsed_ms = start.elapsed().as_millis();
+    out
+}
+
+async fn try_run_ddl(env: &SpannerEnv, statements: Vec<String>) -> anyhow::Result<()> {
+    use gcloud_spanner::admin::client::Client as AdminClient;
+    use gcloud_spanner::admin::AdminClientConfig;
+    use google_cloud_googleapis::spanner::admin::database::v1::UpdateDatabaseDdlRequest;
+
+    let cfg = AdminClientConfig::default().with_auth().await?;
+    let admin = AdminClient::new(cfg).await?;
+    let req = UpdateDatabaseDdlRequest {
+        database: database_path(env),
+        statements,
+        ..Default::default()
+    };
+    let mut op = admin.database().update_database_ddl(req, None).await?;
+    op.wait(None).await?;
+    Ok(())
+}
+
+/// DML を読み書きトランザクションで実行する（INSERT/UPDATE/DELETE）。影響行数を返す。
+async fn run_dml(client: &Client, sql: &str) -> QueryOutcome {
+    let start = Instant::now();
+    let sql_owned = sql.to_string();
+    let result = client
+        .read_write_transaction(move |tx| {
+            let stmt = Statement::new(sql_owned.clone());
+            Box::pin(async move {
+                let n = tx.update(stmt).await?;
+                Ok::<i64, gcloud_spanner::client::Error>(n)
+            })
+        })
+        .await;
+    let mut out = match result {
+        Ok((_commit, affected)) => QueryOutcome {
+            columns: vec!["影響行数".into()],
+            rows: vec![vec![affected.to_string()]],
+            ..Default::default()
+        },
+        Err(e) => QueryOutcome {
+            error: Some(format!("DML 実行エラー: {e}")),
+            ..Default::default()
+        },
+    };
+    out.elapsed_ms = start.elapsed().as_millis();
+    out
 }
 
 /// INFORMATION_SCHEMA からテーブル・カラム・依存関係を集めてグラフを作る。
@@ -3081,6 +3203,31 @@ mod tests {
             ddl_target_table("ALTER TABLE `日本語表` ADD CONSTRAINT Fk FOREIGN KEY(X) REFERENCES Y(Z)")
                 .as_deref(),
             Some("日本語表")
+        );
+    }
+
+    /// SQL 文の種類判定（DDL/DML/Query の振り分け）。
+    #[test]
+    fn statement_kind_classifies() {
+        assert_eq!(statement_kind("SELECT * FROM T"), StatementKind::Query);
+        assert_eq!(statement_kind("  with x as (select 1) select * from x"), StatementKind::Query);
+        assert_eq!(
+            statement_kind("CREATE TABLE Foo (Id INT64) PRIMARY KEY(Id)"),
+            StatementKind::Ddl
+        );
+        assert_eq!(statement_kind("create index Ix on Foo(Id)"), StatementKind::Ddl);
+        assert_eq!(statement_kind("ALTER TABLE Foo ADD COLUMN X INT64"), StatementKind::Ddl);
+        assert_eq!(statement_kind("DROP TABLE Foo"), StatementKind::Ddl);
+        assert_eq!(statement_kind("INSERT INTO T (Id) VALUES (1)"), StatementKind::Dml);
+        assert_eq!(statement_kind("update T set x=1"), StatementKind::Dml);
+        assert_eq!(statement_kind("DELETE FROM T WHERE Id=1"), StatementKind::Dml);
+        // 複数 DDL を ; で分割。
+        assert_eq!(
+            split_ddl_statements("CREATE TABLE A (Id INT64) PRIMARY KEY(Id);\n CREATE INDEX I ON A(Id); "),
+            vec![
+                "CREATE TABLE A (Id INT64) PRIMARY KEY(Id)".to_string(),
+                "CREATE INDEX I ON A(Id)".to_string()
+            ]
         );
     }
 
@@ -3837,6 +3984,51 @@ mod tests {
         assert!(create.contains("CREATE TABLE ImportTest"), "DDL: {create}");
         assert!(create.contains("PRIMARY KEY"), "DDL: {create}");
         assert!(create.trim_end().ends_with(';'), "末尾に ; が無い: {create}");
+    }
+
+    /// SQL コンソール経由で DDL(CREATE/DROP)・DML(INSERT)・Query(SELECT) が
+    /// それぞれ正しい経路で実行できる（emulator 前提）。
+    #[tokio::test]
+    async fn sql_console_ddl_dml_query() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _guard = EMU_LOCK.lock().await;
+        let env = test_env();
+        let tbl = "SqlConsoleTest";
+
+        // 既存なら掃除（無ければエラーは無視）。
+        let _ = run_ddl(&env, &format!("DROP TABLE {tbl}")).await;
+
+        // CREATE（DDL → Admin API）。
+        let out = run_ddl(
+            &env,
+            &format!("CREATE TABLE {tbl} (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY(Id)"),
+        )
+        .await;
+        assert_eq!(out.error, None, "CREATE error: {:?}", out.error);
+
+        let client = client().await;
+        // INSERT（DML → 読み書きトランザクション）。
+        let out = run_dml(
+            &client,
+            &format!("INSERT INTO {tbl} (Id, Name) VALUES (1, 'alice'), (2, 'bob')"),
+        )
+        .await;
+        assert_eq!(out.error, None, "INSERT error: {:?}", out.error);
+        assert_eq!(out.rows[0][0], "2", "影響行数=2");
+
+        // SELECT（Query → 読み取りスナップショット）。
+        let out = run_query(&client, &format!("SELECT Id, Name FROM {tbl} ORDER BY Id")).await;
+        assert_eq!(out.error, None);
+        assert_eq!(out.rows.len(), 2);
+        assert_eq!(out.rows[0][1], "alice");
+        assert_eq!(out.rows[1][1], "bob");
+
+        // 後始末。
+        let _ = run_ddl(&env, &format!("DROP TABLE {tbl}")).await;
     }
 
     /// クォート/カンマ/改行/途中のクォートを含む実データが、欠落・結合・余計な
