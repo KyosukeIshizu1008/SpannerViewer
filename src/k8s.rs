@@ -32,9 +32,69 @@ fn context_args() -> Vec<String> {
     }
 }
 
+/// GUI（Finder 起動）では PATH が `/usr/bin:/bin` 程度しか無く、Homebrew や
+/// gcloud SDK にある kubectl / gke-gcloud-auth-plugin を見つけられない。
+/// k9s 等のターミナル起動では繋がるのにアプリだと繋がらない典型原因なので、
+/// よくある bin ディレクトリを PATH に補う。
+fn augmented_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut dirs: Vec<String> = std::env::var("PATH")
+        .map(|p| p.split(':').map(String::from).collect())
+        .unwrap_or_default();
+    let extra = [
+        "/opt/homebrew/bin".to_string(),
+        "/usr/local/bin".to_string(),
+        "/usr/bin".to_string(),
+        "/bin".to_string(),
+        format!("{home}/google-cloud-sdk/bin"),
+        "/opt/homebrew/share/google-cloud-sdk/bin".to_string(),
+        "/usr/local/share/google-cloud-sdk/bin".to_string(),
+        format!("{home}/.rd/bin"), // Rancher Desktop
+        format!("{home}/.krew/bin"), // kubectl krew プラグイン
+    ];
+    for d in extra {
+        if !d.is_empty() && !dirs.iter().any(|x| x == &d) {
+            dirs.push(d);
+        }
+    }
+    dirs.join(":")
+}
+
+/// kubectl の実体を探す（PATH に無くても一般的な場所から見つける）。
+fn kubectl_bin() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        "/opt/homebrew/bin/kubectl".to_string(),
+        "/usr/local/bin/kubectl".to_string(),
+        "/usr/bin/kubectl".to_string(),
+        format!("{home}/google-cloud-sdk/bin/kubectl"),
+        format!("{home}/.rd/bin/kubectl"),
+    ];
+    for p in &candidates {
+        if std::path::Path::new(p).exists() {
+            return p.clone();
+        }
+    }
+    "kubectl".to_string()
+}
+
+/// PATH を補った kubectl コマンド（非同期）。これを使って kubectl を起動する。
+fn kubectl_cmd() -> tokio::process::Command {
+    let mut c = tokio::process::Command::new(kubectl_bin());
+    c.env("PATH", augmented_path());
+    c
+}
+
+/// PATH を補った kubectl コマンド（同期。UI スレッドからのコンテキスト取得用）。
+fn kubectl_cmd_sync() -> std::process::Command {
+    let mut c = std::process::Command::new(kubectl_bin());
+    c.env("PATH", augmented_path());
+    c
+}
+
 /// 利用可能なコンテキスト一覧と現在のコンテキスト（同期・UI から呼ぶ）。
 pub fn list_contexts_blocking() -> (Vec<String>, Option<String>) {
-    let names = std::process::Command::new("kubectl")
+    let names = kubectl_cmd_sync()
         .args(["config", "get-contexts", "-o", "name"])
         .output()
         .ok()
@@ -47,7 +107,7 @@ pub fn list_contexts_blocking() -> (Vec<String>, Option<String>) {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let current = std::process::Command::new("kubectl")
+    let current = kubectl_cmd_sync()
         .args(["config", "current-context"])
         .output()
         .ok()
@@ -868,7 +928,7 @@ async fn pf_run(
     tx: std::sync::mpsc::Sender<PortForwardEvent>,
 ) {
     let ports = format!("{local}:{remote}");
-    let mut child = match tokio::process::Command::new("kubectl")
+    let mut child = match kubectl_cmd()
         .args(context_args())
         .args(["port-forward", "-n", &ns, &target, &ports])
         .stdout(std::process::Stdio::piped())
@@ -1029,7 +1089,7 @@ async fn stream_logs(
         args.push("-c".into());
         args.push(container.clone());
     }
-    let mut child = match tokio::process::Command::new("kubectl")
+    let mut child = match kubectl_cmd()
         .args(context_args())
         .args(&args)
         .stdout(std::process::Stdio::piped())
@@ -1242,7 +1302,7 @@ async fn run_action(a: ActionReq) -> ActionResult {
 /// stdin にデータを渡して kubectl を実行する（apply 用）。
 async fn run_stdin(args: &[&str], input: &str) -> Result<String, String> {
     use tokio::io::AsyncWriteExt;
-    let mut child = tokio::process::Command::new("kubectl")
+    let mut child = kubectl_cmd()
         .args(context_args())
         .args(args)
         .stdin(std::process::Stdio::piped())
@@ -1267,7 +1327,7 @@ async fn run_stdin(args: &[&str], input: &str) -> Result<String, String> {
 
 /// stdout/stderr を結合して返す（exec 用、非ゼロ終了でも出力を見せる）。
 async fn run_combined(args: &[&str]) -> Result<String, String> {
-    let out = tokio::process::Command::new("kubectl")
+    let out = kubectl_cmd()
         .args(context_args())
         .args(args)
         .output()
@@ -1345,7 +1405,7 @@ pub async fn topology_loop(
 }
 
 async fn run(args: &[&str]) -> Result<String, String> {
-    let out = tokio::process::Command::new("kubectl")
+    let out = kubectl_cmd()
         .args(context_args())
         .args(args)
         .output()
