@@ -502,6 +502,12 @@ pub struct MonitorApp {
     data_search: String,              // 結果内フィルタ
     data_history: Vec<String>,        // 実行した SQL の履歴（新しい順）
     tree_expanded: HashSet<String>,   // オブジェクトツリーで展開中のテーブル
+    // SQL 補完（テーブル/カラム名 + キーワード）
+    sql_sug_open: bool,               // 補完ポップアップ表示中か
+    sql_sug_index: usize,             // 選択中の候補
+    sql_suggestions: Vec<String>,     // 現在の候補（前フレーム算出。Tab確定にも使う）
+    sql_word_range: (usize, usize),   // 補完対象の単語のバイト範囲 (start, end)
+    sql_set_cursor: Option<usize>,    // 次フレームで設定するカーソル位置（バイト）
 
     // スキーマ図のパン/ズーム・編集状態
     diagram_pan: egui::Vec2,
@@ -723,6 +729,11 @@ impl MonitorApp {
             data_search: String::new(),
             data_history: Vec::new(),
             tree_expanded: HashSet::new(),
+            sql_sug_open: false,
+            sql_sug_index: 0,
+            sql_suggestions: Vec::new(),
+            sql_word_range: (0, 0),
+            sql_set_cursor: None,
             diagram_pan: egui::vec2(40.0, 40.0),
             diagram_zoom: 1.0,
             node_positions: load_layout(),
@@ -3264,14 +3275,127 @@ impl MonitorApp {
                     });
             });
 
+        // 補完候補のソース（テーブル名・カラム名）をスキーマから用意する。
+        let (sql_tables, sql_columns): (Vec<String>, Vec<String>) = {
+            let mut tabs = Vec::new();
+            let mut cols = Vec::new();
+            if let Some(g) = self.schema_graph.as_ref().filter(|g| g.error.is_none()) {
+                for n in &g.nodes {
+                    tabs.push(n.name.clone());
+                    for c in &n.columns {
+                        cols.push(c.name.clone());
+                    }
+                }
+            }
+            cols.sort();
+            cols.dedup();
+            (tabs, cols)
+        };
+
         // 上: SQL エディタ + 実行 / 選択実行 / 履歴
         egui::Panel::top("query_bar").show(ui, |ui| {
             ui.add_space(6.0);
+
+            // 補完ポップアップ表示中のキー操作を TextEdit より前に消費する。
+            let mut accepted = false;
+            if self.sql_sug_open && !self.sql_suggestions.is_empty() {
+                let n = self.sql_suggestions.len();
+                let mut do_accept: Option<String> = None;
+                ui.input_mut(|i| {
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                        self.sql_sug_index = (self.sql_sug_index + 1) % n;
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                        self.sql_sug_index = (self.sql_sug_index + n - 1) % n;
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                        do_accept = self.sql_suggestions.get(self.sql_sug_index).cloned();
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                        self.sql_sug_open = false;
+                    }
+                });
+                if let Some(cand) = do_accept {
+                    apply_sql_completion(&mut self.sql, self.sql_word_range, &cand, &mut self.sql_set_cursor);
+                    self.sql_sug_open = false;
+                    accepted = true;
+                }
+            }
+
             let output = egui::TextEdit::multiline(&mut self.sql)
                 .desired_rows(3)
                 .desired_width(f32::INFINITY)
                 .code_editor()
                 .show(ui);
+
+            // 確定後のカーソル位置を反映する（テキスト変更の次フレームで適用）。
+            if let Some(cpos) = self.sql_set_cursor.take() {
+                let id = output.response.response.id;
+                let mut state = output.state.clone();
+                state.cursor.set_char_range(Some(egui::text_selection::CCursorRange::one(
+                    egui::text::CCursor::new(cpos),
+                )));
+                state.store(ui.ctx(), id);
+                output.response.response.request_focus();
+            }
+
+            // 現在の単語から補完候補を作る（フォーカス時のみ）。
+            let has_focus = output.response.response.has_focus();
+            if has_focus && !accepted {
+                if let Some(cr) = &output.cursor_range {
+                    let (s, e) = current_word_range(&self.sql, cr.primary.index.0);
+                    self.sql_word_range = (s, e);
+                    let word = &self.sql[s..e];
+                    self.sql_suggestions = sql_completions(word, &sql_tables, &sql_columns, 8);
+                    self.sql_sug_open = !self.sql_suggestions.is_empty();
+                    if self.sql_sug_index >= self.sql_suggestions.len() {
+                        self.sql_sug_index = 0;
+                    }
+                }
+            } else if !has_focus {
+                self.sql_sug_open = false;
+            }
+
+            // 補完ポップアップを描画（クリックで確定）。
+            if self.sql_sug_open && !self.sql_suggestions.is_empty() {
+                let anchor = output
+                    .cursor_range
+                    .as_ref()
+                    .map(|cr| {
+                        let r = output.galley.pos_from_cursor(cr.primary);
+                        output.galley_pos + r.left_bottom().to_vec2()
+                    })
+                    .unwrap_or_else(|| output.response.response.rect.left_bottom());
+                let sugs = self.sql_suggestions.clone();
+                let sel = self.sql_sug_index;
+                let mut click: Option<String> = None;
+                let mut hover: Option<usize> = None;
+                egui::Area::new(ui.id().with("sql_ac_popup"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(anchor + egui::vec2(0.0, 3.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.set_max_width(300.0);
+                            for (i, s) in sugs.iter().enumerate() {
+                                let r = ui.selectable_label(i == sel, s);
+                                if r.clicked() {
+                                    click = Some(s.clone());
+                                }
+                                if r.hovered() {
+                                    hover = Some(i);
+                                }
+                            }
+                        });
+                    });
+                if let Some(i) = hover {
+                    self.sql_sug_index = i;
+                }
+                if let Some(cand) = click {
+                    apply_sql_completion(&mut self.sql, self.sql_word_range, &cand, &mut self.sql_set_cursor);
+                    self.sql_sug_open = false;
+                }
+            }
+
             // 選択範囲（あれば）を取り出す
             let selected: Option<String> = output.cursor_range.and_then(|cr| {
                 let s = cr.slice_str(&self.sql);
@@ -8333,6 +8457,73 @@ fn verify_stat(ui: &mut egui::Ui, label: &str, n: usize, color: egui::Color32) {
 }
 
 /// 未割当の主キー列名を返す（空なら OK）。
+/// SQL 補完で使うキーワード。
+const SQL_KEYWORDS: &[&str] = &[
+    "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "NULL", "IS", "IN", "LIKE", "BETWEEN",
+    "ORDER BY", "GROUP BY", "HAVING", "LIMIT", "OFFSET", "JOIN", "LEFT JOIN", "INNER JOIN",
+    "ON", "AS", "DISTINCT", "COUNT", "SUM", "AVG", "MIN", "MAX", "ASC", "DESC", "UNION",
+    "WITH", "INSERT INTO", "VALUES", "UPDATE", "SET", "DELETE FROM", "CREATE TABLE",
+    "CREATE INDEX", "ALTER TABLE", "DROP TABLE", "PRIMARY KEY", "TRUE", "FALSE",
+    "CURRENT_TIMESTAMP", "TIMESTAMP", "STRING", "INT64", "BOOL", "NUMERIC", "FLOAT64",
+];
+
+/// SQL 補完候補（前方一致・大小無視）。テーブル名→カラム名→キーワードの順、最大 max 件。
+fn sql_completions(word: &str, tables: &[String], columns: &[String], max: usize) -> Vec<String> {
+    let w = word.to_lowercase();
+    if w.is_empty() {
+        return Vec::new();
+    }
+    let kw: Vec<String> = SQL_KEYWORDS.iter().map(|s| s.to_string()).collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for cand in tables.iter().chain(columns.iter()).chain(kw.iter()) {
+        if out.len() >= max {
+            break;
+        }
+        let cl = cand.to_lowercase();
+        if cl.starts_with(&w) && cl != w && seen.insert(cl) {
+            out.push(cand.clone());
+        }
+    }
+    out
+}
+
+/// SQL 補完を適用する。`range`(バイト) を `候補 + 空白` で置換し、確定後のカーソル
+/// 文字位置を `set_cursor` に入れる（次フレームで TextEdit に反映）。
+fn apply_sql_completion(
+    sql: &mut String,
+    range: (usize, usize),
+    cand: &str,
+    set_cursor: &mut Option<usize>,
+) {
+    let (s, e) = range;
+    if s > e || e > sql.len() || !sql.is_char_boundary(s) || !sql.is_char_boundary(e) {
+        return;
+    }
+    let rep = format!("{cand} ");
+    sql.replace_range(s..e, &rep);
+    let new_byte = s + rep.len();
+    *set_cursor = Some(sql[..new_byte].chars().count());
+}
+
+/// カーソル（文字位置）直前の識別子トークンのバイト範囲を返す。
+fn current_word_range(text: &str, char_idx: usize) -> (usize, usize) {
+    let byte_idx = text
+        .char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(text.len());
+    let before = &text[..byte_idx];
+    let start = before
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
+        .last()
+        .map(|(b, _)| b)
+        .unwrap_or(byte_idx);
+    (start, byte_idx)
+}
+
 /// 取り込み/照合のマッピング初期値を作る。
 /// ヘッダ有り: テーブル列名 ↔ CSV 見出しを大小無視で対応付け（一致しなければ None）。
 /// ヘッダ無し: 位置で対応（テーブル列 i ← CSV 列 i。CSV 列が足りなければ None）。
@@ -9574,6 +9765,48 @@ mod tests {
         );
         // 全割当なら空。
         assert!(unmapped_pks(&cols, &[Some(1), Some(0)]).is_empty());
+    }
+
+    /// SQL 補完候補（前方一致・大小無視・テーブル/カラム優先）。
+    #[test]
+    fn sql_completions_basic() {
+        let tables = vec!["Users".to_string(), "Orders".to_string()];
+        let cols = vec!["UserId".to_string(), "Name".to_string()];
+        // "us" → Users(テーブル) と UserId(カラム)。
+        assert_eq!(sql_completions("us", &tables, &cols, 8), vec!["Users", "UserId"]);
+        // 大小無視（"OR" 自体は完全一致で除外、"Orders"/"ORDER BY" が出る）。
+        assert_eq!(sql_completions("OR", &tables, &cols, 8), vec!["Orders", "ORDER BY"]);
+        // キーワードも候補に。
+        assert_eq!(sql_completions("sel", &tables, &cols, 8), vec!["SELECT"]);
+        // 空はなし。
+        assert!(sql_completions("", &tables, &cols, 8).is_empty());
+        // 完全一致は除外（打ち終わっている語は提案しない）。
+        assert!(sql_completions("name", &tables, &cols, 8).is_empty());
+    }
+
+    /// カーソル直前の識別子トークン範囲。
+    #[test]
+    fn current_word_range_cases() {
+        let t = "SELECT * FROM Us";
+        // 末尾（16文字目）の直前の単語は "Us"（byte 14..16）。
+        assert_eq!(current_word_range(t, 16), (14, 16));
+        // 記号の直後は空語。
+        assert_eq!(current_word_range("a = ", 4), (4, 4));
+        // 日本語混じりでも byte 境界で正しく返す。
+        let j = "あ FROM Te";
+        let n = j.chars().count();
+        let (s, e) = current_word_range(j, n);
+        assert_eq!(&j[s..e], "Te");
+    }
+
+    /// 補完適用: 単語を候補+空白で置換し、カーソル文字位置を返す。
+    #[test]
+    fn apply_sql_completion_replaces() {
+        let mut sql = "SELECT * FROM Us".to_string();
+        let mut cur = None;
+        apply_sql_completion(&mut sql, (14, 16), "Users", &mut cur);
+        assert_eq!(sql, "SELECT * FROM Users ");
+        assert_eq!(cur, Some(20));
     }
 
     /// マッピング初期値: ヘッダ有=名前一致 / ヘッダ無=位置対応（スキップにしない）。
