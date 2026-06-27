@@ -1462,6 +1462,12 @@ impl MonitorApp {
 }
 
 impl eframe::App for MonitorApp {
+    /// 未描画領域がクリアカラー（黒）で出ないよう、エディタ背景色で塗る。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        let [r, g, b, _] = BASE.to_normalized_gamma_f32();
+        [r, g, b, 1.0]
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx_owned = ui.ctx().clone();
         let ctx = &ctx_owned;
