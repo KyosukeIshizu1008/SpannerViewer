@@ -6881,6 +6881,62 @@ mod tests {
         assert_eq!(n, 3, "Spanner に 3 行入っているはず");
     }
 
+    /// 取込中の進捗バー（％・行数・速度・ETA）が描画されることを視覚確認する。
+    /// 進捗中ジョブを差し込んでインポート画面を PNG 出力する（GPU 必須のため #[ignore]）。
+    #[ignore = "wgpu アダプタが必要。視覚確認時のみ手動実行する"]
+    #[test]
+    fn render_import_progress_to_png() {
+        use egui_kittest::Harness;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dir = std::path::Path::new("target/ui_shots");
+        std::fs::create_dir_all(dir).unwrap();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 460.0))
+            .build_eframe(|cc| MonitorApp::new(make_test_channels(), cc));
+
+        {
+            let app = harness.state_mut();
+            app.section = Section::Spanner;
+            app.view = View::Import;
+            let req = query::ImportRequest {
+                table: "Users".into(),
+                columns: vec![],
+                source: query::ImportSource::File("/tmp/users.csv".into()),
+                has_header: true,
+                mode: query::ImportMode::InsertOrUpdate,
+                empty_as_null: true,
+                fresh: false,
+                encoding: query::Encoding::Utf8,
+                delimiter: b',',
+                skip_bad_rows: false,
+                dry_run: false,
+                null_token: None,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            app.import_jobs.push(ImportJob {
+                req,
+                source_name: "users.csv".into(),
+                sent: true,
+                status: JobStatus::Running,
+                started: std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(6)),
+                progress: Some(ImportProg {
+                    frac: Some(0.42),
+                    written: 420_000,
+                    bytes_done: 42_000_000,
+                    bytes_total: Some(100_000_000),
+                }),
+                result: None,
+                outcome: None,
+            });
+        }
+        harness.step();
+        match harness.render() {
+            Ok(img) => img.save(dir.join("07_import_progress.png")).unwrap(),
+            Err(e) => eprintln!("[render] 失敗: {e}"),
+        }
+    }
+
     /// テスト用に Channels を作る（背景ループは無いので送受信端は捨てる）。
     fn make_test_channels() -> Channels {
         use std::sync::mpsc::channel;
