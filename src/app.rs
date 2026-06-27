@@ -400,6 +400,9 @@ pub struct MonitorApp {
     import_jobs: Vec<ImportJob>,
     /// 証跡レポートの保存先（スクショ受信待ち。受信したら PNG を書いて Finder で開く）。
     pending_report_dir: Option<std::path::PathBuf>,
+    /// スクショ応答を待つ残りフレーム数。0 で諦めて pending を解放する
+    /// （応答が来ないまま後の無関係なスクショを誤って保存しないため）。
+    pending_report_wait: u32,
     /// GCS フォルダ一括投入の保留（List 応答待ち）。
     pending_bulk: Option<BulkSpec>,
     /// インポートタブで選択中の取り込み先テーブル名。
@@ -512,6 +515,7 @@ pub struct MonitorApp {
     auth_status: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     // 起動時 ADC ログイン確認とログイン誘導ダイアログ
     auth_ok: std::sync::Arc<std::sync::Mutex<Option<bool>>>, // None=確認中
+    auth_checking: std::sync::Arc<std::sync::atomic::AtomicBool>, // 確認スレッド実行中
     auth_check_started: bool,
     auth_was_running: bool,
     login_dialog: bool,
@@ -596,6 +600,7 @@ impl MonitorApp {
             import_pending: false,
             import_jobs: Vec::new(),
             pending_report_dir: None,
+            pending_report_wait: 0,
             pending_bulk: None,
             import_table_pick: String::new(),
             gcs_req_tx: ch.gcs_req_tx,
@@ -680,6 +685,7 @@ impl MonitorApp {
             auth_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             auth_status: std::sync::Arc::new(std::sync::Mutex::new(None)),
             auth_ok: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            auth_checking: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             auth_check_started: false,
             auth_was_running: false,
             login_dialog: false,
@@ -761,6 +767,9 @@ impl MonitorApp {
         if let Some(ok) = result {
             if ok {
                 self.login_dialog = false;
+                // ログイン成功で「後で」の抑止を解除。後でトークン失効等で
+                // 再び未ログインになったら、また案内できるようにする。
+                self.login_dismissed = false;
             } else if !self.login_dismissed {
                 self.login_dialog = true;
             }
@@ -770,12 +779,23 @@ impl MonitorApp {
 
     /// ADC（ログイン状態）を背景で確認する。結果は auth_ok に入る。
     fn start_adc_check(&self, ctx: &egui::Context) {
+        use std::sync::atomic::Ordering;
+        // 多重起動を防ぐ（実行中なら何もしない）。
+        if self
+            .auth_checking
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         *self.auth_ok.lock().unwrap() = None; // 確認中
         let slot = self.auth_ok.clone();
+        let checking = self.auth_checking.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let ok = run_blocking(query::check_adc()).is_ok();
             *slot.lock().unwrap() = Some(ok);
+            checking.store(false, Ordering::Release);
             ctx.request_repaint();
         });
     }
@@ -2845,12 +2865,17 @@ impl MonitorApp {
         let _ = std::fs::write(dir.join("report.md"), md);
         // スクショは次フレームで Event::Screenshot として届く。届いたら同フォルダへ保存。
         self.pending_report_dir = Some(dir.clone());
+        self.pending_report_wait = 30; // 約30フレーム待って来なければ諦める
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         self.copy_note = Some(format!("レポートを出力中…: {}", dir.display()));
     }
 
     /// スクリーンショット応答が来ていれば PNG として保存し、Finder で開く。
     fn drain_screenshot(&mut self, ctx: &egui::Context) {
+        // 依頼中でなければスクショイベントには触れない（無関係なスクショを拾わない）。
+        if self.pending_report_dir.is_none() {
+            return;
+        }
         let shot = ctx.input(|i| {
             i.raw.events.iter().find_map(|e| match e {
                 egui::Event::Screenshot { image, .. } => Some(image.clone()),
@@ -2868,6 +2893,18 @@ impl MonitorApp {
                 } else {
                     format!("レポートは保存（スクショは失敗）: {}", dir.display())
                 });
+            }
+        } else {
+            // まだ届かない。一定フレーム待っても来なければ諦めて pending を解放する。
+            self.pending_report_wait = self.pending_report_wait.saturating_sub(1);
+            if self.pending_report_wait == 0 {
+                if let Some(dir) = self.pending_report_dir.take() {
+                    let _ = std::process::Command::new("open").arg(&dir).spawn();
+                    self.copy_note = Some(format!(
+                        "レポートは保存（スクショ取得に失敗）: {}",
+                        dir.display()
+                    ));
+                }
             }
         }
     }
