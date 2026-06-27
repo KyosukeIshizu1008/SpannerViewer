@@ -2857,22 +2857,25 @@ impl MonitorApp {
             .show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("データベース").strong());
-                    if ui
-                        .add_enabled(!self.schema_pending, egui::Button::new("⟳").small())
-                        .on_hover_text("スキーマを再取得")
-                        .clicked()
-                    {
-                        self.schema_graph = None;
-                        self.run_schema();
-                    }
+                    // VS Code のセクション見出し風（小さめ・補助色）。
+                    ui.label(
+                        egui::RichText::new("データベース")
+                            .small()
+                            .strong()
+                            .color(MUTED),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!self.schema_pending, egui::Button::new("⟳").small())
+                            .on_hover_text("スキーマを再取得")
+                            .clicked()
+                        {
+                            self.schema_graph = None;
+                            self.run_schema();
+                        }
+                    });
                 });
-                ui.label(
-                    egui::RichText::new("インポートは上の「インポート」タブから")
-                        .color(MUTED)
-                        .small(),
-                );
-                ui.separator();
+                ui.add_space(2.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -2891,34 +2894,24 @@ impl MonitorApp {
                             );
                             return;
                         }
-                        ui.label(
-                            egui::RichText::new(format!("{} テーブル", g.nodes.len()))
-                                .color(MUTED)
-                                .small(),
-                        );
                         for node in &g.nodes {
                             let expanded = self.tree_expanded.contains(&node.name);
-                            ui.horizontal(|ui| {
-                                let tri = if expanded { "▼" } else { "▶" };
-                                if ui
-                                    .add(
-                                        egui::Label::new(format!("{tri} {}", node.name))
-                                            .sense(egui::Sense::click()),
-                                    )
-                                    .on_hover_text("クリックで展開 / 右クリックでメニュー")
-                                    .clicked()
-                                {
-                                    if expanded {
-                                        self.tree_expanded.remove(&node.name);
-                                    } else {
-                                        self.tree_expanded.insert(node.name.clone());
-                                    }
+                            let chev = if expanded { "▾" } else { "▸" };
+                            let resp = explorer_row(
+                                ui,
+                                8.0,
+                                &format!("{chev}  {}", node.name),
+                                TEXT,
+                                false,
+                            );
+                            if resp.clicked() {
+                                if expanded {
+                                    self.tree_expanded.remove(&node.name);
+                                } else {
+                                    self.tree_expanded.insert(node.name.clone());
                                 }
-                                // CSV インポートは専用「インポート」タブ・右クリックメニュー
-                                // から行うため、ここの ⬆ ボタンは廃止。
-                            })
-                            .response
-                            .context_menu(|ui| {
+                            }
+                            resp.context_menu(|ui| {
                                 if ui.button("SELECT * を実行").clicked() {
                                     load_run =
                                         Some(format!("SELECT * FROM `{}` LIMIT 100", node.name));
@@ -2942,43 +2935,29 @@ impl MonitorApp {
                                 }
                             });
                             if expanded {
-                                ui.indent(&node.name, |ui| {
-                                    for c in &node.columns {
-                                        let key = if c.pk { "🔑" } else { "•" };
-                                        let label = format!("{key} {}  {}", c.name, c.ty);
-                                        let color = if c.pk { PK_COLOR } else { TEXT };
-                                        if ui
-                                            .add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(label)
-                                                        .color(color)
-                                                        .monospace()
-                                                        .small(),
-                                                )
-                                                .sense(egui::Sense::click()),
-                                            )
-                                            .on_hover_text("クリックで列名コピー")
-                                            .clicked()
-                                        {
-                                            ui.ctx().copy_text(c.name.clone());
-                                        }
+                                for c in &node.columns {
+                                    let key = if c.pk { "🔑" } else { "·" };
+                                    let color = if c.pk { PK_COLOR } else { TEXT };
+                                    let r = explorer_row(
+                                        ui,
+                                        30.0,
+                                        &format!("{key} {}  {}", c.name, c.ty),
+                                        color,
+                                        true,
+                                    );
+                                    if r.clicked() {
+                                        ui.ctx().copy_text(c.name.clone());
                                     }
-                                    if !node.indexes.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new("インデックス")
-                                                .color(MUTED)
-                                                .small(),
-                                        );
-                                        for idx in &node.indexes {
-                                            ui.label(
-                                                egui::RichText::new(format!("  🔎 {idx}"))
-                                                    .color(ACCENT)
-                                                    .monospace()
-                                                    .small(),
-                                            );
-                                        }
-                                    }
-                                });
+                                }
+                                for idx in &node.indexes {
+                                    explorer_row(
+                                        ui,
+                                        30.0,
+                                        &format!("🔎 {idx}"),
+                                        DIAGRAM_ACCENT,
+                                        true,
+                                    );
+                                }
                             }
                         }
                     });
@@ -5950,6 +5929,40 @@ fn tab(ui: &mut egui::Ui, selected: bool, label: &str) -> bool {
 }
 
 /// 凡例の色サンプル + ラベル。
+/// VS Code エクスプローラー風の1行（全幅・コンパクト・ホバーで全幅ハイライト）。
+/// indent はテキスト開始位置、mono で等幅。返り値でクリック判定。
+fn explorer_row(
+    ui: &mut egui::Ui,
+    indent: f32,
+    text: &str,
+    fg: egui::Color32,
+    mono: bool,
+) -> egui::Response {
+    let h = 22.0;
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(rect, 0.0, LIST_HOVER);
+    }
+    let font = if mono {
+        egui::FontId::monospace(12.0)
+    } else {
+        egui::FontId::proportional(13.0)
+    };
+    p.text(
+        egui::pos2(rect.left() + indent, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font,
+        fg,
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
 fn legend(ui: &mut egui::Ui, color: egui::Color32, text: &str) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 3.0), egui::Sense::hover());
     ui.painter().rect_filled(rect, 1.0, color);
@@ -6939,6 +6952,7 @@ const ELEVATED: egui::Color32 = egui::Color32::from_rgb(45, 45, 45); // ウィ�
 const BORDER: egui::Color32 = egui::Color32::from_rgb(60, 60, 60); // 境界 #3c3c3c
 const INPUT_BG: egui::Color32 = egui::Color32::from_rgb(60, 60, 60); // 入力 #3c3c3c
 const ROW_ALT: egui::Color32 = egui::Color32::from_rgb(42, 42, 42); // 縞模様（控えめ）
+const LIST_HOVER: egui::Color32 = egui::Color32::from_rgb(42, 45, 46); // 一覧ホバー #2a2d2e
 const ACTIVITY_BG: egui::Color32 = egui::Color32::from_rgb(51, 51, 51); // アクティビティバー #333333
 const STATUS_BG: egui::Color32 = egui::Color32::from_rgb(0, 122, 204); // ステータスバー #007acc
 const BUTTON_BG: egui::Color32 = egui::Color32::from_rgb(14, 99, 156); // ボタン #0e639c
@@ -7791,6 +7805,50 @@ mod tests {
         harness.step();
         match harness.render() {
             Ok(img) => img.save(dir.join("07_import_progress.png")).unwrap(),
+            Err(e) => eprintln!("[render] 失敗: {e}"),
+        }
+    }
+
+    /// データタブのテーブルツリー（VS Code エクスプローラー風）を描画。
+    #[ignore = "wgpu アダプタが必要。視覚確認時のみ手動実行する"]
+    #[test]
+    fn render_data_tree_to_png() {
+        use egui_kittest::Harness;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dir = std::path::Path::new("target/ui_shots");
+        std::fs::create_dir_all(dir).unwrap();
+        let col = |n: &str, t: &str, pk: bool| query::Column {
+            name: n.into(),
+            ty: t.into(),
+            pk,
+        };
+        let node = |n: &str, cols: Vec<query::Column>| query::TableNode {
+            name: n.into(),
+            columns: cols,
+            indexes: vec![],
+        };
+        let g = query::SchemaGraph {
+            nodes: vec![
+                node("Users", vec![col("Id", "INT64", true), col("Name", "STRING(MAX)", false)]),
+                node("Orders", vec![col("OrderId", "INT64", true), col("UserId", "INT64", false)]),
+                node("Products", vec![col("Sku", "STRING(36)", true)]),
+            ],
+            edges: vec![],
+            error: None,
+        };
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 560.0))
+            .build_eframe(|cc| MonitorApp::new(make_test_channels(), cc));
+        {
+            let app = harness.state_mut();
+            app.section = Section::Spanner;
+            app.view = View::Data;
+            app.schema_graph = Some(g);
+            app.tree_expanded.insert("Users".to_string());
+        }
+        harness.step();
+        match harness.render() {
+            Ok(img) => img.save(dir.join("10_data_tree.png")).unwrap(),
             Err(e) => eprintln!("[render] 失敗: {e}"),
         }
     }
