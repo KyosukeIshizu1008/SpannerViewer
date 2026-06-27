@@ -19,6 +19,9 @@ encoding_rs = "0.8"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # 依存ツリーに aws-lc-rs と ring が両方あるため、rustls の既定プロバイダを明示選択する
 rustls = "0.23"
+# 巨大 CSV ビューア: メモリマップ + 高速な改行スキャン（全体をRAMに載せない）
+memmap2 = "0.9"
+memchr = "2"
 
 # 負荷生成バイナリ (src/bin/loadgen.rs) 用
 gcloud-spanner = "1.8"

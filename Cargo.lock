@@ -4011,6 +4011,8 @@ dependencies = [
  "gcloud-spanner",
  "gcp_auth",
  "image",
+ "memchr",
+ "memmap2",
  "reqwest 0.12.28",
  "rustls",
  "serde",

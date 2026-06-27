@@ -1,4 +1,5 @@
 mod app;
+mod csvview;
 mod k8s;
 mod monitoring;
 mod query;
