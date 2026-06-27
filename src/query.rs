@@ -78,6 +78,29 @@ pub enum Target {
     #[default]
     Data,
     Schema,
+    /// クエリの実行計画（EXPLAIN 相当。PLAN モードで取得）。
+    Plan,
+}
+
+/// 実行計画ツリーの 1 ノード（表示用）。
+#[derive(Clone, Debug)]
+pub struct PlanLine {
+    /// インデント深さ（0=ルート）。
+    pub depth: usize,
+    /// 演算子名（display_name）。
+    pub name: String,
+    /// 補足（short_representation や metadata の要約）。
+    pub detail: String,
+    /// スカラ（式）ノードか（リレーショナル演算子と区別して薄く表示）。
+    pub scalar: bool,
+}
+
+/// 実行計画の取得結果（UI へ返す）。
+#[derive(Clone, Debug, Default)]
+pub struct PlanOutcome {
+    pub lines: Vec<PlanLine>,
+    pub elapsed_ms: u128,
+    pub error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -450,6 +473,7 @@ pub async fn query_loop(
     mut req_rx: UnboundedReceiver<(Target, String)>,
     data_tx: std::sync::mpsc::Sender<QueryOutcome>,
     schema_tx: std::sync::mpsc::Sender<SchemaGraph>,
+    plan_tx: std::sync::mpsc::Sender<PlanOutcome>,
 ) {
     // 起動時の env（環境変数由来）を初期値として seed（設定画面が未指定のとき用）。
     init_spanner_env(SpannerEnv {
@@ -468,8 +492,10 @@ pub async fn query_loop(
         // タスク用とパニック時のエラー通知用に別々のクローンを用意する。
         let data_tx_task = data_tx.clone();
         let schema_tx_task = schema_tx.clone();
+        let plan_tx_task = plan_tx.clone();
         let data_tx_err = data_tx.clone();
         let schema_tx_err = schema_tx.clone();
+        let plan_tx_err = plan_tx.clone();
 
         // 各リクエストは独立タスクで実行する。Spanner クライアント側で万一
         // パニックが起きても、この query_loop 自体は生き続け、UI からの次の
@@ -523,6 +549,31 @@ pub async fn query_loop(
                     };
                     let _ = schema_tx_task.send(graph);
                 }
+                Target::Plan => {
+                    let start = Instant::now();
+                    let mut guard = client.lock().await;
+                    let mut out = if mock {
+                        PlanOutcome {
+                            error: Some("モックモードでは実行計画を取得できません".into()),
+                            ..Default::default()
+                        }
+                    } else if !configured {
+                        PlanOutcome {
+                            error: Some(NO_CONFIG.into()),
+                            ..Default::default()
+                        }
+                    } else {
+                        match ensure_client(&mut guard, &env).await {
+                            Ok(c) => run_plan(c, &sql).await,
+                            Err(e) => PlanOutcome {
+                                error: Some(e),
+                                ..Default::default()
+                            },
+                        }
+                    };
+                    out.elapsed_ms = start.elapsed().as_millis();
+                    let _ = plan_tx_task.send(out);
+                }
             }
         });
 
@@ -539,6 +590,12 @@ pub async fn query_loop(
                 }
                 Target::Schema => {
                     let _ = schema_tx_err.send(SchemaGraph {
+                        error: Some(msg),
+                        ..Default::default()
+                    });
+                }
+                Target::Plan => {
+                    let _ = plan_tx_err.send(PlanOutcome {
                         error: Some(msg),
                         ..Default::default()
                     });
@@ -2970,6 +3027,127 @@ async fn run_query(client: &Client, sql: &str) -> QueryOutcome {
     }
 }
 
+/// クエリの実行計画（PLAN モード）を取得して表示用ツリーに整形する。
+async fn run_plan(client: &Client, sql: &str) -> PlanOutcome {
+    match try_plan(client, sql).await {
+        Ok(lines) if lines.is_empty() => {
+            // エミュレータは EXPLAIN/実行計画に未対応で常に空が返る。
+            let msg = if std::env::var("SPANNER_EMULATOR_HOST").is_ok() {
+                "エミュレータは実行計画(EXPLAIN)に未対応です。実 Spanner では取得できます。"
+            } else {
+                "実行計画が空でした（SELECT 等のクエリで試してください）"
+            };
+            PlanOutcome {
+                error: Some(msg.into()),
+                ..Default::default()
+            }
+        }
+        Ok(lines) => PlanOutcome {
+            lines,
+            ..Default::default()
+        },
+        Err(e) => PlanOutcome {
+            error: Some(e.to_string()),
+            ..Default::default()
+        },
+    }
+}
+
+async fn try_plan(client: &Client, sql: &str) -> anyhow::Result<Vec<PlanLine>> {
+    use gcloud_spanner::transaction::QueryOptions;
+    use google_cloud_googleapis::spanner::v1::execute_sql_request::QueryMode;
+
+    let mut tx = client.single().await?;
+    let opt = QueryOptions {
+        mode: QueryMode::Plan,
+        ..Default::default()
+    };
+    let mut iter = tx.query_with_option(Statement::new(sql), opt).await?;
+    // PLAN モードは行を返さないが、ストリームを最後まで進めて stats を受け取る。
+    while iter.next().await?.is_some() {}
+    let plan = iter.stats().and_then(|s| s.query_plan.clone());
+    Ok(plan.map(|p| build_plan_lines(&p.plan_nodes)).unwrap_or_default())
+}
+
+/// 実行計画ノード（pre-order）を child_links でたどって表示用ツリーにする。
+fn build_plan_lines(
+    nodes: &[google_cloud_googleapis::spanner::v1::PlanNode],
+) -> Vec<PlanLine> {
+    let mut lines = Vec::new();
+    if !nodes.is_empty() {
+        walk_plan(nodes, 0, 0, &mut lines);
+    }
+    lines
+}
+
+fn walk_plan(
+    nodes: &[google_cloud_googleapis::spanner::v1::PlanNode],
+    idx: usize,
+    depth: usize,
+    lines: &mut Vec<PlanLine>,
+) {
+    const MAX_LINES: usize = 4000;
+    const MAX_DEPTH: usize = 60;
+    if lines.len() >= MAX_LINES || depth > MAX_DEPTH {
+        return;
+    }
+    let Some(node) = nodes.get(idx) else {
+        return;
+    };
+    // Kind: Relational=1, Scalar=2。
+    let scalar = node.kind == 2;
+    lines.push(PlanLine {
+        depth,
+        name: if node.display_name.is_empty() {
+            "(node)".to_string()
+        } else {
+            node.display_name.clone()
+        },
+        detail: plan_node_detail(node),
+        scalar,
+    });
+    for cl in &node.child_links {
+        let ci = cl.child_index;
+        // 子は常に親より後（pre-order）。これを満たさないものは循環防止のため無視。
+        if ci > node.index && (ci as usize) < nodes.len() {
+            walk_plan(nodes, ci as usize, depth + 1, lines);
+        }
+    }
+}
+
+/// ノードの補足説明（short_representation と metadata の要約）。
+fn plan_node_detail(node: &google_cloud_googleapis::spanner::v1::PlanNode) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(sr) = &node.short_representation {
+        if !sr.description.is_empty() {
+            parts.push(sr.description.clone());
+        }
+    }
+    if let Some(meta) = &node.metadata {
+        // scan_target / scan_type などを "key=value" で要約（文字列・数値のみ）。
+        let mut keys: Vec<&String> = meta.fields.keys().collect();
+        keys.sort();
+        for k in keys {
+            if let Some(v) = meta.fields.get(k) {
+                if let Some(s) = struct_value_string(v) {
+                    parts.push(format!("{k}={s}"));
+                }
+            }
+        }
+    }
+    parts.join("  ·  ")
+}
+
+fn struct_value_string(v: &prost_types::Value) -> Option<String> {
+    use prost_types::value::Kind;
+    match v.kind.as_ref()? {
+        Kind::StringValue(s) if !s.is_empty() => Some(s.clone()),
+        Kind::NumberValue(n) => Some(format!("{n}")),
+        Kind::BoolValue(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
 async fn try_query(
     client: &Client,
     sql: &str,
@@ -3204,6 +3382,66 @@ mod tests {
                 .as_deref(),
             Some("日本語表")
         );
+    }
+
+    /// 実行計画ツリーの組み立て（pre-order の child_links を深さ付きで展開）。
+    #[test]
+    fn build_plan_lines_tree() {
+        use google_cloud_googleapis::spanner::v1::plan_node::ChildLink;
+        use google_cloud_googleapis::spanner::v1::PlanNode;
+        let node = |idx: i32, name: &str, kind: i32, children: &[i32]| PlanNode {
+            index: idx,
+            kind,
+            display_name: name.into(),
+            child_links: children
+                .iter()
+                .map(|c| ChildLink {
+                    child_index: *c,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        // Union → Serialize → Scan の 3 段ツリー。
+        let nodes = vec![
+            node(0, "Distributed Union", 1, &[1]),
+            node(1, "Serialize Result", 1, &[2]),
+            node(2, "Scan", 1, &[]),
+        ];
+        let lines = build_plan_lines(&nodes);
+        assert_eq!(lines.len(), 3);
+        assert_eq!((lines[0].depth, lines[0].name.as_str()), (0, "Distributed Union"));
+        assert_eq!((lines[1].depth, lines[1].name.as_str()), (1, "Serialize Result"));
+        assert_eq!((lines[2].depth, lines[2].name.as_str()), (2, "Scan"));
+        // 親より小さい/不正な child_index は循環防止で無視（パニックしない）。
+        let bad = vec![node(0, "Root", 1, &[0, 9])];
+        assert_eq!(build_plan_lines(&bad).len(), 1);
+    }
+
+    /// 実行計画を実際に取得できる（emulator 前提・実行はしない）。
+    #[tokio::test]
+    async fn plan_for_select() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _guard = EMU_LOCK.lock().await;
+        reseed_loadtest(20).await;
+        let client = client().await;
+        let out = run_plan(&client, "SELECT Id, Payload FROM LoadTest LIMIT 10").await;
+        // エミュレータは EXPLAIN 未対応で空を返す（その旨のメッセージ）。RPC レベルの
+        // 失敗（接続/SQL エラー）でないこと、計画が返れば depth 0 のルートがあることを確認。
+        if out.lines.is_empty() {
+            assert!(
+                out.error.as_deref().unwrap_or("").contains("エミュレータ"),
+                "想定外のエラー: {:?}",
+                out.error
+            );
+        } else {
+            assert_eq!(out.error, None);
+            assert_eq!(out.lines[0].depth, 0);
+        }
     }
 
     /// SQL 文の種類判定（DDL/DML/Query の振り分け）。

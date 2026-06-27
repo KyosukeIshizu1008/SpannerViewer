@@ -4013,6 +4013,7 @@ dependencies = [
  "image",
  "memchr",
  "memmap2",
+ "prost-types",
  "reqwest 0.12.28",
  "rustls",
  "serde",

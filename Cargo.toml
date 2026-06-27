@@ -31,6 +31,8 @@ uuid = { version = "1", features = ["v4"] }
 # セットアップバイナリ (src/bin/setup.rs) 用 — Admin API の型とエラーコード
 google-cloud-googleapis = { package = "gcloud-googleapis", version = "1.3", features = ["spanner"] }
 google-cloud-gax = { package = "gcloud-gax", version = "1" }
+# 実行計画ノードの metadata(Struct) を読むため
+prost-types = "0.14"
 
 [dev-dependencies]
 # UI の操作テスト＋ヘッドレス描画（PNG スナップショット）用

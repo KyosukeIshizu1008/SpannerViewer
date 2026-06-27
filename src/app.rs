@@ -38,6 +38,7 @@ enum View {
     Schema,
     Import,
     Verify,
+    Plan,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -423,6 +424,7 @@ pub struct Channels {
     pub verify_req_tx: UnboundedSender<query::VerifyRequest>,
     pub verify_res_rx: Receiver<query::VerifyProgress>,
     pub schema_rx: Receiver<SchemaGraph>,
+    pub plan_rx: Receiver<query::PlanOutcome>,
     pub kube_metrics_rx: Receiver<k8s::KubeMetrics>,
     pub kube_topo_req_tx: UnboundedSender<Option<String>>,
     pub kube_topo_rx: Receiver<k8s::ArchGraph>,
@@ -451,6 +453,10 @@ pub struct MonitorApp {
     req_tx: UnboundedSender<(Target, String)>,
     res_rx: Receiver<QueryOutcome>,
     schema_rx: Receiver<SchemaGraph>,
+    // 実行計画
+    plan_rx: Receiver<query::PlanOutcome>,
+    plan_result: Option<query::PlanOutcome>,
+    plan_pending: bool,
     // CSV インポート
     import_req_tx: UnboundedSender<query::ImportRequest>,
     import_res_rx: Receiver<query::ImportProgress>,
@@ -697,6 +703,9 @@ impl MonitorApp {
             req_tx: ch.req_tx,
             res_rx: ch.res_rx,
             schema_rx: ch.schema_rx,
+            plan_rx: ch.plan_rx,
+            plan_result: None,
+            plan_pending: false,
             import_req_tx: ch.import_req_tx,
             import_res_rx: ch.import_res_rx,
             import_dialog: None,
@@ -1145,6 +1154,10 @@ impl MonitorApp {
         while let Ok(g) = self.schema_rx.try_recv() {
             self.schema_pending = false;
             self.schema_graph = Some(g);
+        }
+        while let Ok(p) = self.plan_rx.try_recv() {
+            self.plan_pending = false;
+            self.plan_result = Some(p);
         }
         while let Ok(ev) = self.import_res_rx.try_recv() {
             // ジョブは並列実行されうるので、進捗/完了は id で正しいジョブ行に紐付ける。
@@ -1606,6 +1619,24 @@ impl MonitorApp {
         }
     }
 
+    /// 現在の SQL の実行計画を背景で取得する（PLAN モード・実行はしない）。
+    fn run_plan(&mut self) {
+        let sql = self.sql.trim().to_string();
+        if sql.is_empty() {
+            return;
+        }
+        if self.req_tx.send((Target::Plan, sql)).is_ok() {
+            self.plan_pending = true;
+            self.plan_result = None;
+        } else {
+            self.plan_pending = false;
+            self.plan_result = Some(query::PlanOutcome {
+                error: Some(WORKER_GONE.into()),
+                ..Default::default()
+            });
+        }
+    }
+
     fn run_schema(&mut self) {
         if self.req_tx.send((Target::Schema, String::new())).is_ok() {
             self.schema_pending = true;
@@ -1719,6 +1750,10 @@ impl eframe::App for MonitorApp {
                         ui.add_space(gap);
                         if tab(ui, self.view == View::Verify, "照合") {
                             self.view = View::Verify;
+                        }
+                        ui.add_space(gap);
+                        if tab(ui, self.view == View::Plan, "実行計画") {
+                            self.view = View::Plan;
                         }
                         // 右寄せで project / instance / DB のカスケード選択。
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1984,6 +2019,7 @@ impl eframe::App for MonitorApp {
                 View::Data => self.data_view(ui),
                 View::Import => self.import_view(ui),
                 View::Verify => self.verify_view(ui),
+                View::Plan => self.plan_view(ui),
             },
             Section::Kube => match self.kube_view {
                 KubeView::Monitor => self.kube_monitor_view(ui),
@@ -6275,6 +6311,100 @@ impl MonitorApp {
         }
     }
 
+    fn plan_view(&mut self, ui: &mut egui::Ui) {
+        let mut run = false;
+        egui::Panel::top("plan_bar").show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("クエリの実行計画（EXPLAIN 相当・クエリは実行しません）")
+                    .color(MUTED)
+                    .small(),
+            );
+            ui.add_space(4.0);
+            egui::TextEdit::multiline(&mut self.sql)
+                .desired_rows(3)
+                .desired_width(f32::INFINITY)
+                .code_editor()
+                .show(ui);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.plan_pending, egui::Button::new("実行計画を取得"))
+                    .clicked()
+                {
+                    run = true;
+                }
+                let cmd_enter =
+                    ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
+                if cmd_enter && !self.plan_pending {
+                    run = true;
+                }
+                if self.plan_pending {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("取得中…").color(MUTED));
+                }
+                if let Some(p) = &self.plan_result {
+                    if let Some(e) = &p.error {
+                        ui.colored_label(egui::Color32::from_rgb(248, 113, 113), e);
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} ノード · {} ms",
+                                p.lines.len(),
+                                p.elapsed_ms
+                            ))
+                            .color(MUTED)
+                            .small(),
+                        );
+                    }
+                }
+            });
+            ui.add_space(4.0);
+        });
+
+        egui::CentralPanel::default_margins().show(ui, |ui| {
+            let Some(p) = &self.plan_result else {
+                centered_hint(
+                    ui,
+                    "SQL を入力して「実行計画を取得」を押してください（実行はされません）",
+                );
+                return;
+            };
+            if p.error.is_some() {
+                return; // エラーは上部に表示済み
+            }
+            if p.lines.is_empty() {
+                centered_hint(ui, "実行計画が空です");
+                return;
+            }
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for line in &p.lines {
+                        ui.horizontal(|ui| {
+                            ui.add_space(4.0 + line.depth as f32 * 18.0);
+                            let marker = if line.scalar { "·" } else { "▸" };
+                            let mcol = if line.scalar { MUTED } else { DIAGRAM_ACCENT };
+                            ui.label(egui::RichText::new(marker).color(mcol).monospace());
+                            let ncol = if line.scalar { MUTED } else { TEXT };
+                            let name = egui::RichText::new(&line.name).color(ncol);
+                            ui.label(if line.scalar { name } else { name.strong() });
+                            if !line.detail.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(&line.detail).color(MUTED).small(),
+                                );
+                            }
+                        });
+                    }
+                });
+        });
+
+        if run {
+            self.run_plan();
+        }
+    }
+
     fn schema_view(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("schema_bar").show(ui, |ui| {
             ui.add_space(6.0);
@@ -9460,6 +9590,7 @@ mod tests {
         let (verify_req_tx, _vf) = unbounded_channel();
         let (_vg, verify_res_rx) = channel();
         let (_h, schema_rx) = channel();
+        let (_hp, plan_rx) = channel();
         let (_i, kube_metrics_rx) = channel();
         let (kube_topo_req_tx, _j) = unbounded_channel();
         let (_k, kube_topo_rx) = channel();
@@ -9498,6 +9629,7 @@ mod tests {
             Box::new(_u),
             Box::new(_vf),
             Box::new(_vg),
+            Box::new(_hp),
         ] {
             Box::leak(far);
         }
@@ -9512,6 +9644,7 @@ mod tests {
             verify_req_tx,
             verify_res_rx,
             schema_rx,
+            plan_rx,
             kube_metrics_rx,
             kube_topo_req_tx,
             kube_topo_rx,
@@ -9636,6 +9769,39 @@ mod tests {
         match harness.render() {
             Ok(img) => img.save(dir.join("07_verify.png")).unwrap(),
             Err(e) => eprintln!("[render] 07_verify 失敗: {e}"),
+        }
+
+        // 実行計画タブ（合成プランを注入）。
+        {
+            let app = harness.state_mut();
+            app.section = Section::Spanner;
+            app.view = View::Plan;
+            app.verify = None;
+            app.sql = "SELECT u.Name, COUNT(*) FROM Users u JOIN Orders o ON o.UserId = u.Id GROUP BY u.Name".into();
+            let pl = |depth, name: &str, detail: &str, scalar| query::PlanLine {
+                depth,
+                name: name.into(),
+                detail: detail.into(),
+                scalar,
+            };
+            app.plan_result = Some(query::PlanOutcome {
+                lines: vec![
+                    pl(0, "Distributed Union", "", false),
+                    pl(1, "Serialize Result", "", false),
+                    pl(2, "Global Stream Aggregate", "GROUP BY u.Name", false),
+                    pl(3, "Distributed Cross Apply", "", false),
+                    pl(4, "Table Scan", "scan_target=Users", false),
+                    pl(4, "Index Scan", "scan_target=IDX_Orders_UserId", false),
+                    pl(5, "Reference", "$UserId", true),
+                ],
+                elapsed_ms: 42,
+                error: None,
+            });
+        }
+        harness.run();
+        match harness.render() {
+            Ok(img) => img.save(dir.join("11_plan.png")).unwrap(),
+            Err(e) => eprintln!("[render] 11_plan 失敗: {e}"),
         }
 
         // スキーマ図 + CREATE 文ウィンドウ。

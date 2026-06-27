@@ -73,6 +73,8 @@ fn main() -> eframe::Result<()> {
     let (verify_res_tx, verify_res_rx) = mpsc::channel::<query::VerifyProgress>();
     // スキーマ図: 背景 → UI
     let (schema_tx, schema_rx) = mpsc::channel::<query::SchemaGraph>();
+    // 実行計画: 背景 → UI
+    let (plan_tx, plan_rx) = mpsc::channel::<query::PlanOutcome>();
     // k8s 監視: 背景 → UI
     let (kube_metrics_tx, kube_metrics_rx) = mpsc::channel::<k8s::KubeMetrics>();
     // k8s 構成図: 要求 UI → 背景（対象 namespace）、結果 背景 → UI
@@ -117,7 +119,13 @@ fn main() -> eframe::Result<()> {
                     bg_interval.clone(),
                     sample_tx,
                 )),
-                tokio::spawn(query::query_loop(q_cfg.clone(), req_rx, res_tx, schema_tx)),
+                tokio::spawn(query::query_loop(
+                    q_cfg.clone(),
+                    req_rx,
+                    res_tx,
+                    schema_tx,
+                    plan_tx,
+                )),
                 tokio::spawn(query::import_loop(q_cfg.clone(), import_req_rx, import_res_tx)),
                 tokio::spawn(query::gcs_loop(q_cfg.clone(), gcs_req_rx, gcs_res_tx)),
                 tokio::spawn(query::verify_loop(q_cfg, verify_req_rx, verify_res_tx)),
@@ -184,6 +192,7 @@ fn main() -> eframe::Result<()> {
                     verify_req_tx,
                     verify_res_rx,
                     schema_rx,
+                    plan_rx,
                     kube_metrics_rx,
                     kube_topo_req_tx,
                     kube_topo_rx,
