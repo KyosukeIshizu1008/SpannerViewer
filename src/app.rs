@@ -665,10 +665,19 @@ pub struct MonitorApp {
 }
 
 /// project/instance/database カスケード選択の背景取得結果。
+/// Instances/Databases は「どの親に対する結果か」をタグ付けし、取得中に選択が
+/// 切り替わった場合に古い結果を誤って別の親に紐付けないようにする。
 enum PickMsg {
     Projects(Result<Vec<String>, String>),
-    Instances(Result<Vec<String>, String>),
-    Databases(Result<Vec<String>, String>),
+    Instances {
+        project: String,
+        result: Result<Vec<String>, String>,
+    },
+    Databases {
+        project: String,
+        instance: String,
+        result: Result<Vec<String>, String>,
+    },
 }
 
 impl MonitorApp {
@@ -1072,13 +1081,19 @@ impl MonitorApp {
 
     fn load_instances(&self, ctx: &egui::Context, project: String) {
         self.spawn_pick(ctx, move || {
-            PickMsg::Instances(run_blocking(query::list_instances(&project)))
+            let result = run_blocking(query::list_instances(&project));
+            PickMsg::Instances { project, result }
         });
     }
 
     fn load_databases(&self, ctx: &egui::Context, project: String, instance: String) {
         self.spawn_pick(ctx, move || {
-            PickMsg::Databases(run_blocking(query::list_databases(&project, &instance)))
+            let result = run_blocking(query::list_databases(&project, &instance));
+            PickMsg::Databases {
+                project,
+                instance,
+                result,
+            }
         });
     }
 
@@ -1092,21 +1107,32 @@ impl MonitorApp {
                 self.pick_projects = v;
                 self.pick_error = None;
             }
-            PickMsg::Instances(Ok(v)) => {
-                self.pick_instances = v;
-                self.pick_error = None;
-                // 現在のプロジェクトに対して取得済みと記録（空でも再取得しない）。
-                self.instances_loaded_for = Some(self.pick_project.clone());
-            }
-            PickMsg::Databases(Ok(v)) => {
-                self.pick_databases = v;
-                self.pick_error = None;
-                self.databases_loaded_for =
-                    Some((self.pick_project.clone(), self.pick_instance.clone()));
-            }
-            PickMsg::Projects(Err(e))
-            | PickMsg::Instances(Err(e))
-            | PickMsg::Databases(Err(e)) => {
+            PickMsg::Instances { project, result } => match result {
+                Ok(v) => {
+                    self.pick_error = None;
+                    // 取得中に別プロジェクトへ切り替わっていたら破棄（次フレームで再取得される）。
+                    if project == self.pick_project {
+                        self.pick_instances = v;
+                        self.instances_loaded_for = Some(project);
+                    }
+                }
+                Err(e) => self.pick_error = Some(e),
+            },
+            PickMsg::Databases {
+                project,
+                instance,
+                result,
+            } => match result {
+                Ok(v) => {
+                    self.pick_error = None;
+                    if project == self.pick_project && instance == self.pick_instance {
+                        self.pick_databases = v;
+                        self.databases_loaded_for = Some((project, instance));
+                    }
+                }
+                Err(e) => self.pick_error = Some(e),
+            },
+            PickMsg::Projects(Err(e)) => {
                 self.pick_error = Some(e);
             }
         }
@@ -2818,8 +2844,10 @@ impl CsvTab {
             );
         }
         painter.rect_filled(htrack, 0.0, vbar_bg);
-        if max_off > 0.0 {
-            let tw = (grid.width() / content_w * htrack.width()).clamp(24.0, htrack.width());
+        if max_off > 0.0 && htrack.width() > 0.0 {
+            // 縦と同じく、トラックが 24px 未満でも min>max で clamp が panic しないようにする。
+            let min_tw = 24.0_f32.min(htrack.width());
+            let tw = (grid.width() / content_w * htrack.width()).clamp(min_tw, htrack.width());
             let tx = htrack.left() + (coloff / max_off) * (htrack.width() - tw);
             painter.rect_filled(
                 egui::Rect::from_min_size(egui::pos2(tx, htrack.top() + 2.0), egui::vec2(tw, sb - 4.0)),
@@ -2971,10 +2999,12 @@ impl MonitorApp {
         if let Some(i) = close {
             if i < self.csv_tabs.len() {
                 self.csv_tabs.remove(i);
+                // アクティブより左を閉じたら、表示中タブがずれないよう index を詰める。
+                if i < self.csv_active {
+                    self.csv_active -= 1;
+                }
             }
-            if self.csv_active >= self.csv_tabs.len() {
-                self.csv_active = self.csv_tabs.len().saturating_sub(1);
-            }
+            self.csv_active = self.csv_active.min(self.csv_tabs.len().saturating_sub(1));
         }
 
         if self.csv_tabs.is_empty() {

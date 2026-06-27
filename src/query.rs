@@ -2182,6 +2182,7 @@ struct CsvStreamer {
     pending_quote: bool, // クォート内で直前が " （エスケープ "" か閉じか保留）
     swallow_lf: bool,    // 直前が CRLF の CR（続く LF を 1 つ飲む）
     started: bool,       // 現レコードに何か読み始めたか
+    bom_checked: bool,   // 先頭フィールドの BOM 除去を済ませたか
     encoding: Encoding,  // フィールドのデコード方式
     delimiter: u8,       // フィールド区切り文字
 }
@@ -2201,6 +2202,7 @@ impl CsvStreamer {
             pending_quote: false,
             swallow_lf: false,
             started: false,
+            bom_checked: false,
             encoding,
             delimiter,
         }
@@ -2261,8 +2263,16 @@ impl CsvStreamer {
     }
 
     fn end_field(&mut self) {
-        let s = self.encoding.decode(&self.field);
+        let mut s = self.encoding.decode(&self.field);
         self.field.clear();
+        // 先頭フィールドの BOM を除去する。チャンク境界で生バイト strip_bom が
+        // 取りこぼしても（GCS の極小先頭チャンク等）、デコード後の U+FEFF をここで落とす。
+        if !self.bom_checked {
+            self.bom_checked = true;
+            if let Some(rest) = s.strip_prefix('\u{feff}') {
+                s = rest.to_string();
+            }
+        }
         self.record.push(s);
     }
 
@@ -2757,7 +2767,9 @@ fn group_ddl_by_table(statements: &[String]) -> HashMap<String, String> {
 /// DDL 文が対象とするテーブル名を返す（既定スキーマ前提）。
 fn ddl_target_table(stmt: &str) -> Option<String> {
     let s = stmt.trim();
-    let upper = s.to_uppercase();
+    // ASCII 大文字化はバイト長を変えないので、得たオフセットを s にそのまま使える
+    // （to_uppercase は ß→SS 等で長さが変わりオフセットがずれる）。
+    let upper = s.to_ascii_uppercase();
     if upper.starts_with("CREATE TABLE") {
         return Some(ddl_name_after(s, "CREATE TABLE".len()));
     }
@@ -2776,7 +2788,11 @@ fn ddl_target_table(stmt: &str) -> Option<String> {
 /// キーワード長 `kw_len` の後ろからテーブル名トークンを取り出す（IF NOT EXISTS を読み飛ばす）。
 fn ddl_name_after(s: &str, kw_len: usize) -> String {
     let rest = s.get(kw_len..).unwrap_or("").trim_start();
-    let rest = if rest.len() >= 13 && rest[..13].eq_ignore_ascii_case("IF NOT EXISTS") {
+    // char 境界を割らないよう get(..13) で安全に判定する。
+    let rest = if rest
+        .get(..13)
+        .is_some_and(|h| h.eq_ignore_ascii_case("IF NOT EXISTS"))
+    {
         rest[13..].trim_start()
     } else {
         rest
@@ -3052,6 +3068,20 @@ mod tests {
             Some("Bar")
         );
         assert_eq!(ddl_target_table("SELECT 1").as_deref(), None);
+        // 非 ASCII（マルチバイト）を含んでもパニックせず正しく抜き出す。
+        assert_eq!(
+            ddl_target_table("CREATE TABLE `テーブル名` (Id INT64) PRIMARY KEY(Id)").as_deref(),
+            Some("テーブル名")
+        );
+        assert_eq!(
+            ddl_target_table("CREATE INDEX Ix ON `テーブル名`(列)").as_deref(),
+            Some("テーブル名")
+        );
+        assert_eq!(
+            ddl_target_table("ALTER TABLE `日本語表` ADD CONSTRAINT Fk FOREIGN KEY(X) REFERENCES Y(Z)")
+                .as_deref(),
+            Some("日本語表")
+        );
     }
 
     /// gs:// URI のパース（ネットワーク不要）。
@@ -3155,6 +3185,22 @@ mod tests {
         );
         // 先頭が " のフィールドは従来どおり引用（カンマを保持・外側 " を除去）。
         assert_eq!(stream_all(b"\"a,b\",c\n"), vec![vec!["a,b", "c"]]);
+    }
+
+    /// 先頭の UTF-8 BOM は、1 バイトずつ供給して境界をまたいでも先頭フィールドから除かれる。
+    #[test]
+    fn csv_streamer_strips_bom_across_chunks() {
+        let mut input = vec![0xEF, 0xBB, 0xBF]; // UTF-8 BOM
+        input.extend_from_slice(b"Id,Name\n1,a\n");
+        let mut s = CsvStreamer::default();
+        let mut out = Vec::new();
+        for b in &input {
+            s.push(&[*b], &mut out); // 生 strip_bom を通さず 1 バイトずつ
+        }
+        s.finish(&mut out);
+        assert_eq!(out[0][0], "Id", "先頭フィールドに BOM が残らない");
+        assert_eq!(out[0], vec!["Id", "Name"]);
+        assert_eq!(out[1], vec!["1", "a"]);
     }
 
     /// Shift-JIS デコードとタブ区切りに対応する。

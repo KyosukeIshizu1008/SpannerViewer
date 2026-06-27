@@ -197,9 +197,13 @@ impl CsvIndex {
                 }
             }
         }
-        // 末尾（改行で終わらない最後の行）。
+        // 末尾（改行で終わらない最後の行）。途中の行と同じく末尾の \r は除く。
         if out.len() < cap && !cancel.load(Ordering::Relaxed) && start < data.len() {
-            consider(line, &data[start..], &mut out);
+            let mut e = data.len();
+            if e > start && data[e - 1] == b'\r' {
+                e -= 1;
+            }
+            consider(line, &data[start..e], &mut out);
         }
         progress.store(data.len() as u64, Ordering::Relaxed);
         out
