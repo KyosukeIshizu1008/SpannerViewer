@@ -532,6 +532,8 @@ pub struct MonitorApp {
     node_positions: HashMap<String, egui::Pos2>,
     selected: Option<String>,
     copy_note: Option<String>,
+    /// 図のテーブル名クリックで開く CREATE 文ウィンドウ（テーブル名, DDL）。
+    ddl_view: Option<(String, String)>,
 
     // Kubernetes
     kube_metrics_rx: Receiver<k8s::KubeMetrics>,
@@ -739,6 +741,7 @@ impl MonitorApp {
             node_positions: load_layout(),
             selected: None,
             copy_note: None,
+            ddl_view: None,
             kube_metrics_rx: ch.kube_metrics_rx,
             kube_metrics: None,
             kube_req_tx: ch.kube_topo_req_tx,
@@ -1981,6 +1984,7 @@ impl eframe::App for MonitorApp {
         }
 
         self.settings_window(ctx);
+        self.ddl_window(ctx);
         // インポートのマッピング/進捗は専用「インポート」タブ内にインライン描画する。
         self.gcs_window(ctx);
         self.logs_window(ctx);
@@ -6038,7 +6042,7 @@ impl MonitorApp {
                 ui.separator();
                 ui.label(
                     egui::RichText::new(
-                        "ヘッダ: クリックで名前コピー+選択 / ドラッグで移動 ・ 行: クリックでコピー",
+                        "ヘッダ: クリックで CREATE 文表示 / ドラッグで移動 ・ 行: クリックでコピー",
                     )
                     .color(MUTED)
                     .small(),
@@ -6052,27 +6056,92 @@ impl MonitorApp {
             ui.add_space(6.0);
         });
 
-        let Self {
-            schema_graph,
-            node_positions,
-            selected,
-            diagram_pan,
-            diagram_zoom,
-            copy_note,
-            ..
-        } = self;
-        let g = schema_graph.as_ref();
-        egui::CentralPanel::default_margins().show(ui, |ui| {
-            Self::draw_graph(
-                ui,
-                g,
+        let mut show_ddl: Option<String> = None;
+        {
+            let Self {
+                schema_graph,
                 node_positions,
                 selected,
                 diagram_pan,
                 diagram_zoom,
                 copy_note,
-            );
-        });
+                ..
+            } = self;
+            let g = schema_graph.as_ref();
+            egui::CentralPanel::default_margins().show(ui, |ui| {
+                Self::draw_graph(
+                    ui,
+                    g,
+                    node_positions,
+                    selected,
+                    diagram_pan,
+                    diagram_zoom,
+                    copy_note,
+                    &mut show_ddl,
+                );
+            });
+        }
+        // テーブル名がクリックされたら CREATE 文ウィンドウを開く。
+        if let Some(table) = show_ddl {
+            self.open_ddl_view(&table);
+        }
+    }
+
+    /// 指定テーブルの CREATE 文を組み立ててウィンドウを開く。
+    /// 実 DDL（GetDatabaseDdl）があればそれを、無ければ近似 DDL を表示する。
+    fn open_ddl_view(&mut self, table: &str) {
+        let Some(g) = &self.schema_graph else { return };
+        let ddl = g
+            .ddl
+            .get(table)
+            .cloned()
+            .or_else(|| g.nodes.iter().find(|n| n.name == table).map(build_ddl))
+            .unwrap_or_else(|| format!("-- {table} の DDL を取得できませんでした"));
+        self.ddl_view = Some((table.to_string(), ddl));
+    }
+
+    /// CREATE 文（DDL）ウィンドウ。コピー可能なテキストとして表示する。
+    fn ddl_window(&mut self, ctx: &egui::Context) {
+        let Some((table, ddl)) = self.ddl_view.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut copy = false;
+        let mut close = false;
+        egui::Window::new(format!("CREATE 文 — {table}"))
+            .open(&mut open)
+            .default_size([560.0, 420.0])
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("📋 コピー").clicked() {
+                        copy = true;
+                    }
+                    if ui.button("閉じる").clicked() {
+                        close = true;
+                    }
+                });
+                ui.add_space(6.0);
+                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                    // 等幅で選択コピーできるよう、編集不可の TextEdit を使う。
+                    let mut text = ddl.clone();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(18)
+                            .code_editor()
+                            .interactive(true),
+                    );
+                });
+            });
+        if copy {
+            ctx.copy_text(ddl);
+            self.copy_note = Some(format!("コピー: {table} の CREATE 文"));
+        }
+        if close || !open {
+            self.ddl_view = None;
+        }
     }
 
     /// グラフ（テーブル/依存、または k8s 構成）を図として描画する。
@@ -6086,6 +6155,7 @@ impl MonitorApp {
         diagram_pan: &mut egui::Vec2,
         diagram_zoom: &mut f32,
         copy_note: &mut Option<String>,
+        show_ddl: &mut Option<String>,
     ) {
         let Some(graph) = graph else {
             centered_hint(ui, "読み込み中…");
@@ -6302,14 +6372,9 @@ impl MonitorApp {
                 *cur += hresp.drag_delta() / z;
             }
             if hresp.clicked() {
-                // クリックで選択ハイライト + テーブル名をコピー
-                *selected = if sel.as_deref() == Some(node.name.as_str()) {
-                    None
-                } else {
-                    Some(node.name.clone())
-                };
-                ui.ctx().copy_text(node.name.clone());
-                *copy_note = Some(copied(&node.name));
+                // クリックで選択ハイライト + CREATE 文（DDL）を表示する。
+                *selected = Some(node.name.clone());
+                *show_ddl = Some(node.name.clone());
             }
             if hresp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
@@ -6323,6 +6388,10 @@ impl MonitorApp {
                 .join("\n");
             let idx_joined = node.indexes.join("\n");
             hresp.context_menu(|ui| {
+                if ui.button("CREATE 文を表示").clicked() {
+                    *show_ddl = Some(name.clone());
+                    ui.close();
+                }
                 if ui.button("テーブル名をコピー").clicked() {
                     ui.ctx().copy_text(name.clone());
                     *copy_note = Some(copied(&name));
@@ -8569,6 +8638,7 @@ mod tests {
             ],
             edges: vec![],
             error: None,
+            ddl: std::collections::HashMap::new(),
         };
         let mut harness = Harness::builder()
             .with_size(egui::vec2(1000.0, 560.0))
@@ -8892,6 +8962,33 @@ mod tests {
         match harness.render() {
             Ok(img) => img.save(dir.join("07_verify.png")).unwrap(),
             Err(e) => eprintln!("[render] 07_verify 失敗: {e}"),
+        }
+
+        // スキーマ図 + CREATE 文ウィンドウ。
+        {
+            let app = harness.state_mut();
+            app.section = Section::Spanner;
+            app.view = View::Schema;
+            app.verify = None;
+            app.ddl_view = Some((
+                "Orders".into(),
+                "CREATE TABLE Orders (\n  \
+                 OrderId INT64 NOT NULL,\n  \
+                 UserId INT64,\n  \
+                 Amount NUMERIC,\n) PRIMARY KEY(OrderId);\n\n\
+                 CREATE INDEX IDX_Orders_User ON Orders(UserId);\n\n\
+                 ALTER TABLE Orders ADD CONSTRAINT FK_Orders_Users \
+                 FOREIGN KEY(UserId) REFERENCES Users(Id);"
+                    .into(),
+            ));
+        }
+        // スキーマ未取得でスピナーが回り続けるため run() ではなく step() で 1 フレーム描く。
+        for _ in 0..3 {
+            harness.step();
+        }
+        match harness.render() {
+            Ok(img) => img.save(dir.join("08_ddl.png")).unwrap(),
+            Err(e) => eprintln!("[render] 08_ddl 失敗: {e}"),
         }
 
         eprintln!("[render] PNG 出力先: {}", dir.display());

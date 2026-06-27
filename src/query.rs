@@ -429,6 +429,10 @@ pub struct SchemaGraph {
     pub nodes: Vec<TableNode>,
     pub edges: Vec<Edge>,
     pub error: Option<String>,
+    /// テーブル名 → 実 DDL（GetDatabaseDdl 由来。CREATE TABLE + 付随する
+    /// CREATE INDEX / ALTER TABLE を連結）。取得できなければ空（UI 側で近似 DDL に
+    /// フォールバック）。
+    pub ddl: std::collections::HashMap<String, String>,
 }
 
 const NO_CONFIG: &str = "SPANNER_PROJECT / SPANNER_INSTANCE / SPANNER_DATABASE を設定してください";
@@ -496,7 +500,15 @@ pub async fn query_loop(
                         }
                     } else {
                         match ensure_client(&mut guard, &env).await {
-                            Ok(c) => fetch_schema(c).await,
+                            Ok(c) => {
+                                let mut g = fetch_schema(c).await;
+                                // 実 DDL をベストエフォートで取得（失敗時は近似 DDL に
+                                // フォールバックするので無視してよい）。
+                                if g.error.is_none() {
+                                    g.ddl = fetch_ddl(&env).await;
+                                }
+                                g
+                            }
                             Err(e) => SchemaGraph {
                                 error: Some(e),
                                 ..Default::default()
@@ -2677,7 +2689,91 @@ async fn try_fetch_schema(client: &Client) -> anyhow::Result<SchemaGraph> {
         nodes,
         edges,
         error: None,
+        ddl: HashMap::new(),
     })
+}
+
+/// GetDatabaseDdl で実 DDL を取得し、テーブル名 → 連結 DDL のマップにする
+/// （ベストエフォート。失敗時は空マップ → UI 側で近似 DDL にフォールバック）。
+async fn fetch_ddl(env: &SpannerEnv) -> HashMap<String, String> {
+    (try_fetch_ddl(env).await).unwrap_or_default()
+}
+
+async fn try_fetch_ddl(env: &SpannerEnv) -> anyhow::Result<HashMap<String, String>> {
+    use gcloud_spanner::admin::client::Client as AdminClient;
+    use gcloud_spanner::admin::AdminClientConfig;
+    use google_cloud_googleapis::spanner::admin::database::v1::GetDatabaseDdlRequest;
+
+    let cfg = AdminClientConfig::default().with_auth().await?;
+    let admin = AdminClient::new(cfg).await?;
+    let req = GetDatabaseDdlRequest {
+        database: database_path(env),
+    };
+    let resp = admin.database().get_database_ddl(req, None).await?;
+    Ok(group_ddl_by_table(&resp.into_inner().statements))
+}
+
+/// DDL 文の一覧を、対象テーブルごとにまとめる。CREATE TABLE / CREATE INDEX … ON /
+/// ALTER TABLE を対象テーブルに割り当て、出現順を保って ";\n\n" で連結する。
+fn group_ddl_by_table(statements: &[String]) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    for stmt in statements {
+        let Some(table) = ddl_target_table(stmt) else {
+            continue;
+        };
+        let entry = map.entry(table).or_default();
+        if !entry.is_empty() {
+            entry.push_str(";\n\n");
+        }
+        entry.push_str(stmt.trim());
+    }
+    for v in map.values_mut() {
+        v.push(';');
+    }
+    map
+}
+
+/// DDL 文が対象とするテーブル名を返す（既定スキーマ前提）。
+fn ddl_target_table(stmt: &str) -> Option<String> {
+    let s = stmt.trim();
+    let upper = s.to_uppercase();
+    if upper.starts_with("CREATE TABLE") {
+        return Some(ddl_name_after(s, "CREATE TABLE".len()));
+    }
+    if upper.starts_with("ALTER TABLE") {
+        return Some(ddl_name_after(s, "ALTER TABLE".len()));
+    }
+    // CREATE [UNIQUE] [NULL_FILTERED] INDEX <idx> ON <table> (...)
+    if upper.starts_with("CREATE") && upper.contains(" INDEX ") {
+        if let Some(pos) = upper.find(" ON ") {
+            return Some(strip_table_token(&s[pos + 4..]));
+        }
+    }
+    None
+}
+
+/// キーワード長 `kw_len` の後ろからテーブル名トークンを取り出す（IF NOT EXISTS を読み飛ばす）。
+fn ddl_name_after(s: &str, kw_len: usize) -> String {
+    let rest = s.get(kw_len..).unwrap_or("").trim_start();
+    let rest = if rest.len() >= 13 && rest[..13].eq_ignore_ascii_case("IF NOT EXISTS") {
+        rest[13..].trim_start()
+    } else {
+        rest
+    };
+    strip_table_token(rest)
+}
+
+/// 先頭のテーブル識別子を取り出す（`バッククォート` 付き / 素のどちらにも対応）。
+fn strip_table_token(s: &str) -> String {
+    let s = s.trim_start();
+    if let Some(rest) = s.strip_prefix('`') {
+        if let Some(end) = rest.find('`') {
+            return rest[..end].to_string();
+        }
+    }
+    s.chars()
+        .take_while(|c| !c.is_whitespace() && *c != '(')
+        .collect()
 }
 
 /// テーブルの行数を COUNT(*) で取得する（証跡レポートの「元件数/新規/更新」用、
@@ -2889,12 +2985,53 @@ fn mock_graph() -> SchemaGraph {
             },
         ],
         error: None,
+        ddl: HashMap::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DDL 文をテーブル単位にまとめる（CREATE TABLE + INDEX + FK をその表へ）。
+    #[test]
+    fn group_ddl_collects_table_index_and_fk() {
+        let stmts = vec![
+            "CREATE TABLE Users (\n  Id INT64 NOT NULL,\n  Name STRING(MAX),\n) PRIMARY KEY(Id)".to_string(),
+            "CREATE TABLE Orders (\n  OrderId INT64 NOT NULL,\n  UserId INT64,\n) PRIMARY KEY(OrderId)".to_string(),
+            "CREATE INDEX IDX_Orders_User ON Orders(UserId)".to_string(),
+            "ALTER TABLE Orders ADD CONSTRAINT FK_Orders_Users FOREIGN KEY(UserId) REFERENCES Users(Id)".to_string(),
+        ];
+        let map = group_ddl_by_table(&stmts);
+        // Users は CREATE TABLE のみ。
+        let users = map.get("Users").unwrap();
+        assert!(users.starts_with("CREATE TABLE Users"));
+        assert!(users.ends_with(';'));
+        // Orders は CREATE TABLE + INDEX + ALTER を連結。
+        let orders = map.get("Orders").unwrap();
+        assert!(orders.contains("CREATE TABLE Orders"));
+        assert!(orders.contains("CREATE INDEX IDX_Orders_User ON Orders"));
+        assert!(orders.contains("ALTER TABLE Orders ADD CONSTRAINT FK_Orders_Users"));
+        assert_eq!(orders.matches(";\n\n").count(), 2); // 3 文 → 区切り 2 個
+    }
+
+    /// バッククォート付き / IF NOT EXISTS のテーブル名抽出。
+    #[test]
+    fn ddl_target_table_parsing() {
+        assert_eq!(
+            ddl_target_table("CREATE TABLE `My Tbl` (Id INT64) PRIMARY KEY(Id)").as_deref(),
+            Some("My Tbl")
+        );
+        assert_eq!(
+            ddl_target_table("CREATE TABLE IF NOT EXISTS Foo (Id INT64) PRIMARY KEY(Id)").as_deref(),
+            Some("Foo")
+        );
+        assert_eq!(
+            ddl_target_table("CREATE UNIQUE NULL_FILTERED INDEX Ix ON Bar(Col)").as_deref(),
+            Some("Bar")
+        );
+        assert_eq!(ddl_target_table("SELECT 1").as_deref(), None);
+    }
 
     /// gs:// URI のパース（ネットワーク不要）。
     #[test]
@@ -3603,6 +3740,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows[0][0], "alice2");
+    }
+
+    /// 実 DDL 取得: GetDatabaseDdl から CREATE TABLE が引ける（emulator 前提）。
+    #[tokio::test]
+    async fn fetch_ddl_returns_create_table() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _guard = EMU_LOCK.lock().await;
+        create_import_table().await;
+
+        let ddl = fetch_ddl(&test_env()).await;
+        let create = ddl.get("ImportTest").expect("ImportTest の DDL が無い");
+        assert!(create.contains("CREATE TABLE ImportTest"), "DDL: {create}");
+        assert!(create.contains("PRIMARY KEY"), "DDL: {create}");
+        assert!(create.trim_end().ends_with(';'), "末尾に ; が無い: {create}");
     }
 
     /// CSV↔DB 照合: 一致 / 値差異 / CSVのみ / DBのみ を正しく数える（emulator 前提）。
