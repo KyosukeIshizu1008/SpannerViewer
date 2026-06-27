@@ -7719,8 +7719,10 @@ fn install_japanese_font(ctx: &egui::Context) {
         front.push("latin".to_owned());
     }
     let have_jp = if let Some(b) = jp.iter().find_map(|p| std::fs::read(p).ok()) {
+        // ヒラギノは SF より下に沈むため、欧文（SF=0.15）のベースラインに合わせて
+        // 和文の下げ幅を控えめにする。0.08 が欧文と最も揃う（render_font_alignment_check で実測）。
         let data = egui::FontData::from_owned(b).tweak(egui::FontTweak {
-            y_offset_factor: 0.15,
+            y_offset_factor: 0.08,
             ..Default::default()
         });
         fonts.font_data.insert("jp".to_owned(), Arc::new(data));
@@ -8554,6 +8556,48 @@ mod tests {
             row.column::<i64>(0).unwrap()
         });
         assert_eq!(n, 3, "Spanner に 3 行入っているはず");
+    }
+
+    /// 欧文（SF Pro）と和文（ヒラギノ）が混在したときのベースライン揃いを視覚確認する。
+    /// target/ui_shots/font_check.png に出力。GPU 必須のため #[ignore]。
+    #[ignore = "wgpu アダプタが必要。視覚確認時のみ手動実行する"]
+    #[test]
+    fn render_font_alignment_check() {
+        use egui_kittest::Harness;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        std::fs::create_dir_all("target/ui_shots").unwrap();
+
+        struct FontApp;
+        impl eframe::App for FontApp {
+            fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+                ui.add_space(8.0);
+                for sz in [13.0_f32, 18.0, 26.0] {
+                    ui.label(egui::RichText::new("Abg123 あ漢字Test ボタンRecords 件数Xy").size(sz));
+                    ui.add_space(6.0);
+                }
+                ui.separator();
+                ui.heading("接続(emu) Project 漢字 123");
+                let _ = ui.button("照合を実行 Run 99 件");
+                ui.horizontal(|ui| {
+                    ui.label("CSV件数");
+                    ui.label(egui::RichText::new("12,345").strong());
+                    ui.label("行Records");
+                });
+            }
+        }
+
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(720.0, 460.0))
+            .build_eframe(|cc| {
+                install_japanese_font(&cc.egui_ctx);
+                setup_style(&cc.egui_ctx);
+                FontApp
+            });
+        h.run();
+        match h.render() {
+            Ok(img) => img.save("target/ui_shots/font_check.png").unwrap(),
+            Err(e) => eprintln!("[render] font_check 失敗: {e}"),
+        }
     }
 
     /// 取込中の進捗バー（％・行数・速度・ETA）が描画されることを視覚確認する。
