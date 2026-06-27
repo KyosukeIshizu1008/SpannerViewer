@@ -549,7 +549,7 @@ pub struct MonitorApp {
 
     // CSV ビューア（巨大ファイル: mmap + 行仮想化）
     csv_path: Option<std::path::PathBuf>,
-    csv_index: Option<csvview::CsvIndex>,
+    csv_index: Option<std::sync::Arc<csvview::CsvIndex>>,
     csv_result: std::sync::Arc<std::sync::Mutex<Option<Result<csvview::CsvIndex, String>>>>,
     csv_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     csv_total_bytes: u64,
@@ -560,6 +560,14 @@ pub struct MonitorApp {
     csv_has_header: bool,
     csv_goto: String,
     csv_err: Option<String>,
+    // 検索/絞り込み
+    csv_filter: String,
+    csv_filter_col: Option<usize>, // None=全列
+    csv_matches: Option<std::sync::Arc<Vec<u64>>>, // 一致した「ファイル行」
+    csv_filtering: bool,
+    csv_filter_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    csv_filter_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    csv_filter_result: std::sync::Arc<std::sync::Mutex<Option<Vec<u64>>>>,
 
     section: Section,
     view: View,
@@ -733,6 +741,13 @@ impl MonitorApp {
             csv_has_header: true,
             csv_goto: String::new(),
             csv_err: None,
+            csv_filter: String::new(),
+            csv_filter_col: None,
+            csv_matches: None,
+            csv_filtering: false,
+            csv_filter_progress: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            csv_filter_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            csv_filter_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
 
             section: Section::Spanner,
             view: View::Monitor,
@@ -1839,6 +1854,32 @@ impl MonitorApp {
         });
     }
 
+    /// 検索/絞り込みを背景スレッドで実行（全件スキャン・進捗・キャンセル可）。
+    fn start_filter_scan(&mut self, ctx: &egui::Context) {
+        use std::sync::atomic::Ordering;
+        let Some(idx) = self.csv_index.clone() else {
+            return;
+        };
+        let needle = self.csv_filter.trim().to_string();
+        let col = self.csv_filter_col;
+        let delim = self.csv_delim;
+        let has_header = self.csv_has_header;
+        self.csv_filtering = true;
+        self.csv_filter_cancel.store(false, Ordering::Relaxed);
+        self.csv_filter_progress.store(0, Ordering::Relaxed);
+        *self.csv_filter_result.lock().unwrap() = None;
+        let cancel = self.csv_filter_cancel.clone();
+        let prog = self.csv_filter_progress.clone();
+        let slot = self.csv_filter_result.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let cap = 5_000_000; // 一致件数の上限（メモリ保護）
+            let v = idx.scan_filter(&needle, col, delim, has_header, &cancel, &prog, cap);
+            *slot.lock().unwrap() = Some(v);
+            ctx.request_repaint();
+        });
+    }
+
     fn csv_view(&mut self, ui: &mut egui::Ui) {
         use std::sync::atomic::Ordering;
         // 背景の索引作成結果を取り込む。
@@ -1846,9 +1887,17 @@ impl MonitorApp {
             if let Some(r) = self.csv_result.lock().unwrap().take() {
                 self.csv_loading = false;
                 match r {
-                    Ok(idx) => self.csv_index = Some(idx),
+                    Ok(idx) => self.csv_index = Some(std::sync::Arc::new(idx)),
                     Err(e) => self.csv_err = Some(e),
                 }
+            }
+        }
+        // 絞り込みスキャン結果を取り込む。
+        if self.csv_filtering {
+            if let Some(v) = self.csv_filter_result.lock().unwrap().take() {
+                self.csv_filtering = false;
+                self.csv_first_row = 0;
+                self.csv_matches = Some(std::sync::Arc::new(v));
             }
         }
 
@@ -1912,6 +1961,85 @@ impl MonitorApp {
             }
         }
 
+        // ── 検索 / 絞り込み行 ──
+        if self.csv_index.is_some() {
+            let header_names: Vec<String> = {
+                let idx = self.csv_index.as_ref().unwrap();
+                if self.csv_has_header {
+                    idx.parse_row(0, self.csv_delim)
+                } else {
+                    (1..=idx.column_count(self.csv_delim))
+                        .map(|i| format!("列{i}"))
+                        .collect()
+                }
+            };
+            let mut do_filter = false;
+            let mut do_clear = false;
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label("絞り込み:");
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.csv_filter)
+                        .desired_width(220.0)
+                        .hint_text("含む文字列（大小無視）"),
+                );
+                let col_label = match self.csv_filter_col {
+                    None => "全列".to_string(),
+                    Some(c) => header_names.get(c).cloned().unwrap_or_else(|| format!("列{c}")),
+                };
+                egui::ComboBox::from_id_salt("csv_filter_col")
+                    .selected_text(col_label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.csv_filter_col, None, "全列");
+                        for (c, name) in header_names.iter().enumerate() {
+                            ui.selectable_value(&mut self.csv_filter_col, Some(c), name);
+                        }
+                    });
+                if ui.button("実行").clicked()
+                    || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                {
+                    do_filter = true;
+                }
+                if self.csv_matches.is_some() && ui.button("解除").clicked() {
+                    do_clear = true;
+                }
+                if self.csv_filtering {
+                    ui.spinner();
+                    if ui.button("キャンセル").clicked() {
+                        self.csv_filter_cancel
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                if let Some(m) = &self.csv_matches {
+                    ui.label(
+                        egui::RichText::new(format!("{} 件一致", fmt_count(m.len())))
+                            .color(ACCENT),
+                    );
+                }
+            });
+            if do_filter && !self.csv_filter.trim().is_empty() {
+                self.start_filter_scan(ui.ctx());
+            }
+            if do_clear {
+                self.csv_matches = None;
+                self.csv_first_row = 0;
+            }
+            if self.csv_filtering {
+                let done = self.csv_filter_progress.load(Ordering::Relaxed);
+                let frac = if self.csv_total_bytes > 0 {
+                    (done as f32 / self.csv_total_bytes as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .text("スキャン中…")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.ctx().request_repaint();
+            }
+        }
+
         if self.csv_loading {
             let done = self.csv_progress.load(Ordering::Relaxed);
             let frac = if self.csv_total_bytes > 0 {
@@ -1953,7 +2081,12 @@ impl MonitorApp {
             (idx.total_rows, idx.column_count(delim).max(1))
         };
         let header_off: u64 = if has_header && total > 0 { 1 } else { 0 };
-        let data_rows = total - header_off;
+        // 絞り込み中はその一致行集合が表示対象。
+        let matches = self.csv_matches.clone();
+        let data_rows: u64 = match &matches {
+            Some(m) => m.len() as u64,
+            None => total - header_off,
+        };
 
         let row_h = 22.0_f32;
         let col_w = 160.0_f32;
@@ -2084,7 +2217,10 @@ impl MonitorApp {
             if di >= data_rows {
                 break;
             }
-            let file_row = header_off + di;
+            let file_row = match &matches {
+                Some(m) => m[di as usize],
+                None => header_off + di,
+            };
             let y = body_top + vr as f32 * row_h;
             if vr % 2 == 1 {
                 painter.rect_filled(
@@ -7233,7 +7369,7 @@ mod tests {
             let app = harness.state_mut();
             app.section = Section::Csv;
             app.csv_path = Some(path.clone());
-            app.csv_index = Some(idx);
+            app.csv_index = Some(std::sync::Arc::new(idx));
             app.csv_first_row = 0;
         }
         harness.step();
