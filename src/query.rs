@@ -4967,6 +4967,112 @@ mod tests {
         assert_eq!(r2.db_only, 2);
     }
 
+    /// 決定的バグハント: 同じ CSV をインポート→その同じ CSV で照合したら 100% 一致するはず。
+    /// STRING PK・桁数バラバラの数値ID 5000 件・他テーブルデータ混在の条件を再現する。
+    /// 一致しなければ取込か照合にバグがある（emulator 前提）。
+    #[tokio::test]
+    async fn import_then_verify_same_csv_all_match() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _guard = EMU_LOCK.lock().await;
+        // STRING PK のテーブル。
+        {
+            use gcloud_spanner::admin::client::Client as AdminClient;
+            use gcloud_spanner::admin::AdminClientConfig;
+            use google_cloud_googleapis::spanner::admin::database::v1::UpdateDatabaseDdlRequest;
+            let cfg = AdminClientConfig::default().with_auth().await.unwrap();
+            let admin = AdminClient::new(cfg).await.unwrap();
+            let req = UpdateDatabaseDdlRequest {
+                database: emulator_db().unwrap(),
+                statements: vec![
+                    "CREATE TABLE IF NOT EXISTS StrKeyAll (Code STRING(MAX) NOT NULL, \
+                     Name STRING(MAX)) PRIMARY KEY (Code)"
+                        .to_string(),
+                ],
+                ..Default::default()
+            };
+            admin.database().update_database_ddl(req, None).await.unwrap().wait(None).await.unwrap();
+        }
+        let c = client().await;
+        let _ = c
+            .apply(vec![gcloud_spanner::mutation::delete(
+                "StrKeyAll",
+                gcloud_spanner::key::all_keys(),
+            )])
+            .await;
+        // 他テーブル/他データ混在を模す: 関係ない Code を先に入れておく。
+        c.apply(vec![
+            gcloud_spanner::mutation::insert_or_update("StrKeyAll", &["Code", "Name"], &[&"OTHER-1", &"x"]),
+            gcloud_spanner::mutation::insert_or_update("StrKeyAll", &["Code", "Name"], &[&"OTHER-2", &"y"]),
+        ])
+        .await
+        .unwrap();
+
+        // 桁数バラバラの数値ID 5000 件（"0".."4999"）+ 巨大IDを少し。Name も持つ。
+        const N: usize = 5000;
+        let mut csv = String::from("Code,Name\n");
+        for i in 0..N {
+            csv.push_str(&format!("{i},name{i}\n"));
+        }
+        csv.push_str("123456789012345678,big\n");
+        csv.push_str("999999999999999999,big2\n");
+        let total_csv = N + 2;
+        let path = write_temp_csv("same_csv", &csv);
+
+        // インポート（Code=PK, Name）。
+        let import = ImportRequest {
+            id: 0,
+            table: "StrKeyAll".into(),
+            columns: cols(&[("Code", "STRING(MAX)"), ("Name", "STRING(MAX)")]),
+            source: ImportSource::File(path.clone()),
+            has_header: true,
+            mode: ImportMode::InsertOrUpdate,
+            empty_as_null: true,
+            fresh: true,
+            encoding: Encoding::Utf8,
+            delimiter: b',',
+            skip_bad_rows: false,
+            dry_run: false,
+            null_token: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (ptx, _p) = std::sync::mpsc::channel::<ImportProgress>();
+        let out = run_streaming_import(&test_env(), &import, false, &ptx).await;
+        assert_eq!(out.error, None, "import error: {:?}", out.error);
+        assert_eq!(out.written, total_csv, "全件書き込まれるはず（取込の取りこぼし検出）");
+
+        // 同じ CSV で照合（Code=PK のみ）。混在データがあっても本ファイルは全件一致のはず。
+        for numeric in [true, false] {
+            let vreq = VerifyRequest {
+                table: "StrKeyAll".into(),
+                columns: vec![VerifyColumn { name: "Code".into(), pk: true, src_index: 0 }],
+                source: ImportSource::File(path.clone()),
+                has_header: true,
+                encoding: Encoding::Utf8,
+                delimiter: b',',
+                empty_as_null: true,
+                null_token: None,
+                numeric_match: numeric,
+                cancel: Arc::new(AtomicBool::new(false)),
+            };
+            let (vtx, _v) = std::sync::mpsc::channel::<VerifyProgress>();
+            let r = run_verify(&test_env(), &vreq, false, &vtx).await;
+            assert_eq!(r.error, None, "verify error: {:?}", r.error);
+            assert_eq!(r.csv_rows, total_csv, "[numeric={numeric}] csv_rows");
+            assert_eq!(
+                r.matched, total_csv,
+                "[numeric={numeric}] 同じCSVなのに一致しない=バグ: matched={} csv_only={} db_only={}",
+                r.matched, r.csv_only, r.db_only
+            );
+            assert_eq!(r.csv_only, 0, "[numeric={numeric}] csv_only");
+            // 混在の OTHER-1/2 が db_only に出る（本ファイルにはない）。
+            assert_eq!(r.db_only, 2, "[numeric={numeric}] db_only=混在データ2件");
+        }
+    }
+
     /// 照合: PK 列だけマッピングすれば「DB に存在するか（存在確認）」ができる。
     /// 値差異は常に 0、CSVのみ = 不足行、になる（emulator 前提）。
     #[tokio::test]
