@@ -4466,6 +4466,75 @@ mod tests {
         assert_eq!(rows[3][2], "last");
     }
 
+    /// 照合: PK 列だけマッピングすれば「DB に存在するか（存在確認）」ができる。
+    /// 値差異は常に 0、CSVのみ = 不足行、になる（emulator 前提）。
+    #[tokio::test]
+    async fn verify_pk_only_existence_check() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _guard = EMU_LOCK.lock().await;
+        create_import_table().await;
+
+        // DB に Id 1,2,3 を投入（Name は適当）。
+        let seed = "Id,Name,Score,Active,Note\n1,a,1,true,\n2,b,2,true,\n3,c,3,true,\n";
+        let import = ImportRequest {
+            id: 0,
+            table: "ImportTest".into(),
+            columns: cols(&[
+                ("Id", "INT64"),
+                ("Name", "STRING(MAX)"),
+                ("Score", "FLOAT64"),
+                ("Active", "BOOL"),
+                ("Note", "STRING(MAX)"),
+            ]),
+            source: ImportSource::File(write_temp_csv("pkonly_seed", seed)),
+            has_header: true,
+            mode: ImportMode::InsertOrUpdate,
+            empty_as_null: true,
+            fresh: true,
+            encoding: Encoding::Utf8,
+            delimiter: b',',
+            skip_bad_rows: false,
+            dry_run: false,
+            null_token: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (ptx, _p) = std::sync::mpsc::channel::<ImportProgress>();
+        assert_eq!(
+            run_streaming_import(&test_env(), &import, false, &ptx).await.error,
+            None
+        );
+
+        // スプレッドシート相当（Id だけの列・名前は何でもよい）。Id 1,2,4。
+        let csv = "Key\n1\n2\n4\n";
+        let vreq = VerifyRequest {
+            table: "ImportTest".into(),
+            // PK 列(Id)だけをマッピング。他列はマッピングしない。
+            columns: vec![VerifyColumn {
+                name: "Id".into(),
+                pk: true,
+                src_index: 0,
+            }],
+            source: ImportSource::File(write_temp_csv("pkonly_target", csv)),
+            has_header: true,
+            encoding: Encoding::Utf8,
+            delimiter: b',',
+            empty_as_null: true,
+            null_token: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (vtx, _v) = std::sync::mpsc::channel::<VerifyProgress>();
+        let r = run_verify(&test_env(), &vreq, false, &vtx).await;
+        assert_eq!(r.error, None, "verify error: {:?}", r.error);
+        assert_eq!(r.matched, 2, "1,2 は存在");
+        assert_eq!(r.value_mismatch, 0, "PK のみなので値差異は常に 0");
+        assert_eq!(r.csv_only, 1, "4 は DB に無い（不足行）");
+        assert_eq!(r.db_only, 1, "3 はスプレッドシートに無い");
+    }
+
     /// CSV↔DB 照合: 一致 / 値差異 / CSVのみ / DBのみ を正しく数える（emulator 前提）。
     #[tokio::test]
     async fn verify_counts_match_mismatch_csvonly_dbonly() {
