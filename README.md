@@ -29,7 +29,8 @@ cargo run --release
 
 ## 配布 (.dmg のビルド) — macOS
 
-署名なしの配布用ディスクイメージを作成します（標準の `hdiutil` のみ使用）。
+配布用ディスクイメージを作成します（標準の `hdiutil` のみ使用、外部依存なし）。
+ビルド時にアプリをアドホック署名します（`CODESIGN_IDENTITY` を指定すれば Developer ID 署名）。
 
 ```sh
 scripts/build-dmg.sh
@@ -41,8 +42,25 @@ scripts/build-dmg.sh
 は `scripts/make-icon.py` で生成されます（リポジトリにコミット済みなので python3 が
 無くても DMG は作れます）。
 
-> 署名していないため、受け取った側は初回のみ Finder でアプリを右クリック →「開く」で
-> Gatekeeper の警告を許可してください。
+### 「壊れているため開けません。ゴミ箱に入れる必要があります」と出るとき
+
+公証 (notarization) していないため、DMG をダウンロード/共有して別の Mac で開くと、
+macOS が隔離属性を付け Gatekeeper が起動をブロックします（**アプリが壊れているわけ
+ではありません**）。受け取った側の Mac で次のいずれかを行ってください。
+
+1. DMG を開き `Spanner Viewer.app` を `/Applications` にドラッグ（コピーはできます）。
+2. ターミナルで隔離属性を外す:
+
+   ```sh
+   xattr -dr com.apple.quarantine "/Applications/Spanner Viewer.app"
+   ```
+
+   （権限エラーなら `sudo xattr -rd com.apple.quarantine "/Applications/Spanner Viewer.app"`）
+3. 通常どおりダブルクリックで開く。
+
+> 受け取る人が何もせずに開けるようにするには、Apple Developer ID 署名＋公証が必要です:
+> `CODESIGN_IDENTITY="Developer ID Application: 名前 (TEAMID)" scripts/build-dmg.sh` の後に
+> `xcrun notarytool submit --wait` → `xcrun stapler staple` を実行してください。
 
 ## モックモード（実 Spanner / 認証 不要）
 
