@@ -4001,6 +4001,7 @@ impl MonitorApp {
             .filter_map(|(col, m)| {
                 m.map(|src| query::VerifyColumn {
                     name: col.name.clone(),
+                    ty: col.ty.clone(),
                     pk: col.pk,
                     src_index: src,
                 })
@@ -8881,20 +8882,34 @@ fn verify_result_ui(
             res.csv_only,
             egui::Color32::from_rgb(96, 165, 250),
         );
-        verify_stat(
-            ui,
-            "DBのみ",
-            res.db_only,
-            egui::Color32::from_rgb(248, 113, 113),
-        );
+        if res.db_only_checked {
+            verify_stat(
+                ui,
+                "DBのみ",
+                res.db_only,
+                egui::Color32::from_rgb(248, 113, 113),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new("DBのみ: 未算出")
+                    .color(MUTED)
+                    .small(),
+            )
+            .on_hover_text("テーブルが大きいため『DBのみ』は算出していません（存在確認には不要）。");
+        }
     });
     ui.add_space(6.0);
-    let perfect = res.value_mismatch == 0 && res.csv_only == 0 && res.db_only == 0;
+    // 「完全一致」は算出できた指標だけで判定（DBのみ未算出ならそれは除く）。
+    let perfect = res.value_mismatch == 0
+        && res.csv_only == 0
+        && (!res.db_only_checked || res.db_only == 0);
     if perfect {
-        ui.colored_label(
-            egui::Color32::from_rgb(74, 222, 128),
-            "✓ 完全一致（CSV と DB のレコードは同一です）",
-        );
+        let msg = if res.db_only_checked {
+            "✓ 完全一致（CSV と DB のレコードは同一です）"
+        } else {
+            "✓ CSV のレコードはすべて DB に存在し、値も一致しています"
+        };
+        ui.colored_label(egui::Color32::from_rgb(74, 222, 128), msg);
     } else {
         ui.colored_label(
             egui::Color32::from_rgb(251, 191, 36),
@@ -8912,7 +8927,7 @@ fn verify_result_ui(
     );
     ui.label(
         egui::RichText::new(format!(
-            "CSV {} 行 / DB {} 行{extra}",
+            "CSV {} 行 / うち DB に存在 {} 行{extra}",
             fmt_count(res.csv_rows),
             fmt_count(res.db_rows),
         ))
@@ -10190,6 +10205,7 @@ mod tests {
                 ],
                 samples_truncated: false,
                 db_truncated: false,
+                db_only_checked: true,
                 elapsed_ms: 1234,
                 error: None,
                 note: None,

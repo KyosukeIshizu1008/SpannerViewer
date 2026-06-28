@@ -294,6 +294,9 @@ pub enum ImportProgress {
 #[derive(Clone, Debug)]
 pub struct VerifyColumn {
     pub name: String,
+    /// テーブル列の型（INT64 / STRING(MAX) など）。PK 問い合わせを索引が効く
+    /// ネイティブ型で行うために使う。
+    pub ty: String,
     /// 主キー構成カラムか（行の突合キーに使う）。
     pub pk: bool,
     /// この列に対応する CSV 側の列インデックス（0 始まり）。
@@ -366,6 +369,8 @@ pub struct VerifyOutcome {
     pub samples_truncated: bool,
     /// DB 行を上限で打ち切ったか（巨大テーブル時）。
     pub db_truncated: bool,
+    /// 「DBのみ」を算出できたか（巨大テーブルでは未算出 = false）。
+    pub db_only_checked: bool,
     pub elapsed_ms: u128,
     pub error: Option<String>,
     /// 補足（モード制限など）。
@@ -668,7 +673,13 @@ pub async fn import_loop(
 }
 
 /// 照合で DB に読み込む最大行数（メモリ保護。超えたら note で通知）。
+#[allow(dead_code)]
 const VERIFY_DB_CAP: usize = 5_000_000;
+/// 1 回の DB 問い合わせにまとめる CSV キー数（WHERE pk IN UNNEST(@keys) のバッチ）。
+const VERIFY_BATCH: usize = 1_000;
+/// 「DBのみ」算出のためにテーブルを走査する最大行数。これを超えたら未算出にする
+/// （巨大テーブルでは「DBのみ」は意味が薄く、存在確認には不要）。
+const VERIFY_DBONLY_SCAN_CAP: usize = 200_000;
 /// 不一致サンプルの保持上限（UI 表示用。総数は別途集計）。
 const VERIFY_SAMPLE_CAP: usize = 500;
 /// 複合主キーの内部連結に使う区切り（データに現れない制御文字）。
@@ -804,6 +815,8 @@ fn canon_cell(raw: &str, empty_as_null: bool, null_token: Option<&str>) -> Strin
 }
 
 /// テーブル全行を読み込む（行数上限 cap）。UI 保護の MAX_ROWS は適用しない。
+/// （照合はキー突合方式に移行したため、現在はテスト専用。）
+#[cfg_attr(not(test), allow(dead_code))]
 async fn read_all_rows(
     client: &Client,
     sql: &str,
@@ -857,61 +870,36 @@ async fn run_verify(
         };
     }
 
-    // ── DB 側を全件読み込み、主キー → 全カラム値 のマップを作る ──
-    // モックモードでは実テーブルが無いので空とみなす（CSV 件数のみ）。
-    let mut db_map: HashMap<String, Vec<String>> = HashMap::new();
-    let mut db_truncated = false;
-    if !mock {
-        let select_cols = req
-            .columns
-            .iter()
-            .map(|c| format!("`{}`", c.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("SELECT {select_cols} FROM `{}`", req.table);
-        let client = match build_client(env).await {
-            Ok(c) => c,
+    // ── キー突合方式 ──
+    // 旧方式はテーブルを全件メモリに読んでいたため、巨大テーブル（億単位）では
+    // 上限で打ち切られ、CSV の大半が「DBに無い」と誤判定された。新方式は
+    // 「CSV の主キーだけを DB に問い合わせる」（WHERE pk IN UNNEST(@keys) を
+    // バッチで）ので、テーブルが何億行でもスケールする。
+    let select_cols = req
+        .columns
+        .iter()
+        .map(|c| format!("`{}`", c.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let key_expr = pk_key_expr(&req.columns, &pk_positions);
+    // PK 問い合わせはネイティブ型で行い主キー索引を使う（CAST は索引を無効化し
+    // 全表スキャンになるため、巨大テーブルで破綻する）。
+    let pkq = pk_query(&req.columns, &pk_positions);
+
+    let client = if mock {
+        None
+    } else {
+        match build_client(env).await {
+            Ok(c) => Some(c),
             Err(e) => {
                 return VerifyOutcome {
                     error: Some(format!("接続/認証に失敗: {e}")),
                     ..Default::default()
                 }
             }
-        };
-        let _ = progress.send(VerifyProgress::Progress {
-            phase: "DB読込",
-            db_rows: 0,
-            csv_rows: 0,
-        });
-        let (rows, truncated) = match read_all_rows(&client, &sql, VERIFY_DB_CAP).await {
-            Ok(v) => v,
-            Err(e) => {
-                return VerifyOutcome {
-                    error: Some(format!("DB 読み込みに失敗: {e}")),
-                    ..Default::default()
-                }
-            }
-        };
-        db_truncated = truncated;
-        db_map.reserve(rows.len());
-        for row in rows {
-            // SELECT の列順 = req.columns 順。PK 位置から突合キーを作る。
-            // numeric_match 時は数値表記ゆれを吸収して突合する。
-            let key = pk_positions
-                .iter()
-                .map(|&p| cmp_norm(row.get(p).map(|s| s.as_str()).unwrap_or(""), req.numeric_match))
-                .collect::<Vec<_>>()
-                .join(&KEY_SEP.to_string());
-            db_map.insert(key, row);
         }
-        let _ = progress.send(VerifyProgress::Progress {
-            phase: "DB読込",
-            db_rows: db_map.len(),
-            csv_rows: 0,
-        });
-    }
+    };
 
-    // ── CSV をストリーミングし、各行を DB マップと突合 ──
     let (mut source, _bytes_total, _id) = match open_source(&req.source).await {
         Ok(s) => s,
         Err(e) => {
@@ -922,12 +910,7 @@ async fn run_verify(
         }
     };
 
-    let mut out = VerifyOutcome {
-        db_rows: db_map.len(),
-        db_truncated,
-        ..Default::default()
-    };
-    // CSV 側で突合できた DB キー（db_only 算出用）と、CSV 内重複検出用。
+    let mut out = VerifyOutcome::default();
     let mut matched_keys: HashSet<String> = HashSet::new();
     let mut csv_seen: HashSet<String> = HashSet::new();
 
@@ -935,63 +918,45 @@ async fn run_verify(
     let mut recs: Vec<Vec<String>> = Vec::new();
     let mut first_chunk = true;
     let mut row_no = 0usize; // 1 始まりの CSV 行番号（ヘッダ含む）
+    let mut batch: Vec<VItem> = Vec::with_capacity(VERIFY_BATCH);
 
-    let process = |rec: &[String],
-                       out: &mut VerifyOutcome,
-                       matched_keys: &mut HashSet<String>,
-                       csv_seen: &mut HashSet<String>| {
-        out.csv_rows += 1;
-        // 表示用（NULL トークン/空欄を NULL に揃えた生の値）。
-        let cell_disp = |src: usize| -> String {
-            let raw = rec.get(src).map(|s| s.as_str()).unwrap_or("");
-            canon_cell(raw, req.empty_as_null, req.null_token.as_deref())
+    macro_rules! flush_batch {
+        () => {
+            if !batch.is_empty() {
+                if let Some(client) = &client {
+                    if let Err(e) = verify_lookup_batch(
+                        client,
+                        &req.table,
+                        &select_cols,
+                        &pkq,
+                        &batch,
+                        req,
+                        &mut out,
+                        &mut matched_keys,
+                    )
+                    .await
+                    {
+                        out.error = Some(e);
+                        return out;
+                    }
+                } else {
+                    // モック: DB が無いので全件 CSVのみ。
+                    for it in &batch {
+                        out.csv_only += 1;
+                        push_sample(&mut out, VerifyKind::CsvOnly, it.key_show.clone(), String::new());
+                    }
+                }
+                batch.clear();
+                let _ = progress.send(VerifyProgress::Progress {
+                    phase: "CSV照合",
+                    db_rows: matched_keys.len(),
+                    csv_rows: out.csv_rows,
+                });
+            }
         };
-        // 比較用（さらに数値/空白の表記ゆれを吸収）。
-        let cell_cmp = |src: usize| -> String { cmp_norm(&cell_disp(src), req.numeric_match) };
-        let key_disp = pk_positions
-            .iter()
-            .map(|&p| cell_disp(req.columns[p].src_index))
-            .collect::<Vec<_>>();
-        let key = pk_positions
-            .iter()
-            .map(|&p| cell_cmp(req.columns[p].src_index))
-            .collect::<Vec<_>>()
-            .join(&KEY_SEP.to_string());
-        let key_show = key_disp.join(", ");
-        if !csv_seen.insert(key.clone()) {
-            out.csv_dup += 1;
-        }
-        match db_map.get(&key) {
-            None => {
-                out.csv_only += 1;
-                push_sample(out, VerifyKind::CsvOnly, key_show, String::new());
-            }
-            Some(db_row) => {
-                matched_keys.insert(key.clone());
-                // 全カラム値を比較し、最初に異なる列を詳細に出す（表記ゆれは吸収）。
-                let mut diff: Option<String> = None;
-                for (i, c) in req.columns.iter().enumerate() {
-                    let cv = cell_cmp(c.src_index);
-                    let dv_raw = db_row.get(i).cloned().unwrap_or_default();
-                    let dv = cmp_norm(&dv_raw, req.numeric_match);
-                    if cv != dv {
-                        let cv_disp = cell_disp(c.src_index);
-                        diff = Some(format!("{}: '{cv_disp}'(csv) ≠ '{dv_raw}'(db)", c.name));
-                        break;
-                    }
-                }
-                match diff {
-                    None => out.matched += 1,
-                    Some(detail) => {
-                        out.value_mismatch += 1;
-                        push_sample(out, VerifyKind::ValueMismatch, key_show, detail);
-                    }
-                }
-            }
-        }
-    };
+    }
 
-    loop {
+    'stream: loop {
         if req.cancel.load(Ordering::Relaxed) {
             out.note = Some("中断しました（部分的な結果）".into());
             break;
@@ -1016,15 +981,19 @@ async fn run_verify(
             if req.has_header && row_no == 1 {
                 continue; // ヘッダ行は飛ばす
             }
-            // 列数が極端に少ない行も突合は試みる（不足分は空欄補完）。
-            process(&rec, &mut out, &mut matched_keys, &mut csv_seen);
-        }
-        if out.csv_rows.is_multiple_of(50_000) {
-            let _ = progress.send(VerifyProgress::Progress {
-                phase: "CSV照合",
-                db_rows: out.db_rows,
-                csv_rows: out.csv_rows,
-            });
+            out.csv_rows += 1;
+            let item = build_vitem(&rec, req, &pk_positions);
+            if !csv_seen.insert(item.cmp_key.clone()) {
+                out.csv_dup += 1;
+            }
+            batch.push(item);
+            if batch.len() >= VERIFY_BATCH {
+                flush_batch!();
+                if req.cancel.load(Ordering::Relaxed) {
+                    out.note = Some("中断しました（部分的な結果）".into());
+                    break 'stream;
+                }
+            }
         }
     }
     // 末尾の未確定レコードを処理。
@@ -1034,36 +1003,255 @@ async fn run_verify(
         if req.has_header && row_no == 1 {
             continue;
         }
-        process(&rec, &mut out, &mut matched_keys, &mut csv_seen);
-    }
-
-    // DB のみ（CSV で突合されなかった DB キー）。
-    out.db_only = db_map.len().saturating_sub(matched_keys.len());
-    for (key, _) in db_map.iter() {
-        if out.samples.len() >= VERIFY_SAMPLE_CAP {
-            out.samples_truncated = true;
-            break;
+        out.csv_rows += 1;
+        let item = build_vitem(&rec, req, &pk_positions);
+        if !csv_seen.insert(item.cmp_key.clone()) {
+            out.csv_dup += 1;
         }
-        if !matched_keys.contains(key) {
-            let key_show = key.split(KEY_SEP).collect::<Vec<_>>().join(", ");
-            out.samples.push(VerifySample {
-                kind: VerifyKind::DbOnly,
-                key: key_show,
-                detail: String::new(),
-            });
+        batch.push(item);
+    }
+    flush_batch!();
+
+    out.db_rows = matched_keys.len();
+
+    // ── DBのみ（CSV に無い DB 行）: 小さいテーブルだけ全走査して算出。
+    // 巨大テーブルでは上限で打ち切り「未算出」とする（存在確認では不要）。
+    out.db_only_checked = true;
+    if let Some(client) = &client {
+        if !req.cancel.load(Ordering::Relaxed) {
+            match scan_db_only(client, &req.table, &key_expr, req, &matched_keys, &mut out).await {
+                Ok(true) => {}                                 // 全走査できた
+                Ok(false) => out.db_only_checked = false,      // 上限で打ち切り
+                Err(e) => {
+                    // DBのみの算出失敗は致命的でない（一致結果は有効）。
+                    out.db_only_checked = false;
+                    out.note = Some(format!("DBのみは算出できませんでした: {e}"));
+                }
+            }
         }
     }
 
     if mock {
+        out.db_only_checked = false;
         out.note = Some(
             "モックモードでは実テーブルが無いため、全行を『CSVのみ』として扱います。".into(),
         );
-    } else if db_truncated {
+    } else if !out.db_only_checked && out.note.is_none() {
         out.note = Some(format!(
-            "DB 行が上限 {VERIFY_DB_CAP} 件で打ち切られました。結果は部分的です。"
+            "テーブルが大きいため『DBのみ』は未算出です（先頭 {VERIFY_DBONLY_SCAN_CAP} 行まで確認）。\
+             一致 / CSVのみ は全件正確です。"
         ));
     }
     out
+}
+
+/// 突合 1 件分の事前計算（表示用・比較用・DB問い合わせ用のキー）。
+struct VItem {
+    /// DB へ問い合わせる生キー（PK 値を KEY_SEP で連結。CAST(pk AS STRING) と一致）。
+    query_key: String,
+    /// 突合判定キー（数値/空白の表記ゆれを吸収後、KEY_SEP 連結）。
+    cmp_key: String,
+    /// 表示用キー（", " 連結）。
+    key_show: String,
+    /// req.columns 順の比較用値（数値表記ゆれ吸収後）。
+    col_cmp: Vec<String>,
+    /// req.columns 順の表示用値。
+    col_disp: Vec<String>,
+}
+
+/// CSV 1 レコードから VItem を作る。
+fn build_vitem(rec: &[String], req: &VerifyRequest, pk_positions: &[usize]) -> VItem {
+    let col_disp: Vec<String> = req
+        .columns
+        .iter()
+        .map(|c| {
+            let raw = rec.get(c.src_index).map(|s| s.as_str()).unwrap_or("");
+            canon_cell(raw, req.empty_as_null, req.null_token.as_deref())
+        })
+        .collect();
+    let col_cmp: Vec<String> = col_disp.iter().map(|d| cmp_norm(d, req.numeric_match)).collect();
+    let sep = KEY_SEP.to_string();
+    let query_key = pk_positions.iter().map(|&p| col_disp[p].clone()).collect::<Vec<_>>().join(&sep);
+    let cmp_key = pk_positions.iter().map(|&p| col_cmp[p].clone()).collect::<Vec<_>>().join(&sep);
+    let key_show = pk_positions.iter().map(|&p| col_disp[p].clone()).collect::<Vec<_>>().join(", ");
+    VItem { query_key, cmp_key, key_show, col_cmp, col_disp }
+}
+
+/// 主キーを文字列化する SQL 式。単一 PK は CAST(col AS STRING)、複合は KEY_SEP で CONCAT。
+/// （「DBのみ」走査の読み出し用。索引は使わない全走査なので CAST でよい。）
+fn pk_key_expr(columns: &[VerifyColumn], pk_positions: &[usize]) -> String {
+    let parts: Vec<String> = pk_positions
+        .iter()
+        .map(|&p| format!("CAST(`{}` AS STRING)", columns[p].name))
+        .collect();
+    if parts.len() == 1 {
+        parts.into_iter().next().unwrap()
+    } else {
+        // KEY_SEP = U+0001 を SQL のヘックスエスケープで挟む。
+        format!("CONCAT({})", parts.join(", '\\x01', "))
+    }
+}
+
+/// PK の WHERE 問い合わせ方法。索引を使うため単一 PK はネイティブ型で問い合わせる。
+enum PkBind {
+    /// `col` IN UNNEST(@keys) を文字列配列で。
+    Str,
+    /// `col` IN UNNEST(@keys) を INT64 配列で（ゼロ詰め等は数値化して索引一致）。
+    Int,
+    /// CAST/CONCAT した式に文字列配列で（複合 PK や非対応型のフォールバック・索引なし）。
+    StrCast,
+}
+struct PkQuery {
+    where_expr: String,
+    bind: PkBind,
+}
+
+/// PK の型から、索引が効く問い合わせ方法を決める。
+fn pk_query(columns: &[VerifyColumn], pk_positions: &[usize]) -> PkQuery {
+    if pk_positions.len() == 1 {
+        let c = &columns[pk_positions[0]];
+        let t = c.ty.to_uppercase();
+        if t.starts_with("INT64") {
+            return PkQuery { where_expr: format!("`{}`", c.name), bind: PkBind::Int };
+        }
+        if t.starts_with("STRING") || t.starts_with("BYTES") {
+            return PkQuery { where_expr: format!("`{}`", c.name), bind: PkBind::Str };
+        }
+    }
+    // 複合 PK / その他の型は CAST-CONCAT（索引なしだが正しく突合する）。
+    PkQuery { where_expr: pk_key_expr(columns, pk_positions), bind: PkBind::StrCast }
+}
+
+/// 1 バッチ分の CSV キーを DB に問い合わせ、突合する。
+#[allow(clippy::too_many_arguments)]
+async fn verify_lookup_batch(
+    client: &Client,
+    table: &str,
+    select_cols: &str,
+    pkq: &PkQuery,
+    batch: &[VItem],
+    req: &VerifyRequest,
+    out: &mut VerifyOutcome,
+    matched_keys: &mut HashSet<String>,
+) -> Result<(), String> {
+    // 問い合わせキーを重複排除。
+    let mut seen = HashSet::new();
+    let mut keys: Vec<String> = Vec::with_capacity(batch.len());
+    for it in batch {
+        if seen.insert(it.query_key.as_str()) {
+            keys.push(it.query_key.clone());
+        }
+    }
+    let sql =
+        format!("SELECT {select_cols} FROM `{table}` WHERE {} IN UNNEST(@keys)", pkq.where_expr);
+    let mut stmt = Statement::new(sql);
+    match pkq.bind {
+        PkBind::Int => {
+            // 数値として読めるキーだけを INT64 で問い合わせる（読めないものは
+            // INT64 PK には存在しえない → そのまま CSVのみ になる）。
+            let ints: Vec<i64> = keys.iter().filter_map(|k| k.trim().parse::<i64>().ok()).collect();
+            stmt.add_param("keys", &ints);
+        }
+        PkBind::Str | PkBind::StrCast => {
+            stmt.add_param("keys", &keys);
+        }
+    }
+    let mut tx = client.single().await.map_err(|e| e.to_string())?;
+    let mut iter = tx.query(stmt).await.map_err(|e| e.to_string())?;
+    // 取得した DB 行を「比較キー → 全カラム値」のマップにする。
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    while let Some(row) = iter.next().await.map_err(|e| e.to_string())? {
+        let mut cells = Vec::with_capacity(req.columns.len());
+        let mut i = 0;
+        while let Some(c) = stringify_cell(&row, i) {
+            cells.push(c);
+            i += 1;
+        }
+        let pk_positions: Vec<usize> =
+            req.columns.iter().enumerate().filter(|(_, c)| c.pk).map(|(i, _)| i).collect();
+        let dbkey = pk_positions
+            .iter()
+            .map(|&p| cmp_norm(cells.get(p).map(|s| s.as_str()).unwrap_or(""), req.numeric_match))
+            .collect::<Vec<_>>()
+            .join(&KEY_SEP.to_string());
+        map.insert(dbkey, cells);
+    }
+    for it in batch {
+        match map.get(&it.cmp_key) {
+            None => {
+                out.csv_only += 1;
+                push_sample(out, VerifyKind::CsvOnly, it.key_show.clone(), String::new());
+            }
+            Some(db_cells) => {
+                matched_keys.insert(it.cmp_key.clone());
+                let mut diff: Option<String> = None;
+                for (i, c) in req.columns.iter().enumerate() {
+                    let cv = &it.col_cmp[i];
+                    let dv_raw = db_cells.get(i).cloned().unwrap_or_default();
+                    let dv = cmp_norm(&dv_raw, req.numeric_match);
+                    if *cv != dv {
+                        diff = Some(format!("{}: '{}'(csv) ≠ '{dv_raw}'(db)", c.name, it.col_disp[i]));
+                        break;
+                    }
+                }
+                match diff {
+                    None => out.matched += 1,
+                    Some(detail) => {
+                        out.value_mismatch += 1;
+                        push_sample(out, VerifyKind::ValueMismatch, it.key_show.clone(), detail);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 「DBのみ」算出: テーブルの PK を上限まで走査し、CSV と突合できなかった DB 行を数える。
+/// 戻り値 Ok(true)=全走査できた / Ok(false)=上限で打ち切り（未算出）。
+async fn scan_db_only(
+    client: &Client,
+    table: &str,
+    key_expr: &str,
+    req: &VerifyRequest,
+    matched_keys: &HashSet<String>,
+    out: &mut VerifyOutcome,
+) -> Result<bool, String> {
+    let sql = format!("SELECT {key_expr} AS k FROM `{table}`");
+    let mut tx = client.single().await.map_err(|e| e.to_string())?;
+    let mut iter = tx.query(Statement::new(sql)).await.map_err(|e| e.to_string())?;
+    let sep = KEY_SEP.to_string();
+    let mut count = 0usize;
+    while let Some(row) = iter.next().await.map_err(|e| e.to_string())? {
+        if count >= VERIFY_DBONLY_SCAN_CAP {
+            return Ok(false); // 巨大テーブル → 未算出
+        }
+        count += 1;
+        if req.cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let raw = stringify_cell(&row, 0).unwrap_or_default();
+        // 比較キーへ正規化（CSV 側と同じ規則）。
+        let kn = raw
+            .split(KEY_SEP)
+            .map(|p| cmp_norm(p, req.numeric_match))
+            .collect::<Vec<_>>()
+            .join(&sep);
+        if !matched_keys.contains(&kn) {
+            out.db_only += 1;
+            if out.samples.len() < VERIFY_SAMPLE_CAP {
+                let key_show = raw.split(KEY_SEP).collect::<Vec<_>>().join(", ");
+                out.samples.push(VerifySample {
+                    kind: VerifyKind::DbOnly,
+                    key: key_show,
+                    detail: String::new(),
+                });
+            } else {
+                out.samples_truncated = true;
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// 不一致サンプルを上限まで蓄える（超過分は truncated フラグのみ立てる）。
@@ -4836,7 +5024,8 @@ mod tests {
         create_import_table().await;
 
         // Id 1..=N を直接ミューテーションで投入（CSV 経路に依存しない）。
-        const N: i64 = 73_000;
+        // N は 1 バッチ(1000)を十分超える＝複数バッチ問い合わせを通す規模。
+        const N: i64 = 12_000;
         let c = client().await;
         let mut muts = Vec::new();
         for id in 1..=N {
@@ -4868,7 +5057,7 @@ mod tests {
         }
         let vreq = VerifyRequest {
             table: "ImportTest".into(),
-            columns: vec![VerifyColumn { name: "Id".into(), pk: true, src_index: 0 }],
+            columns: vec![VerifyColumn { name: "Id".into(), ty: "INT64".into(), pk: true, src_index: 0 }],
             source: ImportSource::File(write_temp_csv("large_pk_target", &csv)),
             has_header: true,
             encoding: Encoding::Utf8,
@@ -4888,8 +5077,9 @@ mod tests {
         assert_eq!(r.db_only, 0, "db_only: {}", r.db_only);
     }
 
-    /// STRING 列に数値 ID を入れているケース（ユーザー事例）。CSV 側がゼロ詰め/小数化
-    /// していても numeric_match=true なら突合できる。false なら表記どおり一致しない。
+    /// 数値の表記ゆれ吸収（numeric_match）が「値カラム」の比較で効くこと。
+    /// 主キーは索引を使うため厳密一致で問い合わせる（キーの表記ゆれは吸収しない）。
+    /// 値カラムは取得後に正規化比較するので "005"="5" "10.0"="10" "+1000"="1000"。
     #[tokio::test]
     async fn verify_string_pk_numeric_match() {
         let Some(_) = emulator_db() else {
@@ -4923,24 +5113,23 @@ mod tests {
                 gcloud_spanner::key::all_keys(),
             )])
             .await;
-        // DB は素の数値文字列で格納: "5", "10", 巨大値。
+        // キー(Code)は厳密一致用に同じ文字列、値(Name)に数値を素の形で格納。
         c.apply(vec![
-            gcloud_spanner::mutation::insert_or_update("StrKeyTest", &["Code"], &[&"5"]),
-            gcloud_spanner::mutation::insert_or_update("StrKeyTest", &["Code"], &[&"10"]),
-            gcloud_spanner::mutation::insert_or_update(
-                "StrKeyTest",
-                &["Code"],
-                &[&"123456789012345678"],
-            ),
+            gcloud_spanner::mutation::insert_or_update("StrKeyTest", &["Code", "Name"], &[&"A", &"5"]),
+            gcloud_spanner::mutation::insert_or_update("StrKeyTest", &["Code", "Name"], &[&"B", &"10"]),
+            gcloud_spanner::mutation::insert_or_update("StrKeyTest", &["Code", "Name"], &[&"C", &"1000"]),
         ])
         .await
         .unwrap();
 
-        // CSV はゼロ詰め/小数化（同じ論理値）。巨大値はそのまま。
-        let csv = "Key\n005\n10.0\n123456789012345678\n";
+        // キーは厳密一致（A/B/C）。値はゼロ詰め/小数化/符号つき（同じ論理値）。
+        let csv = "Code,Name\nA,005\nB,10.0\nC,+1000\n";
         let mk = |numeric: bool| VerifyRequest {
             table: "StrKeyTest".into(),
-            columns: vec![VerifyColumn { name: "Code".into(), pk: true, src_index: 0 }],
+            columns: vec![
+                VerifyColumn { name: "Code".into(), ty: "STRING(MAX)".into(), pk: true, src_index: 0 },
+                VerifyColumn { name: "Name".into(), ty: "STRING(MAX)".into(), pk: false, src_index: 1 },
+            ],
             source: ImportSource::File(write_temp_csv("strkey_target", csv)),
             has_header: true,
             encoding: Encoding::Utf8,
@@ -4951,20 +5140,22 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
         };
 
-        // numeric_match=true: 表記ゆれを吸収して全件一致。
+        // numeric_match=true: 値の表記ゆれを吸収して全件一致。
         let (vtx, _v) = std::sync::mpsc::channel::<VerifyProgress>();
         let r = run_verify(&test_env(), &mk(true), false, &vtx).await;
         assert_eq!(r.error, None, "verify error: {:?}", r.error);
-        assert_eq!(r.matched, 3, "numeric_match で全件一致のはず");
+        assert_eq!(r.matched, 3, "値の numeric_match で全件一致のはず");
+        assert_eq!(r.value_mismatch, 0);
         assert_eq!(r.csv_only, 0);
         assert_eq!(r.db_only, 0);
 
-        // numeric_match=false: 表記どおり比較 → ゼロ詰め/小数は一致しない。
+        // numeric_match=false: 値は表記どおり比較 → 005≠5 などで値差異。
         let (vtx2, _v2) = std::sync::mpsc::channel::<VerifyProgress>();
         let r2 = run_verify(&test_env(), &mk(false), false, &vtx2).await;
-        assert_eq!(r2.matched, 1, "巨大値だけ表記一致（005/10.0 は外れる）");
-        assert_eq!(r2.csv_only, 2);
-        assert_eq!(r2.db_only, 2);
+        assert_eq!(r2.matched, 0, "値が表記ゆれで一致しない");
+        assert_eq!(r2.value_mismatch, 3, "A/B/C すべて値差異");
+        assert_eq!(r2.csv_only, 0);
+        assert_eq!(r2.db_only, 0);
     }
 
     /// 決定的バグハント: 同じ CSV をインポート→その同じ CSV で照合したら 100% 一致するはず。
@@ -5048,7 +5239,7 @@ mod tests {
         for numeric in [true, false] {
             let vreq = VerifyRequest {
                 table: "StrKeyAll".into(),
-                columns: vec![VerifyColumn { name: "Code".into(), pk: true, src_index: 0 }],
+                columns: vec![VerifyColumn { name: "Code".into(), ty: "STRING(MAX)".into(), pk: true, src_index: 0 }],
                 source: ImportSource::File(path.clone()),
                 has_header: true,
                 encoding: Encoding::Utf8,
@@ -5122,6 +5313,7 @@ mod tests {
             // PK 列(Id)だけをマッピング。他列はマッピングしない。
             columns: vec![VerifyColumn {
                 name: "Id".into(),
+                ty: "INT64".into(),
                 pk: true,
                 src_index: 0,
             }],
@@ -5195,11 +5387,11 @@ mod tests {
         let vreq = VerifyRequest {
             table: "ImportTest".into(),
             columns: vec![
-                VerifyColumn { name: "Id".into(), pk: true, src_index: 0 },
-                VerifyColumn { name: "Name".into(), pk: false, src_index: 1 },
-                VerifyColumn { name: "Score".into(), pk: false, src_index: 2 },
-                VerifyColumn { name: "Active".into(), pk: false, src_index: 3 },
-                VerifyColumn { name: "Note".into(), pk: false, src_index: 4 },
+                VerifyColumn { name: "Id".into(), ty: "INT64".into(), pk: true, src_index: 0 },
+                VerifyColumn { name: "Name".into(), ty: "STRING(MAX)".into(), pk: false, src_index: 1 },
+                VerifyColumn { name: "Score".into(), ty: "FLOAT64".into(), pk: false, src_index: 2 },
+                VerifyColumn { name: "Active".into(), ty: "BOOL".into(), pk: false, src_index: 3 },
+                VerifyColumn { name: "Note".into(), ty: "STRING(MAX)".into(), pk: false, src_index: 4 },
             ],
             source: ImportSource::File(csv_path),
             has_header: true,
@@ -5214,7 +5406,8 @@ mod tests {
         let r = run_verify(&test_env(), &vreq, false, &vtx).await;
         assert_eq!(r.error, None, "verify error: {:?}", r.error);
         assert_eq!(r.csv_rows, 3, "csv rows");
-        assert_eq!(r.db_rows, 3, "db rows");
+        // db_rows = CSV キーで DB に存在した行数（Id1,Id2 が一致 → 2）。
+        assert_eq!(r.db_rows, 2, "db rows (found for CSV keys)");
         assert_eq!(r.matched, 1, "matched (Id1)");
         assert_eq!(r.value_mismatch, 1, "value mismatch (Id2 Name)");
         assert_eq!(r.csv_only, 1, "csv only (Id4)");
