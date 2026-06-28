@@ -2078,6 +2078,10 @@ struct CsvTab {
     first_row: u64,
     col_off: f32,
     delim: u8,
+    /// 索引/プレビューを作ったときの区切り文字。delim を変えたら作り直す判定に使う。
+    built_delim: u8,
+    /// GCS から開いた場合の元 URI（区切り変更時の再ストリーミング用）。
+    gcs_uri: Option<String>,
     encoding: query::Encoding,
     has_header: bool,
     goto: String,
@@ -2115,6 +2119,8 @@ impl CsvTab {
             first_row: 0,
             col_off: 0.0,
             delim: b',',
+            built_delim: b',',
+            gcs_uri: None,
             encoding: query::Encoding::Utf8,
             has_header: true,
             goto: String::new(),
@@ -2187,14 +2193,17 @@ impl CsvTab {
     fn start_load(&mut self, ctx: &egui::Context) {
         use std::sync::atomic::Ordering;
         self.loading = true;
+        self.built_delim = self.delim;
         self.progress.store(0, Ordering::Relaxed);
         *self.result.lock().unwrap() = None;
         let prog = self.progress.clone();
         let slot = self.result.clone();
         let path = self.path.clone();
+        let delim = self.delim;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let r = csvview::CsvIndex::build(&path, prog).map_err(|e| e.to_string());
+            let r =
+                csvview::CsvIndex::build_with_delim(&path, prog, delim).map_err(|e| e.to_string());
             *slot.lock().unwrap() = Some(r);
             ctx.request_repaint();
         });
@@ -2206,11 +2215,14 @@ impl CsvTab {
         use std::sync::atomic::Ordering;
         let buf = std::sync::Arc::new(std::sync::Mutex::new(PreviewBuf::default()));
         self.preview = Some(buf.clone());
+        self.gcs_uri = Some(uri.clone());
+        self.built_delim = self.delim;
         self.loading = false; // 即表示（ローディング画面にしない）
         self.progress.store(0, Ordering::Relaxed);
         self.stream_cancel.store(false, Ordering::Relaxed);
         let prog = self.progress.clone();
         let stop = self.stream_cancel.clone();
+        let delim = self.delim;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             const ROW_CAP: usize = 2_000_000; // メモリ保護
@@ -2254,16 +2266,17 @@ impl CsvTab {
                         first = false;
                     }
                     carry.extend_from_slice(bytes);
-                    // carry から完成行を切り出す。
+                    // carry から完成レコードを切り出す（RFC4180 引用符対応＝インポート
+                    // /照合と同じ数え方。引用符内の改行は 1 レコード内に束ねる）。
                     let mut newlines: Vec<Vec<u8>> = Vec::new();
                     let mut s = 0usize;
-                    while let Some(p) = memchr::memchr(b'\n', &carry[s..]) {
-                        let mut line = carry[s..s + p].to_vec();
-                        if line.last() == Some(&b'\r') {
-                            line.pop();
+                    while let Some((ce, next, blank)) =
+                        crate::csvview::next_complete_record(&carry, s, delim)
+                    {
+                        if !blank {
+                            newlines.push(carry[s..ce].to_vec());
                         }
-                        newlines.push(line);
-                        s += p + 1;
+                        s = next;
                     }
                     carry.drain(0..s);
                     let mut capped = false;
@@ -2283,12 +2296,11 @@ impl CsvTab {
                     }
                 }
                 let mut b = buf.lock().unwrap();
-                if reached_eof && !carry.is_empty() {
-                    let mut line = carry;
-                    if line.last() == Some(&b'\r') {
-                        line.pop();
+                if reached_eof {
+                    // 改行で終わらない最後のレコード（引用符対応・空行は除外）。
+                    if let Some(line) = crate::csvview::final_record(&carry, delim) {
+                        b.lines.push(line);
                     }
-                    b.lines.push(line);
                 }
                 b.complete = reached_eof;
                 ctx.request_repaint();
@@ -2542,6 +2554,20 @@ impl CsvTab {
         if layout_changed {
             // ヘッダ有無/区切り/文字コードが変わると列の内容も変わるので幅を再算出。
             self.invalidate_col_widths();
+        }
+        // 区切り文字が変わるとレコード境界（引用符の開始判定）が変わるので、
+        // 索引/プレビューを作り直してレコード数・行内容を一致させる。
+        if self.delim != self.built_delim {
+            let ctx = ui.ctx().clone();
+            if let Some(uri) = self.gcs_uri.clone() {
+                self.stream_cancel.store(true, Ordering::Relaxed);
+                self.start_gcs_preview(uri, &ctx);
+            } else {
+                self.index = None;
+                self.start_load(&ctx);
+            }
+            self.first_row = 0;
+            self.matches = None;
         }
 
         // ── 検索 / 絞り込み行 ──

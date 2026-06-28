@@ -18,12 +18,135 @@ use crate::query::Encoding;
 /// 疎な行オフセット索引つきの CSV。
 pub struct CsvIndex {
     mmap: Mmap,
-    /// offsets[k] = 行 (k*stride) の先頭バイトオフセット。
+    /// offsets[k] = レコード (k*stride) の先頭バイトオフセット。
     offsets: Vec<u64>,
     stride: u64,
-    /// データ行も含む総行数（ヘッダ込み）。
+    /// レコード総数（ヘッダ込み）。RFC4180 準拠で、引用符内の改行は行内として扱い、
+    /// 空行（単一の空フィールド）は除く。インポート/照合の数え方と一致する。
     pub total_rows: u64,
     pub bytes: u64,
+    /// 索引・レコード境界を決めた区切り文字。引用符が「フィールド先頭でのみ開く」
+    /// 規則に必要なので、変えたら作り直す必要がある。
+    delim: u8,
+}
+
+/// 1 レコード分のスキャン結果。
+struct Scan {
+    /// レコード本文の終端（末尾の CR/LF を含まない）。
+    content_end: usize,
+    /// 次レコードの先頭オフセット。
+    next: usize,
+    /// 空行（区切りもデータも無い単一空フィールド）か。CsvStreamer が捨てる行と一致。
+    blank: bool,
+    /// 改行で終端したか（false なら data 末尾に到達＝最後の行 or データ不足）。
+    terminated: bool,
+}
+
+/// `data` の `from`（レコード先頭・引用符の外）から 1 レコードを読む。
+/// RFC4180 風（`CsvStreamer` と同じ規則）: 引用符はフィールド先頭でのみ開始し、
+/// 引用内の改行・区切りはデータ、`""` はエスケープされた `"`。
+fn scan_one(data: &[u8], from: usize, delim: u8) -> Scan {
+    let n = data.len();
+    let mut k = from;
+    let mut in_q = false;
+    let mut field_empty = true; // 現フィールドがまだ空か（引用開始判定に使う）
+    let mut saw_delim = false;
+    let mut saw_data = false;
+    while k < n {
+        if in_q {
+            // 次の `"` まで一気に飛ばす（その間は全部データ）。
+            match memchr::memchr(b'"', &data[k..]) {
+                Some(p) => {
+                    let q = k + p;
+                    let escaped = q + 1 < n && data[q + 1] == b'"';
+                    if p > 0 || escaped {
+                        saw_data = true; // 引用内のデータ or エスケープされた "
+                    }
+                    if escaped {
+                        k = q + 2;
+                    } else {
+                        in_q = false;
+                        field_empty = false;
+                        k = q + 1;
+                    }
+                }
+                None => {
+                    // 閉じない引用符: 末尾まで本文（引用を開いた時点で空行ではない）。
+                    return Scan { content_end: n, next: n, blank: false, terminated: false };
+                }
+            }
+            continue;
+        }
+        // 引用符外: 次の特殊バイト（" \n \r delim）まで飛ばす。
+        let other = memchr::memchr3(b'"', b'\n', b'\r', &data[k..]);
+        let dl = memchr::memchr(delim, &data[k..]);
+        let p = match (other, dl) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => {
+                if n > k {
+                    saw_data = true;
+                }
+                let blank = !saw_delim && !saw_data;
+                return Scan { content_end: n, next: n, blank, terminated: false };
+            }
+        };
+        if p > 0 {
+            saw_data = true;
+            field_empty = false;
+        }
+        let q = k + p;
+        let c = data[q];
+        if c == delim {
+            saw_delim = true;
+            field_empty = true;
+            k = q + 1;
+        } else if c == b'"' {
+            if field_empty {
+                in_q = true;
+            } else {
+                saw_data = true; // フィールド途中の " はデータ（5'10" など）
+            }
+            k = q + 1;
+        } else if c == b'\r' {
+            let next = if q + 1 < n && data[q + 1] == b'\n' { q + 2 } else { q + 1 };
+            let blank = !saw_delim && !saw_data;
+            return Scan { content_end: q, next, blank, terminated: true };
+        } else {
+            // b'\n'
+            let blank = !saw_delim && !saw_data;
+            return Scan { content_end: q, next: q + 1, blank, terminated: true };
+        }
+    }
+    let blank = !saw_delim && !saw_data;
+    Scan { content_end: n, next: n, blank, terminated: false }
+}
+
+/// ストリーミング用: `data[from..]` の先頭にある「改行で終端した」完成レコードを
+/// 返す。返り値 `Some((content_end, next, blank))`。データ不足（未終端）なら None。
+/// GCS のチャンク逐次読みで、引用符内の改行をまたいでも正しく 1 レコードに束ねる。
+pub fn next_complete_record(data: &[u8], from: usize, delim: u8) -> Option<(usize, usize, bool)> {
+    let s = scan_one(data, from, delim);
+    if s.terminated {
+        Some((s.content_end, s.next, s.blank))
+    } else {
+        None
+    }
+}
+
+/// ストリーミングの末尾処理: 改行で終わらない最後のレコードを取り出す。
+/// 空行なら None。
+pub fn final_record(data: &[u8], delim: u8) -> Option<Vec<u8>> {
+    if data.is_empty() {
+        return None;
+    }
+    let s = scan_one(data, 0, delim);
+    if s.blank {
+        None
+    } else {
+        Some(data[0..s.content_end].to_vec())
+    }
 }
 
 /// 索引エントリ数の上限（超えたら間引いてストライドを倍に）。
@@ -31,14 +154,27 @@ pub struct CsvIndex {
 const MAX_ENTRIES: usize = 8_000_000;
 
 impl CsvIndex {
-    /// ファイルを mmap して改行を走査し、疎な行オフセット索引を作る。
-    /// progress には走査済みバイト数を随時書き込む（UI の進捗表示用）。
+    /// ファイルを mmap し、RFC4180 準拠（引用符対応）でレコード境界を走査して
+    /// 疎な行オフセット索引を作る。区切りは既定でカンマ（主にテスト用。本体は
+    /// `build_with_delim` を使う）。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn build(path: &Path, progress: Arc<AtomicU64>) -> io::Result<Self> {
-        Self::build_inner(path, progress, MAX_ENTRIES)
+        Self::build_with_delim(path, progress, b',')
+    }
+
+    /// 区切り文字を指定して索引を作る。引用符の開始判定に区切りが要るため、
+    /// 区切りを変えたら作り直す（レコード境界・総数が変わりうる）。
+    pub fn build_with_delim(path: &Path, progress: Arc<AtomicU64>, delim: u8) -> io::Result<Self> {
+        Self::build_inner(path, progress, MAX_ENTRIES, delim)
     }
 
     /// 索引エントリ上限を指定できる本体（テストで間引きを強制するため分離）。
-    fn build_inner(path: &Path, progress: Arc<AtomicU64>, max_entries: usize) -> io::Result<Self> {
+    fn build_inner(
+        path: &Path,
+        progress: Arc<AtomicU64>,
+        max_entries: usize,
+        delim: u8,
+    ) -> io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         let data: &[u8] = &mmap;
@@ -46,17 +182,15 @@ impl CsvIndex {
 
         let mut offsets: Vec<u64> = Vec::new();
         let mut stride: u64 = 1;
-        if bytes > 0 {
-            offsets.push(0); // 行0の開始
-        }
-        let mut line: u64 = 0; // これまでに見つけた改行の数
-        for nl in memchr::memchr_iter(b'\n', data) {
-            line += 1;
-            let next_off = (nl + 1) as u64;
-            if next_off < bytes {
-                // 次の行が存在する。stride の倍数の行頭だけ記録。
-                if line.is_multiple_of(stride) {
-                    offsets.push(next_off);
+        let mut total: u64 = 0; // 確定した（空行でない）レコード数
+        let mut pos = 0usize;
+        let len = data.len();
+        while pos < len {
+            let s = scan_one(data, pos, delim);
+            if !s.blank {
+                // stride の倍数番のレコード先頭だけ索引に持つ。
+                if total.is_multiple_of(stride) {
+                    offsets.push(pos as u64);
                     if offsets.len() >= max_entries {
                         // 間引き: 偶数番だけ残してストライドを倍に。
                         let mut keep = true;
@@ -68,15 +202,15 @@ impl CsvIndex {
                         stride *= 2;
                     }
                 }
+                total += 1;
+                if total.is_multiple_of(1 << 18) {
+                    progress.store(pos as u64, Ordering::Relaxed);
+                }
             }
-            if line.is_multiple_of(1 << 18) {
-                progress.store(nl as u64, Ordering::Relaxed);
+            if s.next <= pos {
+                break; // 安全弁（前進しないなら終了）
             }
-        }
-        // 総行数: 改行数 + 末尾が改行で終わらなければ最後の部分行を1行とみなす。
-        let mut total = line;
-        if bytes > 0 && data[data.len() - 1] != b'\n' {
-            total += 1;
+            pos = s.next;
         }
         progress.store(bytes, Ordering::Relaxed);
         Ok(CsvIndex {
@@ -85,32 +219,39 @@ impl CsvIndex {
             stride,
             total_rows: total,
             bytes,
+            delim,
         })
     }
 
-    /// 行 i の生バイト列（末尾の \r\n は除く）。範囲外なら None。
+    /// レコード i の生バイト列（末尾の \r\n は除く。引用符内の改行は含む）。範囲外なら None。
     pub fn row_bytes(&self, i: u64) -> Option<&[u8]> {
         if i >= self.total_rows {
             return None;
         }
         let data: &[u8] = &self.mmap;
         let block = (i / self.stride) as usize;
-        let mut off = *self.offsets.get(block)? as usize;
-        let mut skip = (i - block as u64 * self.stride) as usize;
-        while skip > 0 {
-            let p = memchr::memchr(b'\n', &data[off..])?;
-            off += p + 1;
-            skip -= 1;
+        let mut pos = *self.offsets.get(block)? as usize;
+        // 索引位置（block*stride 番の非空レコード先頭）から i 番まで前進する。
+        // 途中の空行はレコードに数えない（インポート/照合と同じ）。
+        let mut row = block as u64 * self.stride;
+        loop {
+            let s = scan_one(data, pos, self.delim);
+            if s.blank {
+                if !s.terminated || s.next <= pos {
+                    return None;
+                }
+                pos = s.next;
+                continue;
+            }
+            if row == i {
+                return Some(&data[pos..s.content_end]);
+            }
+            if !s.terminated || s.next <= pos {
+                return None;
+            }
+            pos = s.next;
+            row += 1;
         }
-        let end = match memchr::memchr(b'\n', &data[off..]) {
-            Some(p) => off + p,
-            None => data.len(),
-        };
-        let mut e = end;
-        if e > off && data[e - 1] == b'\r' {
-            e -= 1;
-        }
-        Some(&data[off..e])
     }
 
     /// 行 i を区切り文字で分割して文字列ベクタにする（引用符対応・UTF-8）。
@@ -156,7 +297,6 @@ impl CsvIndex {
         let nl_bytes = needle_l.as_bytes();
         let mut out: Vec<u64> = Vec::new();
         let mut line: u64 = 0;
-        let mut start = 0usize;
         let mut count: u64 = 0;
 
         let consider = |line_idx: u64, bytes: &[u8], out: &mut Vec<u64>| {
@@ -178,34 +318,31 @@ impl CsvIndex {
             }
         };
 
-        for nl in memchr::memchr_iter(b'\n', data) {
-            let mut e = nl;
-            if e > start && data[e - 1] == b'\r' {
-                e -= 1;
+        let len = data.len();
+        let mut pos = 0usize;
+        while pos < len {
+            let s = scan_one(data, pos, self.delim);
+            if !s.blank {
+                // pos..content_end が 1 レコード（引用符内の改行は含む）。
+                consider(line, &data[pos..s.content_end], &mut out);
+                line += 1;
+                if out.len() >= cap {
+                    break;
+                }
             }
-            consider(line, &data[start..e], &mut out);
-            line += 1;
-            start = nl + 1;
             count += 1;
-            if out.len() >= cap {
-                break;
-            }
             if count.is_multiple_of(1 << 16) {
-                progress.store(start as u64, Ordering::Relaxed);
+                progress.store(s.next as u64, Ordering::Relaxed);
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
             }
-        }
-        // 末尾（改行で終わらない最後の行）。途中の行と同じく末尾の \r は除く。
-        if out.len() < cap && !cancel.load(Ordering::Relaxed) && start < data.len() {
-            let mut e = data.len();
-            if e > start && data[e - 1] == b'\r' {
-                e -= 1;
+            if !s.terminated || s.next <= pos {
+                break;
             }
-            consider(line, &data[start..e], &mut out);
+            pos = s.next;
         }
-        progress.store(data.len() as u64, Ordering::Relaxed);
+        progress.store(len as u64, Ordering::Relaxed);
         out
     }
 }
@@ -355,6 +492,82 @@ mod tests {
         assert_eq!(idx.parse_row(1, b','), vec!["1", "2"]);
     }
 
+    /// 引用符付きフィールド内の改行は行区切りにしない（インポート/照合と同じ数え方）。
+    /// 生の \n 数えだと水増しになるのを防ぐ回帰テスト。
+    #[test]
+    fn quoted_newline_is_one_record() {
+        // 3 レコード。2 行目の note に埋め込み改行が 2 つある。
+        let body = b"id,note\n1,\"line1\nline2\nline3\"\n2,plain\n";
+        let p = write_tmp("qnl.csv", body);
+        let idx = CsvIndex::build(&p, Arc::new(AtomicU64::new(0))).unwrap();
+        assert_eq!(idx.total_rows, 3, "埋め込み改行で水増ししない");
+        assert_eq!(idx.row_bytes(0).unwrap(), b"id,note");
+        // レコード 1 は埋め込み改行を含む生バイトで返る。
+        assert_eq!(idx.row_bytes(1).unwrap(), b"1,\"line1\nline2\nline3\"");
+        assert_eq!(idx.parse_row(1, b','), vec!["1", "line1\nline2\nline3"]);
+        assert_eq!(idx.row_bytes(2).unwrap(), b"2,plain");
+        assert!(idx.row_bytes(3).is_none());
+        // 絞り込みも 1 レコードとして扱う（行2の中身に一致、ヘッダ除外）。
+        let hits = idx.scan_filter(
+            "line2",
+            None,
+            b',',
+            true,
+            Encoding::Utf8,
+            &AtomicBool::new(false),
+            &AtomicU64::new(0),
+            100,
+        );
+        assert_eq!(hits, vec![1]);
+    }
+
+    /// 空行（単一の空フィールド）はレコードに数えない（CsvStreamer と一致）。
+    #[test]
+    fn blank_lines_are_dropped() {
+        let body = b"a,b\n\n1,2\n\n\n3,4\n";
+        let p = write_tmp("blank.csv", body);
+        let idx = CsvIndex::build(&p, Arc::new(AtomicU64::new(0))).unwrap();
+        assert_eq!(idx.total_rows, 3, "空行は除外: header,(1,2),(3,4)");
+        assert_eq!(idx.row_bytes(0).unwrap(), b"a,b");
+        assert_eq!(idx.row_bytes(1).unwrap(), b"1,2");
+        assert_eq!(idx.row_bytes(2).unwrap(), b"3,4");
+    }
+
+    /// CRLF + 引用符内改行（LF のみ）が混在しても正しく数える。
+    #[test]
+    fn crlf_with_quoted_lf() {
+        let body = b"id,note\r\n1,\"a\nb\"\r\n2,c\r\n";
+        let p = write_tmp("crlf_q.csv", body);
+        let idx = CsvIndex::build(&p, Arc::new(AtomicU64::new(0))).unwrap();
+        assert_eq!(idx.total_rows, 3);
+        assert_eq!(idx.parse_row(1, b','), vec!["1", "a\nb"]);
+        assert_eq!(idx.row_bytes(2).unwrap(), b"2,c");
+    }
+
+    /// ストリーミング用ヘルパ: チャンク境界が引用符内改行をまたいでも 1 レコードに束ねる。
+    #[test]
+    fn streaming_helpers_quote_aware() {
+        let delim = b',';
+        // 全データを一括で渡しても、完成レコードだけ取り出せる。
+        let data = b"1,\"x\ny\"\n2,z\n3,nofinal";
+        let mut pos = 0usize;
+        let mut recs: Vec<Vec<u8>> = Vec::new();
+        while let Some((ce, next, blank)) = next_complete_record(data, pos, delim) {
+            if !blank {
+                recs.push(data[pos..ce].to_vec());
+            }
+            pos = next;
+        }
+        // 終端していない最後のレコードはヘルパで回収。
+        if let Some(last) = final_record(&data[pos..], delim) {
+            recs.push(last);
+        }
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0], b"1,\"x\ny\"");
+        assert_eq!(recs[1], b"2,z");
+        assert_eq!(recs[2], b"3,nofinal");
+    }
+
     #[test]
     fn scan_filter_all_and_column() {
         let p = write_tmp(
@@ -416,7 +629,7 @@ mod tests {
         }
         let p = write_tmp("decim.csv", &body);
         // 上限を極小(=8)にして何度も間引かせる → stride は 1 より十分大きくなる。
-        let idx = CsvIndex::build_inner(&p, Arc::new(AtomicU64::new(0)), 8).unwrap();
+        let idx = CsvIndex::build_inner(&p, Arc::new(AtomicU64::new(0)), 8, b',').unwrap();
         assert_eq!(idx.total_rows, n);
         assert!(idx.stride > 1, "間引きで stride>1 になるはず: {}", idx.stride);
         assert!(idx.offsets.len() <= 8, "索引は上限内: {}", idx.offsets.len());
