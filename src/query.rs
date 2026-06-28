@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use gcloud_spanner::client::{Client, ClientConfig};
 use gcloud_spanner::mutation::{insert, insert_or_update};
+use gcloud_spanner::transaction_ro::ReadOnlyTransaction;
 use gcloud_spanner::row::{Error as RowError, Row};
 use gcloud_spanner::statement::{Statement, ToKind};
 use tokio::io::AsyncReadExt;
@@ -886,11 +887,27 @@ async fn run_verify(
     // 全表スキャンになるため、巨大テーブルで破綻する）。
     let pkq = pk_query(&req.columns, &pk_positions);
 
-    let client = if mock {
-        None
-    } else {
+    // 接続を 1 回だけ張り、読み取り専用トランザクション（スナップショット）を
+    // 1 つ作って全バッチ/全スキャンで使い回す（バッチごとの接続連発を防ぎ、
+    // 全クエリが同一スナップショットを見るので結果も一貫する）。
+    let _client; // tx の寿命のあいだ Client（セッションプール）を生かす
+    let mut tx: Option<ReadOnlyTransaction> = None;
+    if !mock {
         match build_client(env).await {
-            Ok(c) => Some(c),
+            Ok(c) => {
+                match c.read_only_transaction().await {
+                    Ok(t) => {
+                        tx = Some(t);
+                        _client = Some(c);
+                    }
+                    Err(e) => {
+                        return VerifyOutcome {
+                            error: Some(format!("読み取りトランザクションの開始に失敗: {e}")),
+                            ..Default::default()
+                        }
+                    }
+                }
+            }
             Err(e) => {
                 return VerifyOutcome {
                     error: Some(format!("接続/認証に失敗: {e}")),
@@ -898,7 +915,7 @@ async fn run_verify(
                 }
             }
         }
-    };
+    }
 
     let (mut source, _bytes_total, _id) = match open_source(&req.source).await {
         Ok(s) => s,
@@ -923,9 +940,9 @@ async fn run_verify(
     macro_rules! flush_batch {
         () => {
             if !batch.is_empty() {
-                if let Some(client) = &client {
+                if let Some(tx) = tx.as_mut() {
                     if let Err(e) = verify_lookup_batch(
-                        client,
+                        tx,
                         &req.table,
                         &select_cols,
                         &pkq,
@@ -1017,9 +1034,9 @@ async fn run_verify(
     // ── DBのみ（CSV に無い DB 行）: 小さいテーブルだけ全走査して算出。
     // 巨大テーブルでは上限で打ち切り「未算出」とする（存在確認では不要）。
     out.db_only_checked = true;
-    if let Some(client) = &client {
+    if let Some(tx) = tx.as_mut() {
         if !req.cancel.load(Ordering::Relaxed) {
-            match scan_db_only(client, &req.table, &key_expr, req, &matched_keys, &mut out).await {
+            match scan_db_only(tx, &req.table, &key_expr, req, &matched_keys, &mut out).await {
                 Ok(true) => {}                                 // 全走査できた
                 Ok(false) => out.db_only_checked = false,      // 上限で打ち切り
                 Err(e) => {
@@ -1123,9 +1140,11 @@ fn pk_query(columns: &[VerifyColumn], pk_positions: &[usize]) -> PkQuery {
 }
 
 /// 1 バッチ分の CSV キーを DB に問い合わせ、突合する。
+/// 1 つの読み取り専用トランザクション（スナップショット）を使い回すことで、
+/// バッチごとに接続/トランザクションを張り直さない（接続の連発を防ぐ）。
 #[allow(clippy::too_many_arguments)]
 async fn verify_lookup_batch(
-    client: &Client,
+    tx: &mut ReadOnlyTransaction,
     table: &str,
     select_cols: &str,
     pkq: &PkQuery,
@@ -1156,7 +1175,6 @@ async fn verify_lookup_batch(
             stmt.add_param("keys", &keys);
         }
     }
-    let mut tx = client.single().await.map_err(|e| e.to_string())?;
     let mut iter = tx.query(stmt).await.map_err(|e| e.to_string())?;
     // 取得した DB 行を「比較キー → 全カラム値」のマップにする。
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
@@ -1210,7 +1228,7 @@ async fn verify_lookup_batch(
 /// 「DBのみ」算出: テーブルの PK を上限まで走査し、CSV と突合できなかった DB 行を数える。
 /// 戻り値 Ok(true)=全走査できた / Ok(false)=上限で打ち切り（未算出）。
 async fn scan_db_only(
-    client: &Client,
+    tx: &mut ReadOnlyTransaction,
     table: &str,
     key_expr: &str,
     req: &VerifyRequest,
@@ -1218,7 +1236,6 @@ async fn scan_db_only(
     out: &mut VerifyOutcome,
 ) -> Result<bool, String> {
     let sql = format!("SELECT {key_expr} AS k FROM `{table}`");
-    let mut tx = client.single().await.map_err(|e| e.to_string())?;
     let mut iter = tx.query(Statement::new(sql)).await.map_err(|e| e.to_string())?;
     let sep = KEY_SEP.to_string();
     let mut count = 0usize;
