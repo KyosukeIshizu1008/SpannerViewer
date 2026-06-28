@@ -464,7 +464,9 @@ pub struct SchemaGraph {
     pub ddl: std::collections::HashMap<String, String>,
 }
 
-const NO_CONFIG: &str = "SPANNER_PROJECT / SPANNER_INSTANCE / SPANNER_DATABASE を設定してください";
+const NO_CONFIG: &str = "接続先が未設定です。右上でプロジェクト/インスタンス/DB を選ぶか、\
+SPANNER_PROJECT / SPANNER_INSTANCE / SPANNER_DATABASE 環境変数で指定してください。\
+一覧取得には GCP 認証が必要です（gcloud ADC ログイン、または GOOGLE_APPLICATION_CREDENTIALS のサービスアカウント鍵）。";
 
 /// UI からのリクエストを順次処理する。req 側が閉じたら終了。
 /// データクエリは `data_tx`、スキーマ図は `schema_tx` に結果を返す。

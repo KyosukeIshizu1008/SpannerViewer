@@ -33,8 +33,10 @@ fn main() -> eframe::Result<()> {
         eprintln!("モックモードで起動します（MONITOR_MOCK=1）。合成データを表示します。");
     } else if project.is_empty() || instance.is_empty() {
         eprintln!(
-            "接続先が未設定です。アプリ内でログイン後、設定 →「接続先を選択（ADC）」で\
-             プロジェクト/インスタンス/DB を選んでください（環境変数は任意）。"
+            "接続先が未設定です。GCP 認証（gcloud ADC ログイン、または GOOGLE_APPLICATION_CREDENTIALS \
+             のサービスアカウント鍵）の上、右上 or 設定でプロジェクト/インスタンス/DB を選んでください。\
+             直接 SPANNER_PROJECT / SPANNER_INSTANCE / SPANNER_DATABASE を指定しても可。\
+             エミュレータを使う場合は SPANNER_EMULATOR_HOST を設定してください。"
         );
     }
 
