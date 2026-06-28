@@ -616,6 +616,8 @@ pub struct MonitorApp {
     auth_was_running: bool,
     login_dialog: bool,
     login_dismissed: bool,
+    /// 設定ウィンドウが直前のフレームで開いていたか（開いた瞬間に認証を再確認する）。
+    settings_was_open: bool,
 
     // 環境の自動検出（gcloud で instance/database を列挙）
     discover_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -823,6 +825,7 @@ impl MonitorApp {
             auth_was_running: false,
             login_dialog: false,
             login_dismissed: false,
+            settings_was_open: false,
             discover_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             discover_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             discover_project: String::new(),
@@ -3634,10 +3637,12 @@ impl MonitorApp {
                 }
             }
 
+            let mut sql_lay = sql_layouter;
             let output = egui::TextEdit::multiline(&mut self.sql)
                 .desired_rows(3)
                 .desired_width(f32::INFINITY)
                 .code_editor()
+                .layouter(&mut sql_lay)
                 .show(ui);
 
             // 確定後のカーソル位置を反映する（テキスト変更の次フレームで適用）。
@@ -5857,7 +5862,15 @@ impl MonitorApp {
 
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
+            self.settings_was_open = false;
             return;
+        }
+        // 開いた瞬間に認証状態を再確認する（セッション切れを検出してボタンを出す）。
+        if !self.settings_was_open {
+            self.settings_was_open = true;
+            if std::env::var("SPANNER_EMULATOR_HOST").is_err() {
+                self.start_adc_check(ctx);
+            }
         }
         if !self.contexts_loaded {
             let (list, current) = k8s::list_contexts_blocking();
@@ -5868,6 +5881,7 @@ impl MonitorApp {
         let mut open = self.settings_open;
         let mut chosen = self.current_context.clone();
         let mut login_clicked = false;
+        let mut recheck_auth = false;
         // 環境操作（描画中に収集→借用解消後に適用）
         let mut env_select: Option<usize> = None;
         let mut env_delete: Option<usize> = None;
@@ -5882,11 +5896,11 @@ impl MonitorApp {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new("Spanner 接続").color(MUTED).small());
+                settings_section(ui, "Spanner 接続");
                 ui.label(&self.conn_info);
 
                 // ── ADC でプロジェクト/インスタンス/DB を選択（1 回のログインのみ） ──
-                ui.separator();
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("接続先を選択（ADC）")
@@ -6078,31 +6092,53 @@ impl MonitorApp {
                 });
                 ui.separator();
 
-                // GCP 認証（ADC ログイン）
-                ui.label(egui::RichText::new("GCP 認証").color(MUTED).small());
+                // ── GCP 認証 ──
+                settings_section(ui, "GCP 認証");
                 let running = self.auth_running.load(std::sync::atomic::Ordering::Relaxed);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(!running, egui::Button::new("ADC ログイン (gcloud)"))
-                        .on_hover_text("gcloud auth application-default login を実行")
-                        .clicked()
-                    {
-                        login_clicked = true;
-                    }
-                    if running {
-                        ui.spinner();
-                    }
-                });
+                let emu = std::env::var("SPANNER_EMULATOR_HOST").is_ok();
+                let auth = *self.auth_ok.lock().unwrap();
+                if emu {
+                    ui.label(
+                        egui::RichText::new("エミュレータ接続中 — 認証は不要です。")
+                            .color(MUTED)
+                            .small(),
+                    );
+                } else if auth == Some(true) && !running {
+                    // ログイン済み: ボタンは出さず、状態だけ表示（再確認はできる）。
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(74, 222, 128),
+                            "✓ ログイン済み（ADC）",
+                        );
+                        if ui.small_button("再確認").on_hover_text("ログイン状態を確認し直す").clicked() {
+                            recheck_auth = true;
+                        }
+                    });
+                } else {
+                    // 未ログイン / 確認中 / セッション切れ → ログインボタンを出す。
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!running, egui::Button::new("ADC ログイン (gcloud)"))
+                            .on_hover_text("gcloud auth application-default login を実行")
+                            .clicked()
+                        {
+                            login_clicked = true;
+                        }
+                        if running {
+                            ui.spinner();
+                        } else if auth == Some(false) {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(251, 191, 36),
+                                "未ログイン / セッション切れ",
+                            );
+                        }
+                    });
+                }
                 if let Some(s) = self.auth_status.lock().unwrap().as_ref() {
                     ui.label(egui::RichText::new(s).color(MUTED).small());
                 }
-                ui.separator();
 
-                ui.label(
-                    egui::RichText::new("kubectl コンテキスト")
-                        .color(MUTED)
-                        .small(),
-                );
+                settings_section(ui, "kubectl コンテキスト");
                 if self.contexts.is_empty() {
                     ui.label(
                         egui::RichText::new("(kubectl 未検出 / コンテキストなし)").color(MUTED),
@@ -6116,13 +6152,7 @@ impl MonitorApp {
                             }
                         });
                 }
-                ui.separator();
-
-                ui.label(
-                    egui::RichText::new("ポーリング間隔（秒）")
-                        .color(MUTED)
-                        .small(),
-                );
+                settings_section(ui, "ポーリング間隔（秒）");
                 let mut secs = self
                     .poll_interval
                     .load(std::sync::atomic::Ordering::Relaxed);
@@ -6142,6 +6172,9 @@ impl MonitorApp {
 
         if login_clicked {
             self.gcp_login();
+        }
+        if recheck_auth {
+            self.start_adc_check(ctx);
         }
         if discover_clicked {
             self.discover_envs();
@@ -6646,10 +6679,12 @@ impl MonitorApp {
                     .small(),
             );
             ui.add_space(4.0);
+            let mut sql_lay = sql_layouter;
             egui::TextEdit::multiline(&mut self.sql)
                 .desired_rows(3)
                 .desired_width(f32::INFINITY)
                 .code_editor()
+                .layouter(&mut sql_lay)
                 .show(ui);
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -6868,12 +6903,14 @@ impl MonitorApp {
                 egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                     // 等幅で選択コピーできるよう、編集不可の TextEdit を使う。
                     let mut text = ddl.clone();
+                    let mut layouter = sql_layouter;
                     ui.add(
                         egui::TextEdit::multiline(&mut text)
                             .font(egui::TextStyle::Monospace)
                             .desired_width(f32::INFINITY)
                             .desired_rows(18)
                             .code_editor()
+                            .layouter(&mut layouter)
                             .interactive(true),
                     );
                 });
@@ -8537,6 +8574,131 @@ const LIST_HOVER: egui::Color32 = egui::Color32::from_rgb(42, 45, 46); // 一覧
 const ACTIVITY_BG: egui::Color32 = egui::Color32::from_rgb(51, 51, 51); // アクティビティバー #333333
 const STATUS_BG: egui::Color32 = egui::Color32::from_rgb(0, 122, 204); // ステータスバー #007acc
 const BUTTON_BG: egui::Color32 = egui::Color32::from_rgb(14, 99, 156); // ボタン #0e639c
+
+/// SQL を VS Code(Dark+) 風に色付けした LayoutJob を作る。キーワード/型/文字列/
+/// コメント/数値を色分けする。TextEdit の layouter から使う。
+fn sql_highlight(text: &str, font: egui::FontId) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    // VS Code Dark+ の配色。
+    const KEYWORD: egui::Color32 = egui::Color32::from_rgb(86, 156, 214); // 青
+    const TYPE: egui::Color32 = egui::Color32::from_rgb(78, 201, 176); // ティール
+    const STRINGC: egui::Color32 = egui::Color32::from_rgb(206, 145, 120); // 橙
+    const COMMENT: egui::Color32 = egui::Color32::from_rgb(106, 153, 85); // 緑
+    const NUMBER: egui::Color32 = egui::Color32::from_rgb(181, 206, 168); // 薄緑
+    const PLAIN: egui::Color32 = egui::Color32::from_rgb(212, 212, 212);
+    const PUNCT: egui::Color32 = egui::Color32::from_rgb(170, 170, 170);
+
+    // 予約語・型（大小無視で判定）。
+    const KEYWORDS: &[&str] = &[
+        "select", "from", "where", "and", "or", "not", "null", "is", "in", "as", "on", "join",
+        "left", "right", "inner", "outer", "group", "by", "order", "having", "limit", "offset",
+        "insert", "into", "values", "update", "set", "delete", "create", "table", "index",
+        "unique", "primary", "key", "foreign", "references", "constraint", "default", "interleave",
+        "parent", "cascade", "asc", "desc", "distinct", "count", "between", "like", "exists",
+        "case", "when", "then", "else", "end", "union", "all", "with", "drop", "alter", "add",
+        "column", "if", "true", "false", "unnest", "array", "struct", "cast", "options", "max",
+    ];
+    const TYPES: &[&str] = &[
+        "int64", "string", "bytes", "bool", "float64", "numeric", "timestamp", "date", "json",
+        "array", "struct",
+    ];
+
+    let mut job = LayoutJob::default();
+    let fmt = |color: egui::Color32| TextFormat { font_id: font.clone(), color, ..Default::default() };
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i] as char;
+        // 行コメント -- ...
+        if c == '-' && i + 1 < b.len() && b[i + 1] == b'-' {
+            let start = i;
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            job.append(&text[start..i], 0.0, fmt(COMMENT));
+            continue;
+        }
+        // 文字列 '...'（'' エスケープ）または `識別子`
+        if c == '\'' || c == '`' {
+            let quote = b[i];
+            let start = i;
+            i += 1;
+            while i < b.len() {
+                if b[i] == quote {
+                    if quote == b'\'' && i + 1 < b.len() && b[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            let color = if quote == b'`' { PLAIN } else { STRINGC };
+            job.append(&text[start..i], 0.0, fmt(color));
+            continue;
+        }
+        // 識別子・キーワード
+        if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let word = &text[start..i];
+            let lower = word.to_ascii_lowercase();
+            let color = if TYPES.contains(&lower.as_str()) {
+                TYPE
+            } else if KEYWORDS.contains(&lower.as_str()) {
+                KEYWORD
+            } else {
+                PLAIN
+            };
+            job.append(word, 0.0, fmt(color));
+            continue;
+        }
+        // 数値
+        if c.is_ascii_digit() {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                i += 1;
+            }
+            job.append(&text[start..i], 0.0, fmt(NUMBER));
+            continue;
+        }
+        // 記号・空白
+        let color = if c.is_whitespace() { PLAIN } else { PUNCT };
+        job.append(&text[i..i + 1], 0.0, fmt(color));
+        i += 1;
+    }
+    job
+}
+
+/// SQL ハイライト用の layouter（TextEdit::layouter に渡す）。
+fn sql_layouter(
+    ui: &egui::Ui,
+    buf: &dyn egui::TextBuffer,
+    wrap_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let font = egui::FontId::monospace(12.0);
+    let mut job = sql_highlight(buf.as_str(), font);
+    job.wrap.max_width = wrap_width;
+    ui.fonts_mut(|f| f.layout_job(job))
+}
+
+/// 設定ウィンドウのセクション見出し（VS Code 設定風: 太字・上に余白・薄い区切り）。
+fn settings_section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new(title).strong().color(egui::Color32::from_gray(210)));
+    ui.add_space(2.0);
+    let rect = ui.max_rect();
+    let y = ui.cursor().top();
+    ui.painter().hline(
+        rect.left()..=rect.right(),
+        y,
+        egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+    );
+    ui.add_space(6.0);
+}
 
 /// VS Code 風の細いシェブロン（⌄）をプルダウンのアイコンとして描く。
 /// egui 既定の塗りつぶし三角形は野暮ったいので置き換える。
