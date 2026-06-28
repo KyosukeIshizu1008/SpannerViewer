@@ -59,6 +59,21 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+echo "==> コード署名"
+# CODESIGN_IDENTITY に Developer ID を指定すれば正式署名（公証も可能）。
+# 未指定ならアドホック署名 (-)。アドホックでも「壊れているため開けません・ゴミ箱へ」
+# という強制ブロックは避けられ、「開発元未確認」（右クリック→開くで許可可）になる。
+SIGN_ID="${CODESIGN_IDENTITY:--}"
+if [ "$SIGN_ID" = "-" ]; then
+  codesign --force --deep --sign - "$APP" \
+    && echo "   アドホック署名 OK（未公証: 受け取り側で隔離解除が必要）" \
+    || echo "   署名に失敗。未署名のまま続行します。"
+else
+  codesign --force --deep --options runtime --timestamp --sign "$SIGN_ID" "$APP" \
+    && echo "   署名: $SIGN_ID" \
+    || echo "   署名に失敗。未署名のまま続行します。"
+fi
+
 echo "==> DMG 構成 ($DMG)"
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
@@ -76,5 +91,23 @@ hdiutil create \
 rm -rf "$STAGE"
 echo "==> 完成: $DMG"
 echo
-echo "注意: このアプリは署名されていません。初回起動はFinderでアプリを右クリック→「開く」"
-echo "      で許可してください (Gatekeeper の警告回避)。"
+if [ "$SIGN_ID" = "-" ]; then
+  cat <<'NOTE'
+注意: 公証(notarization)していないため、ダウンロード/共有して受け取った Mac では
+      macOS が隔離属性を付け「壊れているため開けません・ゴミ箱へ」と出ることがあります
+      （実際に壊れているわけではなく、署名/公証が無いためです）。
+
+  受け取った人の回避手順（どれか）:
+    1) アプリを /Applications にコピー後、ターミナルで隔離属性を消す:
+         xattr -dr com.apple.quarantine "/Applications/Spanner Viewer.app"
+       （または DMG/.app に対して: xattr -cr "Spanner Viewer.app"）
+    2) システム設定 → プライバシーとセキュリティ → 下の「このまま開く」を押す
+       （アドホック署名済みなので右クリック→「開く」でも許可できる場合があります）
+
+  クリーンに開かせるには Apple Developer ID 署名＋公証が必要です:
+    CODESIGN_IDENTITY="Developer ID Application: 名前 (TEAMID)" scripts/build-dmg.sh
+    のあと xcrun notarytool submit / stapler staple を実行してください。
+NOTE
+else
+  echo "署名済み: $SIGN_ID（必要なら notarytool で公証してください）"
+fi
