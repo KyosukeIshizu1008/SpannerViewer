@@ -4540,10 +4540,14 @@ impl MonitorApp {
                         ui.label("NULL トークン:");
                         ui.add(
                             egui::TextEdit::singleline(&mut d.null_token)
-                                .hint_text("例: NULL, \\N（空なら無効）")
-                                .desired_width(160.0),
+                                .hint_text("例: NULL, \\N, <null>, (null)（空なら無効）")
+                                .desired_width(200.0),
                         )
-                        .on_hover_text("この文字列のセルを NULL として書き込みます（空欄扱いとは別）。");
+                        .on_hover_text(
+                            "この文字列のセルを NULL として書き込みます（完全一致・大文字小文字を区別）。\
+                             未指定だと文字列としてそのまま入ります。\
+                             例: DataGrip/DBeaver の <null> 出力を NULL にしたいときに <null> を入力。",
+                        );
                     });
                     ui.checkbox(&mut d.skip_bad_rows, "不正な行はスキップして続行（リジェクトに記録）")
                         .on_hover_text(
