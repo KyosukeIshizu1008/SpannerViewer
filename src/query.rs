@@ -314,6 +314,9 @@ pub struct VerifyRequest {
     pub empty_as_null: bool,
     /// この文字列を NULL とみなす（空欄とは別。例 "NULL" / "\\N"）。
     pub null_token: Option<String>,
+    /// 数値の表記ゆれを無視して突合するか（"005"="5", "5.0"="5", "+5"="5", 前後空白）。
+    /// STRING 列に数値 ID を入れていて、CSV 側がゼロ詰め/小数化しているとき有効。
+    pub numeric_match: bool,
     /// 中断フラグ。
     pub cancel: Arc<AtomicBool>,
 }
@@ -715,6 +718,73 @@ pub async fn verify_loop(
     }
 }
 
+/// 突合キー・値の表記ゆれを吸収する正準化。CSV 側・DB 側の両方に同じものを
+/// 通すことで、`" 5"` `"005"` `"+5"` `"5.0"` `"10.00"` などを `"5"` `"10"` に
+/// 揃えて一致させる。整数/小数として読めない文字列は前後空白だけ除いて返す。
+/// 桁落ち（スプレッドシートで 2^53 超の INT64 が丸められた等）は復元できない。
+fn norm_value(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    // 整数（符号・先頭ゼロを正準化）。巨大値も i128 で正確に扱う。
+    if let Ok(n) = t.parse::<i128>() {
+        return n.to_string();
+    }
+    // 10進小数（指数なし）。文字列処理で末尾ゼロ・先頭ゼロ・符号を正準化し、
+    // f64 を経由しない（精度を落とさない）。
+    if let Some(c) = canon_decimal(t) {
+        return c;
+    }
+    t.to_string()
+}
+
+/// 突合比較用の最終正準化。numeric=true なら数値表記ゆれも吸収、false なら
+/// 前後空白の除去のみ（STRING の完全一致を保ちたいとき）。CSV/DB 両側に同じものを通す。
+fn cmp_norm(s: &str, numeric: bool) -> String {
+    if numeric {
+        norm_value(s)
+    } else {
+        s.trim().to_string()
+    }
+}
+
+/// `[+-]?整数部(.小数部)?` の 10進小数を正準形にする。該当しなければ None。
+/// 例: "10.00"→"10", "1.50"→"1.5", "+0.250"→"0.25", "-0.0"→"0"。
+fn canon_decimal(t: &str) -> Option<String> {
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => return None, // 小数点が無ければここでは扱わない（整数は上で処理済み）
+    };
+    // 整数部・小数部は数字のみ（空は許容: ".5" や "5."）。
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let int_trimmed = int_part.trim_start_matches('0');
+    let frac_trimmed = frac_part.trim_end_matches('0');
+    let int_norm = if int_trimmed.is_empty() { "0" } else { int_trimmed };
+    let mut out = String::new();
+    let is_zero = int_norm == "0" && frac_trimmed.is_empty();
+    if neg && !is_zero {
+        out.push('-');
+    }
+    out.push_str(int_norm);
+    if !frac_trimmed.is_empty() {
+        out.push('.');
+        out.push_str(frac_trimmed);
+    }
+    Some(out)
+}
+
 /// CSV 1 セルを比較用に正規化する。空欄/NULL トークンは "NULL" に揃える
 /// （DB の NULL も "NULL" で文字列化されるため、これで突合できる）。
 fn canon_cell(raw: &str, empty_as_null: bool, null_token: Option<&str>) -> String {
@@ -826,9 +896,10 @@ async fn run_verify(
         db_map.reserve(rows.len());
         for row in rows {
             // SELECT の列順 = req.columns 順。PK 位置から突合キーを作る。
+            // numeric_match 時は数値表記ゆれを吸収して突合する。
             let key = pk_positions
                 .iter()
-                .map(|&p| row.get(p).cloned().unwrap_or_default())
+                .map(|&p| cmp_norm(row.get(p).map(|s| s.as_str()).unwrap_or(""), req.numeric_match))
                 .collect::<Vec<_>>()
                 .join(&KEY_SEP.to_string());
             db_map.insert(key, row);
@@ -870,16 +941,22 @@ async fn run_verify(
                        matched_keys: &mut HashSet<String>,
                        csv_seen: &mut HashSet<String>| {
         out.csv_rows += 1;
-        // 比較用に各列を正規化。列不足は空欄（→ empty_as_null で NULL）扱い。
-        let cell = |src: usize| -> String {
+        // 表示用（NULL トークン/空欄を NULL に揃えた生の値）。
+        let cell_disp = |src: usize| -> String {
             let raw = rec.get(src).map(|s| s.as_str()).unwrap_or("");
             canon_cell(raw, req.empty_as_null, req.null_token.as_deref())
         };
+        // 比較用（さらに数値/空白の表記ゆれを吸収）。
+        let cell_cmp = |src: usize| -> String { cmp_norm(&cell_disp(src), req.numeric_match) };
         let key_disp = pk_positions
             .iter()
-            .map(|&p| cell(req.columns[p].src_index))
+            .map(|&p| cell_disp(req.columns[p].src_index))
             .collect::<Vec<_>>();
-        let key = key_disp.join(&KEY_SEP.to_string());
+        let key = pk_positions
+            .iter()
+            .map(|&p| cell_cmp(req.columns[p].src_index))
+            .collect::<Vec<_>>()
+            .join(&KEY_SEP.to_string());
         let key_show = key_disp.join(", ");
         if !csv_seen.insert(key.clone()) {
             out.csv_dup += 1;
@@ -891,13 +968,15 @@ async fn run_verify(
             }
             Some(db_row) => {
                 matched_keys.insert(key.clone());
-                // 全カラム値を比較し、最初に異なる列を詳細に出す。
+                // 全カラム値を比較し、最初に異なる列を詳細に出す（表記ゆれは吸収）。
                 let mut diff: Option<String> = None;
                 for (i, c) in req.columns.iter().enumerate() {
-                    let cv = cell(c.src_index);
-                    let dv = db_row.get(i).cloned().unwrap_or_default();
+                    let cv = cell_cmp(c.src_index);
+                    let dv_raw = db_row.get(i).cloned().unwrap_or_default();
+                    let dv = cmp_norm(&dv_raw, req.numeric_match);
                     if cv != dv {
-                        diff = Some(format!("{}: '{cv}'(csv) ≠ '{dv}'(db)", c.name));
+                        let cv_disp = cell_disp(c.src_index);
+                        diff = Some(format!("{}: '{cv_disp}'(csv) ≠ '{dv_raw}'(db)", c.name));
                         break;
                     }
                 }
@@ -4058,6 +4137,37 @@ mod tests {
         assert!(convert_cell("NA", "INT64", false, Some("NULL")).is_err());
     }
 
+    /// 突合の数値正規化: ゼロ詰め・符号・小数・空白を正準化する（ネットワーク不要）。
+    #[test]
+    fn norm_value_canonicalizes_numbers() {
+        // 整数
+        assert_eq!(norm_value("005"), "5");
+        assert_eq!(norm_value(" 5 "), "5");
+        assert_eq!(norm_value("+5"), "5");
+        assert_eq!(norm_value("-007"), "-7");
+        assert_eq!(norm_value("0"), "0");
+        assert_eq!(norm_value("000"), "0");
+        // 巨大 INT64（f64 を経由しないので桁落ちしない）
+        assert_eq!(norm_value("123456789012345678"), "123456789012345678");
+        // 小数（末尾ゼロ・先頭ゼロを除去、指数なし）
+        assert_eq!(norm_value("5.0"), "5");
+        assert_eq!(norm_value("10.00"), "10");
+        assert_eq!(norm_value("1.50"), "1.5");
+        assert_eq!(norm_value("+0.250"), "0.25");
+        assert_eq!(norm_value("-0.0"), "0");
+        assert_eq!(norm_value("007.50"), "7.5");
+        // 数値でないものは前後空白だけ除く
+        assert_eq!(norm_value("  abc "), "abc");
+        assert_eq!(norm_value("NULL"), "NULL");
+        assert_eq!(norm_value("1,234"), "1,234"); // 桁区切りは数値とみなさない（誤マージ防止）
+        assert_eq!(norm_value("1.2.3"), "1.2.3");
+        assert_eq!(norm_value("1e5"), "1e5"); // 指数表記は対象外
+        // cmp_norm: numeric=false は前後空白のみ
+        assert_eq!(cmp_norm("005", false), "005");
+        assert_eq!(cmp_norm(" 005 ", false), "005");
+        assert_eq!(cmp_norm("005", true), "5");
+    }
+
     /// セル変換: 型ごとのパース成否（ネットワーク不要）。
     #[test]
     fn convert_cell_types() {
@@ -4615,6 +4725,179 @@ mod tests {
         assert_eq!(rows[3][2], "last");
     }
 
+    /// 大きい INT64（2^53 超）が正確な10進文字列で読めるか（f64 経由で丸まらないか）。
+    #[tokio::test]
+    async fn large_int64_stringify_exact() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _guard = EMU_LOCK.lock().await;
+        let client = client().await;
+        // 2^53 超・i64::MAX 近辺の値を素の SELECT で文字列化する。
+        let (_, rows, _) = try_query(
+            &client,
+            "SELECT 123456789012345678 AS a, 9223372036854775807 AS b, -987654321098765432 AS c",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows[0],
+            vec![
+                "123456789012345678",
+                "9223372036854775807",
+                "-987654321098765432"
+            ],
+            "大きい INT64 が丸まっている（f64 経由の疑い）: {:?}",
+            rows[0]
+        );
+    }
+
+    /// 大量行(73000)の照合で取りこぼさないことの再現テスト。DB 読み込みの
+    /// ストリーミングと PK 突合が全件一致するかを実測する（emulator 前提）。
+    #[tokio::test]
+    async fn verify_large_pk_all_match() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _guard = EMU_LOCK.lock().await;
+        create_import_table().await;
+
+        // Id 1..=N を直接ミューテーションで投入（CSV 経路に依存しない）。
+        const N: i64 = 73_000;
+        let c = client().await;
+        let mut muts = Vec::new();
+        for id in 1..=N {
+            muts.push(gcloud_spanner::mutation::insert_or_update(
+                "ImportTest",
+                &["Id", "Name"],
+                &[&id, &format!("n{id}")],
+            ));
+            if muts.len() >= 2000 {
+                c.apply(std::mem::take(&mut muts)).await.unwrap();
+            }
+        }
+        if !muts.is_empty() {
+            c.apply(muts).await.unwrap();
+        }
+
+        // DB 読み込みが全件返るか（read_all_rows）。
+        let client = client().await;
+        let (rows, truncated) =
+            read_all_rows(&client, "SELECT Id FROM ImportTest", VERIFY_DB_CAP).await.unwrap();
+        assert_eq!(rows.len(), N as usize, "read_all_rows が取りこぼし: {}", rows.len());
+        assert!(!truncated);
+
+        // 同じ Id 群の CSV で照合 → 全件一致するはず。
+        let mut csv = String::from("Key\n");
+        for id in 1..=N {
+            csv.push_str(&id.to_string());
+            csv.push('\n');
+        }
+        let vreq = VerifyRequest {
+            table: "ImportTest".into(),
+            columns: vec![VerifyColumn { name: "Id".into(), pk: true, src_index: 0 }],
+            source: ImportSource::File(write_temp_csv("large_pk_target", &csv)),
+            has_header: true,
+            encoding: Encoding::Utf8,
+            delimiter: b',',
+            empty_as_null: true,
+            null_token: None,
+            numeric_match: true,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (vtx, _v) = std::sync::mpsc::channel::<VerifyProgress>();
+        let r = run_verify(&test_env(), &vreq, false, &vtx).await;
+        assert_eq!(r.error, None, "verify error: {:?}", r.error);
+        assert_eq!(r.db_rows, N as usize, "db_rows: {}", r.db_rows);
+        assert_eq!(r.csv_rows, N as usize, "csv_rows: {}", r.csv_rows);
+        assert_eq!(r.matched, N as usize, "matched: {} (期待 {N})", r.matched);
+        assert_eq!(r.csv_only, 0, "csv_only: {}", r.csv_only);
+        assert_eq!(r.db_only, 0, "db_only: {}", r.db_only);
+    }
+
+    /// STRING 列に数値 ID を入れているケース（ユーザー事例）。CSV 側がゼロ詰め/小数化
+    /// していても numeric_match=true なら突合できる。false なら表記どおり一致しない。
+    #[tokio::test]
+    async fn verify_string_pk_numeric_match() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _guard = EMU_LOCK.lock().await;
+        // STRING PK のテーブルを作る。
+        {
+            use gcloud_spanner::admin::client::Client as AdminClient;
+            use gcloud_spanner::admin::AdminClientConfig;
+            use google_cloud_googleapis::spanner::admin::database::v1::UpdateDatabaseDdlRequest;
+            let cfg = AdminClientConfig::default().with_auth().await.unwrap();
+            let admin = AdminClient::new(cfg).await.unwrap();
+            let req = UpdateDatabaseDdlRequest {
+                database: emulator_db().unwrap(),
+                statements: vec![
+                    "CREATE TABLE IF NOT EXISTS StrKeyTest (Code STRING(MAX) NOT NULL, \
+                     Name STRING(MAX)) PRIMARY KEY (Code)"
+                        .to_string(),
+                ],
+                ..Default::default()
+            };
+            admin.database().update_database_ddl(req, None).await.unwrap().wait(None).await.unwrap();
+        }
+        let c = client().await;
+        let _ = c
+            .apply(vec![gcloud_spanner::mutation::delete(
+                "StrKeyTest",
+                gcloud_spanner::key::all_keys(),
+            )])
+            .await;
+        // DB は素の数値文字列で格納: "5", "10", 巨大値。
+        c.apply(vec![
+            gcloud_spanner::mutation::insert_or_update("StrKeyTest", &["Code"], &[&"5"]),
+            gcloud_spanner::mutation::insert_or_update("StrKeyTest", &["Code"], &[&"10"]),
+            gcloud_spanner::mutation::insert_or_update(
+                "StrKeyTest",
+                &["Code"],
+                &[&"123456789012345678"],
+            ),
+        ])
+        .await
+        .unwrap();
+
+        // CSV はゼロ詰め/小数化（同じ論理値）。巨大値はそのまま。
+        let csv = "Key\n005\n10.0\n123456789012345678\n";
+        let mk = |numeric: bool| VerifyRequest {
+            table: "StrKeyTest".into(),
+            columns: vec![VerifyColumn { name: "Code".into(), pk: true, src_index: 0 }],
+            source: ImportSource::File(write_temp_csv("strkey_target", csv)),
+            has_header: true,
+            encoding: Encoding::Utf8,
+            delimiter: b',',
+            empty_as_null: true,
+            null_token: None,
+            numeric_match: numeric,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+
+        // numeric_match=true: 表記ゆれを吸収して全件一致。
+        let (vtx, _v) = std::sync::mpsc::channel::<VerifyProgress>();
+        let r = run_verify(&test_env(), &mk(true), false, &vtx).await;
+        assert_eq!(r.error, None, "verify error: {:?}", r.error);
+        assert_eq!(r.matched, 3, "numeric_match で全件一致のはず");
+        assert_eq!(r.csv_only, 0);
+        assert_eq!(r.db_only, 0);
+
+        // numeric_match=false: 表記どおり比較 → ゼロ詰め/小数は一致しない。
+        let (vtx2, _v2) = std::sync::mpsc::channel::<VerifyProgress>();
+        let r2 = run_verify(&test_env(), &mk(false), false, &vtx2).await;
+        assert_eq!(r2.matched, 1, "巨大値だけ表記一致（005/10.0 は外れる）");
+        assert_eq!(r2.csv_only, 2);
+        assert_eq!(r2.db_only, 2);
+    }
+
     /// 照合: PK 列だけマッピングすれば「DB に存在するか（存在確認）」ができる。
     /// 値差異は常に 0、CSVのみ = 不足行、になる（emulator 前提）。
     #[tokio::test]
@@ -4673,6 +4956,7 @@ mod tests {
             delimiter: b',',
             empty_as_null: true,
             null_token: None,
+            numeric_match: true,
             cancel: Arc::new(AtomicBool::new(false)),
         };
         let (vtx, _v) = std::sync::mpsc::channel::<VerifyProgress>();
@@ -4748,6 +5032,7 @@ mod tests {
             delimiter: b',',
             empty_as_null: true,
             null_token: None,
+            numeric_match: true,
             cancel: Arc::new(AtomicBool::new(false)),
         };
         let (vtx, _vrx) = std::sync::mpsc::channel::<VerifyProgress>();

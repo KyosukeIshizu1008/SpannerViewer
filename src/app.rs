@@ -242,6 +242,8 @@ struct VerifyState {
     has_header: bool,
     /// 空欄を NULL とみなして比較するか。
     empty_as_null: bool,
+    /// 数値の表記ゆれを無視して突合するか（"005"="5", "5.0"="5"）。
+    numeric_match: bool,
     /// NULL とみなす文字列（空なら無効）。
     null_token: String,
     /// テーブル各カラムに割り当てる CSV 列インデックス（None=比較から除外）。
@@ -3759,6 +3761,7 @@ impl MonitorApp {
             delimiter,
             has_header: true,
             empty_as_null: true,
+            numeric_match: true,
             null_token: String::new(),
             mapping: Vec::new(),
             note: Some("プレビューは先頭のみ。実行時に全行をストリーミングして突合します。".into()),
@@ -3809,6 +3812,7 @@ impl MonitorApp {
             delimiter: d.delimiter,
             empty_as_null: d.empty_as_null,
             null_token,
+            numeric_match: d.numeric_match,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -6275,6 +6279,13 @@ impl MonitorApp {
                     ui.separator();
                     ui.checkbox(&mut d.empty_as_null, "空欄=NULL")
                         .on_hover_text("空欄を NULL とみなして比較します（DB の NULL と一致）。");
+                    ui.checkbox(&mut d.numeric_match, "数値の表記ゆれを無視")
+                        .on_hover_text(
+                            "005=5・5.0=5・+5=5・前後空白 を同じ値として突合します。\n\
+                             STRING 列に数値 ID を入れていて、CSV 側がゼロ詰め/小数化\n\
+                             しているときに有効。桁落ち（巨大 INT64 を表計算で丸めた等）は\n\
+                             復元できません。",
+                        );
                 });
                 if reparse {
                     d.reparse_preview();
@@ -9931,6 +9942,7 @@ mod tests {
                 delimiter: b',',
                 has_header: true,
                 empty_as_null: true,
+                numeric_match: true,
                 null_token: String::new(),
                 mapping: vec![Some(0), Some(1), Some(2)],
                 note: None,
