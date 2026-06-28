@@ -2292,8 +2292,11 @@ impl CsvTab {
     }
 
     /// 列幅キャッシュを無効化する（フィルタ変更・再読込時）。
+    /// 行インデックス空間が変わると選択セルもズレるので一緒にクリアする。
     fn invalidate_col_widths(&mut self) {
         self.col_widths.clear();
+        self.selected = None;
+        self.copied_note = None;
     }
 
     /// 指定列を「表示中の最長セル」に合わせた幅にする（上限なし＝全部見える）。
@@ -8665,10 +8668,13 @@ fn sql_highlight(text: &str, font: egui::FontId) -> egui::text::LayoutJob {
             job.append(&text[start..i], 0.0, fmt(NUMBER));
             continue;
         }
-        // 記号・空白
-        let color = if c.is_whitespace() { PLAIN } else { PUNCT };
-        job.append(&text[i..i + 1], 0.0, fmt(color));
-        i += 1;
+        // 記号・空白・その他（マルチバイト含む）。バイト境界でスライスすると
+        // 非 ASCII（日本語など）でパニックするので、文字単位で進める。
+        let ch = text[i..].chars().next().unwrap_or(' ');
+        let len = ch.len_utf8();
+        let color = if ch.is_whitespace() { PLAIN } else { PUNCT };
+        job.append(&text[i..i + len], 0.0, fmt(color));
+        i += len;
     }
     job
 }
@@ -10535,6 +10541,24 @@ mod tests {
         assert_eq!(jobs[1].req.encoding, query::Encoding::ShiftJis);
         assert_eq!(jobs[1].req.delimiter, b'\t');
         matches!(jobs[1].req.source, query::ImportSource::Gcs(_));
+    }
+
+    /// SQL ハイライトは非 ASCII（日本語など）でパニックしない（バイト境界スライス対策）。
+    #[test]
+    fn sql_highlight_handles_non_ascii() {
+        let font = egui::FontId::monospace(12.0);
+        for s in [
+            "SELECT * FROM 注文 WHERE 名前 = 'あ'",
+            "-- コメント漢字\nSELECT 1",
+            "`列名` = \"値\"",
+            "5'10\" あ",
+            "",
+            "—— em dash 全角",
+        ] {
+            // パニックしなければ OK。全文字が出力に含まれること（長さ一致）も確認。
+            let job = sql_highlight(s, font.clone());
+            assert_eq!(job.text, s, "input={s:?}");
+        }
     }
 
     /// 並列ディスパッチ判定: 別テーブルは並列・同一テーブルは直列・上限まで。

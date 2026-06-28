@@ -886,6 +886,7 @@ async fn run_verify(
     // PK 問い合わせはネイティブ型で行い主キー索引を使う（CAST は索引を無効化し
     // 全表スキャンになるため、巨大テーブルで破綻する）。
     let pkq = pk_query(&req.columns, &pk_positions);
+    let pk_int = matches!(pkq.bind, PkBind::Int);
 
     // 接続を 1 回だけ張り、読み取り専用トランザクション（スナップショット）を
     // 1 つ作って全バッチ/全スキャンで使い回す（バッチごとの接続連発を防ぎ、
@@ -999,7 +1000,7 @@ async fn run_verify(
                 continue; // ヘッダ行は飛ばす
             }
             out.csv_rows += 1;
-            let item = build_vitem(&rec, req, &pk_positions);
+            let item = build_vitem(&rec, req, &pk_positions, pk_int);
             if !csv_seen.insert(item.cmp_key.clone()) {
                 out.csv_dup += 1;
             }
@@ -1021,7 +1022,7 @@ async fn run_verify(
             continue;
         }
         out.csv_rows += 1;
-        let item = build_vitem(&rec, req, &pk_positions);
+        let item = build_vitem(&rec, req, &pk_positions, pk_int);
         if !csv_seen.insert(item.cmp_key.clone()) {
             out.csv_dup += 1;
         }
@@ -1076,8 +1077,9 @@ struct VItem {
     col_disp: Vec<String>,
 }
 
-/// CSV 1 レコードから VItem を作る。
-fn build_vitem(rec: &[String], req: &VerifyRequest, pk_positions: &[usize]) -> VItem {
+/// CSV 1 レコードから VItem を作る。`pk_int`=PK が INT64 のとき、PK 突合キーは
+/// 常に整数正準化する（DB は INT64 で持つので "007"/"+7" も 7 と一致させる）。
+fn build_vitem(rec: &[String], req: &VerifyRequest, pk_positions: &[usize], pk_int: bool) -> VItem {
     let col_disp: Vec<String> = req
         .columns
         .iter()
@@ -1087,9 +1089,17 @@ fn build_vitem(rec: &[String], req: &VerifyRequest, pk_positions: &[usize]) -> V
         })
         .collect();
     let col_cmp: Vec<String> = col_disp.iter().map(|d| cmp_norm(d, req.numeric_match)).collect();
+    // PK 突合キー（INT64 PK は整数正準化、それ以外は通常の比較正規化）。
+    let pk_cmp = |p: usize| -> String {
+        if pk_int {
+            norm_value(&col_disp[p])
+        } else {
+            col_cmp[p].clone()
+        }
+    };
     let sep = KEY_SEP.to_string();
     let query_key = pk_positions.iter().map(|&p| col_disp[p].clone()).collect::<Vec<_>>().join(&sep);
-    let cmp_key = pk_positions.iter().map(|&p| col_cmp[p].clone()).collect::<Vec<_>>().join(&sep);
+    let cmp_key = pk_positions.iter().map(|&p| pk_cmp(p)).collect::<Vec<_>>().join(&sep);
     let key_show = pk_positions.iter().map(|&p| col_disp[p].clone()).collect::<Vec<_>>().join(", ");
     VItem { query_key, cmp_key, key_show, col_cmp, col_disp }
 }
@@ -1153,6 +1163,9 @@ async fn verify_lookup_batch(
     out: &mut VerifyOutcome,
     matched_keys: &mut HashSet<String>,
 ) -> Result<(), String> {
+    let pk_int = matches!(pkq.bind, PkBind::Int);
+    let pk_positions: Vec<usize> =
+        req.columns.iter().enumerate().filter(|(_, c)| c.pk).map(|(i, _)| i).collect();
     // 問い合わせキーを重複排除。
     let mut seen = HashSet::new();
     let mut keys: Vec<String> = Vec::with_capacity(batch.len());
@@ -1185,11 +1198,17 @@ async fn verify_lookup_batch(
             cells.push(c);
             i += 1;
         }
-        let pk_positions: Vec<usize> =
-            req.columns.iter().enumerate().filter(|(_, c)| c.pk).map(|(i, _)| i).collect();
         let dbkey = pk_positions
             .iter()
-            .map(|&p| cmp_norm(cells.get(p).map(|s| s.as_str()).unwrap_or(""), req.numeric_match))
+            .map(|&p| {
+                let cell = cells.get(p).map(|s| s.as_str()).unwrap_or("");
+                // CSV 側（build_vitem）と同じ規則: INT64 PK は整数正準化。
+                if pk_int {
+                    norm_value(cell)
+                } else {
+                    cmp_norm(cell, req.numeric_match)
+                }
+            })
             .collect::<Vec<_>>()
             .join(&KEY_SEP.to_string());
         map.insert(dbkey, cells);
@@ -5323,8 +5342,9 @@ mod tests {
             None
         );
 
-        // スプレッドシート相当（Id だけの列・名前は何でもよい）。Id 1,2,4。
-        let csv = "Key\n1\n2\n4\n";
+        // スプレッドシート相当（Id だけの列）。Id 1,2,4。1 はゼロ詰め "001" で
+        // 渡し、INT64 PK では整数として 1 と一致すること（表記ゆれ吸収）も確認する。
+        let csv = "Key\n001\n2\n4\n";
         let vreq = VerifyRequest {
             table: "ImportTest".into(),
             // PK 列(Id)だけをマッピング。他列はマッピングしない。
