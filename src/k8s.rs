@@ -20,13 +20,13 @@ pub struct Config {
 /// 選択中の kubectl コンテキスト（None なら current-context）。
 static CONTEXT: Mutex<Option<String>> = Mutex::new(None);
 
-/// UI から選択コンテキストを設定する。
+/// UI から選択コンテキストを設定する。ポイズン時も中身を使う（連鎖パニック回避）。
 pub fn set_context(ctx: Option<String>) {
-    *CONTEXT.lock().unwrap() = ctx;
+    *CONTEXT.lock().unwrap_or_else(|e| e.into_inner()) = ctx;
 }
 
 fn context_args() -> Vec<String> {
-    match CONTEXT.lock().unwrap().clone() {
+    match CONTEXT.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         Some(c) if !c.is_empty() => vec!["--context".into(), c],
         _ => Vec::new(),
     }
@@ -37,6 +37,12 @@ fn context_args() -> Vec<String> {
 /// k9s 等のターミナル起動では繋がるのにアプリだと繋がらない典型原因なので、
 /// よくある bin ディレクトリを PATH に補う。gcloud 実行（app.rs）でも使う。
 pub(crate) fn augmented_path() -> String {
+    // PATH 補完は毎回 spawn ごとに再計算する必要がないのでキャッシュする。
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(augmented_path_compute).clone()
+}
+
+fn augmented_path_compute() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut dirs: Vec<String> = std::env::var("PATH")
         .map(|p| p.split(':').map(String::from).collect())
@@ -60,8 +66,14 @@ pub(crate) fn augmented_path() -> String {
     dirs.join(":")
 }
 
-/// kubectl の実体を探す（PATH に無くても一般的な場所から見つける）。
+/// kubectl の実体を探す（PATH に無くても一般的な場所から見つける）。実体探索の
+/// ファイルシステムアクセスは毎 spawn でやる必要がないのでキャッシュする。
 fn kubectl_bin() -> String {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(kubectl_bin_compute).clone()
+}
+
+fn kubectl_bin_compute() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let candidates = [
         "/opt/homebrew/bin/kubectl".to_string(),
@@ -77,6 +89,10 @@ fn kubectl_bin() -> String {
     }
     "kubectl".to_string()
 }
+
+/// 単発 kubectl 呼び出しの API タイムアウト。到達不能クラスタで全ループが
+/// 無限に固まるのを防ぐ（ストリーミング系: logs -f / port-forward には付けない）。
+const KUBECTL_TIMEOUT: &str = "--request-timeout=10s";
 
 /// PATH を補った kubectl コマンド（非同期）。これを使って kubectl を起動する。
 fn kubectl_cmd() -> tokio::process::Command {
@@ -1304,6 +1320,7 @@ async fn run_stdin(args: &[&str], input: &str) -> Result<String, String> {
     use tokio::io::AsyncWriteExt;
     let mut child = kubectl_cmd()
         .args(context_args())
+        .arg(KUBECTL_TIMEOUT)
         .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1329,6 +1346,7 @@ async fn run_stdin(args: &[&str], input: &str) -> Result<String, String> {
 async fn run_combined(args: &[&str]) -> Result<String, String> {
     let out = kubectl_cmd()
         .args(context_args())
+        .arg(KUBECTL_TIMEOUT)
         .args(args)
         .output()
         .await
@@ -1407,6 +1425,7 @@ pub async fn topology_loop(
 async fn run(args: &[&str]) -> Result<String, String> {
     let out = kubectl_cmd()
         .args(context_args())
+        .arg(KUBECTL_TIMEOUT)
         .args(args)
         .output()
         .await

@@ -1206,6 +1206,8 @@ impl MonitorApp {
                     self.copy_note = Some(msg);
                     // 空いた枠で次の待機ジョブを動かす。
                     self.pump_import_queue();
+                    // 完了ジョブが無限に溜まらないよう古いものから間引く。
+                    self.cap_done_jobs();
                     // 完了/失敗/中断で状態が変わったので保存（Done は保存対象外になる）。
                     save_import_jobs(&self.import_jobs);
                 }
@@ -1550,7 +1552,9 @@ impl MonitorApp {
     /// namespace セレクタ用の一覧を取得する。
     fn run_namespaces(&mut self) {
         self.kube_ns_loaded = true; // 多重送信防止（結果が来たら一覧を更新）
-        let _ = self.kube_res_req_tx.send(k8s::ResourceReq::Namespaces);
+        if self.kube_res_req_tx.send(k8s::ResourceReq::Namespaces).is_err() {
+            self.copy_note = Some(WORKER_GONE.into());
+        }
     }
 
     /// 種別を切り替えて即取得する。
@@ -1564,19 +1568,25 @@ impl MonitorApp {
     }
 
     fn request_yaml(&mut self, ns: Option<String>, name: &str) {
-        let _ = self.kube_res_req_tx.send(k8s::ResourceReq::Yaml {
+        let r = self.kube_res_req_tx.send(k8s::ResourceReq::Yaml {
             kind: self.res_kind.clone(),
             ns,
             name: name.to_string(),
         });
+        if r.is_err() {
+            self.copy_note = Some(WORKER_GONE.into());
+        }
     }
 
     fn request_describe(&mut self, ns: Option<String>, name: &str) {
-        let _ = self.kube_res_req_tx.send(k8s::ResourceReq::Describe {
+        let r = self.kube_res_req_tx.send(k8s::ResourceReq::Describe {
             kind: self.res_kind.clone(),
             ns,
             name: name.to_string(),
         });
+        if r.is_err() {
+            self.copy_note = Some(WORKER_GONE.into());
+        }
     }
 
     fn open_logs(&mut self, ns: &str, pod: &str, container: &str) {
@@ -1601,7 +1611,9 @@ impl MonitorApp {
     }
 
     fn send_action(&mut self, req: k8s::ActionReq) {
-        let _ = self.kube_action_req_tx.send(req);
+        if self.kube_action_req_tx.send(req).is_err() {
+            self.copy_note = Some(WORKER_GONE.into());
+        }
     }
 
     fn latest_ok(&self) -> Option<&Sample> {
@@ -2472,9 +2484,10 @@ impl CsvTab {
             self.filtering = true;
             self.filter_cancel.store(false, Ordering::Relaxed);
             *self.filter_result.lock().unwrap() = None;
-            // 読み込み済みの行スナップショットを走査（ストリームを止めない）。
-            let lines = pv.lock().unwrap().lines.clone();
             std::thread::spawn(move || {
+                // 行スナップショットのクローンも背景スレッドで行う（UI スレッドで
+                // 最大 200万行を複製してフレームを止めない）。
+                let lines = pv.lock().unwrap().lines.clone();
                 let needle_l = needle.to_lowercase();
                 let mut out: Vec<u64> = Vec::new();
                 for (i, line) in lines.iter().enumerate() {
@@ -4200,7 +4213,9 @@ impl MonitorApp {
         });
         self.import_dialog = None;
         // 同フォルダを一覧する（応答で各 CSV を enqueue）。
-        let _ = self.gcs_req_tx.send(query::GcsRequest::List(folder));
+        if self.gcs_req_tx.send(query::GcsRequest::List(folder)).is_err() {
+            self.copy_note = Some(WORKER_GONE.into());
+        }
     }
 
     /// リクエストを 1 ジョブとしてキューに積み、キューを進める。
@@ -4227,6 +4242,24 @@ impl MonitorApp {
 
     /// キューを進める: 別テーブルなら並列、同一テーブルは直列で待機ジョブを送る。
     /// 同時実行は MAX_PARALLEL_IMPORTS まで。
+    /// 完了(Done)ジョブが無限に溜まらないよう、古いものから上限まで間引く。
+    fn cap_done_jobs(&mut self) {
+        const MAX_DONE: usize = 50;
+        let done = self.import_jobs.iter().filter(|j| j.status == JobStatus::Done).count();
+        if done <= MAX_DONE {
+            return;
+        }
+        let mut remove = done - MAX_DONE;
+        self.import_jobs.retain(|j| {
+            if remove > 0 && j.status == JobStatus::Done {
+                remove -= 1;
+                false // 先頭側（古い）の Done から落とす
+            } else {
+                true
+            }
+        });
+    }
+
     fn pump_import_queue(&mut self) {
         loop {
             // 現在実行中のジョブ数と、実行中テーブルの集合を集める。
@@ -5817,13 +5850,16 @@ impl MonitorApp {
                 (Ok(local), Ok(remote)) => {
                     let id = self.pf_next_id;
                     self.pf_next_id += 1;
-                    let _ = self.kube_pf_req_tx.send(k8s::PortForwardReq::Start {
+                    let r = self.kube_pf_req_tx.send(k8s::PortForwardReq::Start {
                         id,
                         ns: self.pf_ns.clone(),
                         target: self.pf_target.clone(),
                         local,
                         remote,
                     });
+                    if r.is_err() {
+                        self.copy_note = Some(WORKER_GONE.into());
+                    }
                     self.pf_open = false;
                 }
                 _ => self.copy_note = Some("ポート番号が不正です".into()),
@@ -6541,9 +6577,11 @@ impl MonitorApp {
                     ui.checkbox(&mut d.numeric_match, "数値の表記ゆれを無視")
                         .on_hover_text(
                             "005=5・5.0=5・+5=5・前後空白 を同じ値として突合します。\n\
-                             STRING 列に数値 ID を入れていて、CSV 側がゼロ詰め/小数化\n\
-                             しているときに有効。桁落ち（巨大 INT64 を表計算で丸めた等）は\n\
-                             復元できません。",
+                             ・値カラムの比較には常に効きます。\n\
+                             ・INT64 の主キーにも効きます（007 も 7 と一致）。\n\
+                             ・STRING の主キーは索引で厳密問い合わせするため、別ファイルで\n\
+                             キーの表記がゆれている（005 と 5）と橋渡しできません。\n\
+                             桁落ち（巨大 INT64 を表計算で丸めた等）は復元できません。",
                         );
                 });
                 if reparse {
@@ -7733,6 +7771,12 @@ fn run_blocking<T>(fut: impl std::future::Future<Output = anyhow::Result<T>>) ->
 /// gcloud 実行ファイルのパスを解決する。PATH に無くても（Finder 起動など）
 /// よくある配置先を探す。見つからなければ "gcloud"（PATH 任せ）。
 fn gcloud_bin() -> std::path::PathBuf {
+    // 実体探索はファイルシステムを叩くので一度だけにする。
+    static CACHE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    CACHE.get_or_init(gcloud_bin_compute).clone()
+}
+
+fn gcloud_bin_compute() -> std::path::PathBuf {
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
             let cand = dir.join("gcloud");
@@ -8687,14 +8731,38 @@ fn sql_highlight(text: &str, font: egui::FontId) -> egui::text::LayoutJob {
     job
 }
 
+thread_local! {
+    /// SQL ハイライトの LayoutJob を本文ハッシュでメモ化する（毎フレームの
+    /// 再トークン化を避ける。特に DDL ウィンドウの大きな SQL 向け）。wrap は
+    /// 取り出した後に設定するのでキーに含めない。表示用キャッシュなのでハッシュ
+    /// 衝突しても色が少しずれるだけ（実害なし）。
+    static SQL_HL_CACHE: std::cell::RefCell<std::collections::HashMap<u64, egui::text::LayoutJob>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// SQL ハイライト用の layouter（TextEdit::layouter に渡す）。
 fn sql_layouter(
     ui: &egui::Ui,
     buf: &dyn egui::TextBuffer,
     wrap_width: f32,
 ) -> std::sync::Arc<egui::Galley> {
-    let font = egui::FontId::monospace(12.0);
-    let mut job = sql_highlight(buf.as_str(), font);
+    use std::hash::{Hash, Hasher};
+    let text = buf.as_str();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    let key = hasher.finish();
+    let mut job = SQL_HL_CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        if let Some(j) = m.get(&key) {
+            return j.clone();
+        }
+        let j = sql_highlight(text, egui::FontId::monospace(12.0));
+        if m.len() >= 32 {
+            m.clear(); // 単純な上限（タブを開き直す等で増えすぎないように）
+        }
+        m.insert(key, j.clone());
+        j
+    });
     job.wrap.max_width = wrap_width;
     ui.fonts_mut(|f| f.layout_job(job))
 }

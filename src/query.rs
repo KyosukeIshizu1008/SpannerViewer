@@ -129,14 +129,15 @@ impl SpannerEnv {
 /// 現在選択中の接続先（query / monitoring が参照する）。
 static CURRENT_ENV: std::sync::Mutex<Option<SpannerEnv>> = std::sync::Mutex::new(None);
 
-/// 接続先を設定する（設定画面の選択時）。
+/// 接続先を設定する（設定画面の選択時）。ポイズン時も中身を使う（巻き戻し由来の
+/// 毒で全経路が連鎖パニックしないように）。
 pub fn set_spanner_env(env: SpannerEnv) {
-    *CURRENT_ENV.lock().unwrap() = Some(env);
+    *CURRENT_ENV.lock().unwrap_or_else(|e| e.into_inner()) = Some(env);
 }
 
 /// まだ設定されていなければ初期値を入れる（起動時の seed 用）。
 pub fn init_spanner_env(env: SpannerEnv) {
-    let mut cur = CURRENT_ENV.lock().unwrap();
+    let mut cur = CURRENT_ENV.lock().unwrap_or_else(|e| e.into_inner());
     if cur.is_none() {
         *cur = Some(env);
     }
@@ -144,7 +145,11 @@ pub fn init_spanner_env(env: SpannerEnv) {
 
 /// 現在の接続先を取得。
 pub fn current_spanner_env() -> SpannerEnv {
-    CURRENT_ENV.lock().unwrap().clone().unwrap_or_default()
+    CURRENT_ENV
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
 }
 
 /// クエリ実行結果（UI へ返す）
@@ -1901,6 +1906,35 @@ fn csv_escape(s: &str, delim: u8) -> String {
     }
 }
 
+/// 取込で作った Spanner セッションを、パニックや早期 return でも必ず解放する
+/// ためのドロップガード。正常終了時は `disarm()` で無効化し、明示削除に任せる。
+/// Drop は非同期にできないため、巻き戻し時はデタッチした tokio タスクで削除する。
+struct SessionGuard {
+    client: SpannerClient<GaxChannel>,
+    database: String,
+    names: Vec<String>,
+}
+impl SessionGuard {
+    fn disarm(&mut self) {
+        self.names.clear();
+    }
+}
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if self.names.is_empty() {
+            return;
+        }
+        let mut client = self.client.clone();
+        let database = std::mem::take(&mut self.database);
+        let names = std::mem::take(&mut self.names);
+        tokio::spawn(async move {
+            for name in &names {
+                let _ = delete_session(&mut client, &database, name).await;
+            }
+        });
+    }
+}
+
 /// CSV をソースからストリーミングし、行を貯めずに並列 BatchWrite で投入する。
 /// - ローカルにもアプリにも全行を溜めない（メモリは概ね「1 バッチ × 並列数」）。
 /// - 1 行 = 1 ミューテーショングループ（独立・非原子）を複数セッションで同時投入。
@@ -2021,6 +2055,11 @@ async fn run_streaming_import(
         }
     };
     let session_names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
+
+    // パニックや早期 return でもセッションを必ず解放するためのドロップガード。
+    // 正常終了時は disarm() し、明示的に await して確実に削除する。
+    let mut session_guard =
+        SessionGuard { client: client.clone(), database: database.clone(), names: session_names.clone() };
 
     // 証跡レポート用に取込前の行数を控える（ベストエフォート）。
     let before_count = count_rows(env, &req.table).await;
@@ -2362,10 +2401,12 @@ async fn run_streaming_import(
         let _ = w.await;
     }
 
-    // セッション後始末（失敗は無視）。
+    // セッション後始末（失敗は無視）。正常路ではここで確実に await して削除し、
+    // ガードを disarm する（パニック時はガードの Drop が肩代わりする）。
     for name in &session_names {
         let _ = delete_session(&mut client, &database, name).await;
     }
+    session_guard.disarm();
 
     let cancelled = req.cancel.load(Ordering::Relaxed);
     let aborted = abort.load(Ordering::Relaxed);
