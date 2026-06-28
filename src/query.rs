@@ -1437,8 +1437,10 @@ fn import_signature(req: &ImportRequest, per_request: usize) -> String {
         .iter()
         .map(|c| format!("{}|{}|{}", c.name, c.ty, c.src_index))
         .collect();
+    // v2: チェックポイント形式が「idx offset」に変わったため版を上げる
+    // （旧 v1 ファイルはシグネチャ不一致で無視され、安全に最初からになる）。
     format!(
-        "v1\ttable={}\tper={per_request}\thdr={}\tnull={}\tsrc={src}\tcols={}",
+        "v2\ttable={}\tper={per_request}\thdr={}\tnull={}\tsrc={src}\tcols={}",
         req.table,
         req.has_header,
         req.empty_as_null,
@@ -1454,22 +1456,43 @@ fn checkpoint_path(sig: &str) -> PathBuf {
     checkpoint_dir().join(format!("ckpt-{:016x}.txt", h.finish()))
 }
 
-/// 既存チェックポイントからコミット済みバッチ index 集合を読む（シグネチャ一致時のみ）。
-fn load_checkpoint(path: &Path, sig: &str) -> HashSet<usize> {
-    let mut set = HashSet::new();
+/// 既存チェックポイントから「コミット済みバッチ index → (終端バイト位置, 累積データ行数)」
+/// を読む（シグネチャ一致時のみ）。各行は `idx offset rows`。
+fn load_checkpoint(path: &Path, sig: &str) -> HashMap<usize, (u64, usize)> {
+    let mut map = HashMap::new();
     let Ok(text) = std::fs::read_to_string(path) else {
-        return set;
+        return map;
     };
     let mut lines = text.lines();
     if lines.next() != Some(sig) {
-        return set; // シグネチャ不一致 → 再開に使わない
+        return map; // シグネチャ不一致 → 再開に使わない
     }
     for l in lines {
-        if let Ok(i) = l.trim().parse::<usize>() {
-            set.insert(i);
+        let mut it = l.split_whitespace();
+        if let (Some(i), Some(o), Some(r)) = (it.next(), it.next(), it.next()) {
+            if let (Ok(i), Ok(o), Ok(r)) =
+                (i.parse::<usize>(), o.parse::<u64>(), r.parse::<usize>())
+            {
+                map.insert(i, (o, r));
+            }
         }
     }
-    set
+    map
+}
+
+/// コミット済みバッチ集合から「先頭から連続して全部コミット済みの末尾」を求める。
+/// 戻り値 (連続済みバッチ数 k, そこまでの終端バイト位置, 累積データ行数)。
+/// k 番目以降の飛び石コミットはバイト的に飛ばせないので committed 判定で再送スキップする。
+fn contiguous_resume_point(committed: &HashMap<usize, (u64, usize)>) -> (usize, u64, usize) {
+    let mut k = 0usize;
+    let mut offset = 0u64;
+    let mut rows = 0usize;
+    while let Some(&(off, r)) = committed.get(&k) {
+        offset = off;
+        rows = r;
+        k += 1;
+    }
+    (k, offset, rows)
 }
 
 /// コミット済みバッチ index を追記するライタ（都度 flush でクラッシュ耐性）。
@@ -1497,11 +1520,11 @@ impl CheckpointWriter {
         }
     }
 
-    /// バッチ index を 1 件確定として記録する（書き込み確定後に呼ぶ）。
-    fn mark(&self, idx: usize) {
+    /// バッチ index・終端バイト位置・累積データ行数を確定として記録する（コミット後に呼ぶ）。
+    fn mark(&self, idx: usize, end_offset: u64, end_row: usize) {
         if let Ok(mut g) = self.file.lock() {
             if let Some(f) = g.as_mut() {
-                let _ = writeln!(f, "{idx}");
+                let _ = writeln!(f, "{idx} {end_offset} {end_row}");
                 let _ = f.flush();
             }
         }
@@ -1645,12 +1668,16 @@ async fn run_streaming_import(
         sig.push_str(&format!("\tsrcid={id}"));
     }
     let ckpt_path = checkpoint_path(&sig);
-    let committed: HashSet<usize> = if req.fresh {
-        HashSet::new()
+    let committed: HashMap<usize, (u64, usize)> = if req.fresh {
+        HashMap::new()
     } else {
         load_checkpoint(&ckpt_path, &sig)
     };
     let resuming = !committed.is_empty();
+    // 連続コミット済みの先頭部分（バッチ数 k・終端バイト位置・累積行数）。ここまで
+    // シークして読み飛ばす。飛び石コミット（k 番目以降）は committed で再送スキップ。
+    let (mut resume_batch, mut resume_offset, mut resume_rows) =
+        contiguous_resume_point(&committed);
     // 既存の続きから（resuming）なら追記、それ以外は新規作成。
     let ckpt = Arc::new(CheckpointWriter::open(&ckpt_path, &sig, !resuming));
     // リジェクト（スキップ行）出力。
@@ -1705,10 +1732,12 @@ async fn run_streaming_import(
         Arc::new(tokio::sync::Mutex::new(None));
     let shared_req = Arc::new(effective_req);
 
-    // バッチ用バウンドチャネル（バックプレッシャ）。要素は (バッチ index, 先頭行番号, 行)。
-    let (tx, rx) = tokio::sync::mpsc::channel::<(usize, usize, Vec<Vec<String>>)>(
-        (concurrency * 2).max(2),
-    );
+    // バッチ用バウンドチャネル（バックプレッシャ）。
+    // 要素は (バッチ index, 先頭行番号, 終端バイト位置, 累積行数, 行)。
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<(usize, usize, u64, usize, Vec<Vec<String>>)>(
+            (concurrency * 2).max(2),
+        );
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
 
     // ワーカー（セッションごとに 1 つ）。
@@ -1732,7 +1761,7 @@ async fn run_streaming_import(
         workers.push(tokio::spawn(async move {
             loop {
                 let item = { rx.lock().await.recv().await };
-                let Some((batch_idx, start_line, rows)) = item else {
+                let Some((batch_idx, start_line, end_off, end_row, rows)) = item else {
                     break;
                 };
                 if abort.load(Ordering::Relaxed) {
@@ -1767,7 +1796,7 @@ async fn run_streaming_import(
                 }
                 if groups.is_empty() {
                     // 全行スキップ → このバッチは完了扱い（再送不要）。
-                    ckpt.mark(batch_idx);
+                    ckpt.mark(batch_idx, end_off, end_row);
                     continue;
                 }
                 let n = groups.len();
@@ -1817,7 +1846,7 @@ async fn run_streaming_import(
                         written.fetch_add(ok.len(), Ordering::Relaxed);
                         let all_ok = group_err.is_none() && ok.len() == n;
                         if all_ok {
-                            ckpt.mark(batch_idx); // 完全コミット → 再開用に記録
+                            ckpt.mark(batch_idx, end_off, end_row); // 完全コミット → 再開用に記録
                         } else if skip {
                             // 失敗グループの行をリジェクトに記録して続行。
                             for (i, row) in kept.iter().enumerate() {
@@ -1827,7 +1856,7 @@ async fn run_streaming_import(
                                 }
                             }
                             // スキップ分も含め処理済みとして記録（再送しない）。
-                            ckpt.mark(batch_idx);
+                            ckpt.mark(batch_idx, end_off, end_row);
                         } else if let Some(e) = group_err {
                             set_first_error(&first_error, e).await;
                             abort.store(true, Ordering::Relaxed);
@@ -1847,7 +1876,7 @@ async fn run_streaming_import(
                                 reject.reject(&msg, row);
                                 skipped.fetch_add(1, Ordering::Relaxed);
                             }
-                            ckpt.mark(batch_idx);
+                            ckpt.mark(batch_idx, end_off, end_row);
                         } else {
                             set_first_error(&first_error, msg).await;
                             abort.store(true, Ordering::Relaxed);
@@ -1858,17 +1887,56 @@ async fn run_streaming_import(
         }));
     }
 
+    // ── 再開シーク: 連続コミット済みの終端バイト位置まで読み飛ばす ──
+    if resume_offset > 0 {
+        let ok = match &req.source {
+            ImportSource::File(_) => {
+                if let ByteSource::File(f) = &mut source {
+                    use tokio::io::AsyncSeekExt;
+                    f.seek(std::io::SeekFrom::Start(resume_offset)).await.is_ok()
+                } else {
+                    false
+                }
+            }
+            ImportSource::Gcs(uri) => match gcs_get_stream_range(uri, resume_offset).await {
+                Ok(resp) => {
+                    source = ByteSource::Gcs(resp);
+                    true
+                }
+                Err(_) => false,
+            },
+        };
+        if !ok {
+            // シーク失敗 → 安全に最初から（committed で再送スキップにフォールバック）。
+            // resume_rows も 0 に戻し、resumed はスキップループ側で数える。
+            resume_batch = 0;
+            resume_offset = 0;
+            resume_rows = 0;
+        }
+    }
+
     // プロデューサ: ソースをストリーミングし、per_request 行ごとに送る。
     let mut streamer = CsvStreamer::new(req.encoding, req.delimiter);
+    if resume_offset > 0 {
+        // 再開地点は BOM・ヘッダより後なので BOM 処理は不要。
+        streamer.bom_checked = true;
+    }
     let mut recs: Vec<Vec<String>> = Vec::new();
+    let mut rec_offs: Vec<u64> = Vec::new(); // recs と 1:1 のレコード終端バイト位置
     let mut batch: Vec<Vec<String>> = Vec::with_capacity(per_request);
-    let mut header_skipped = !req.has_header;
-    let mut next_line = 1usize; // 次のデータ行の 1 始まり番号
-    let mut start_line = 1usize; // 現バッチ先頭の行番号
-    let mut processed = 0usize; // データ行の総数（送出＋スキップ）
-    let mut batch_idx = 0usize; // 決定的なバッチ連番
-    let mut resumed = 0usize; // 再開でスキップした行数
-    let mut first_chunk = true;
+    let mut header_skipped = !req.has_header || resume_offset > 0;
+    // 行番号（1 始まり）。再開時はシークで飛ばした行数を足す。
+    let mut next_line = resume_rows + 1;
+    let mut start_line = next_line; // 現バッチ先頭の行番号
+    let mut processed = resume_rows; // データ行の総数（シーク済み＋送出＋スキップ）
+    let mut batch_idx = resume_batch; // 続きのバッチ番号から
+    let mut resumed = resume_rows; // シークで飛ばした行数
+    let mut first_chunk = resume_offset == 0; // 再開時は BOM 除去しない
+    let mut bom_len: u64 = 0; // 先頭で除去した BOM のバイト数（絶対位置補正）
+    let base_offset = resume_offset; // 絶対位置 = base_offset + bom_len + streamer内オフセット
+    if resume_offset > 0 {
+        bytes_done.store(resume_offset, Ordering::Relaxed);
+    }
     let mut producer_err: Option<String> = None;
 
     // 進捗を 1 つ送るヘルパ。bytes ベースの割合は、バウンドチャネルで読み出しが
@@ -1896,7 +1964,9 @@ async fn run_streaming_import(
                 // BOM 除去前のバイト数で位置を数える。
                 bytes_done.fetch_add(b.len() as u64, Ordering::Relaxed);
                 if first_chunk {
+                    let before = b.len();
                     strip_bom(&mut b);
+                    bom_len = (before - b.len()) as u64;
                     first_chunk = false;
                 }
                 b
@@ -1907,8 +1977,10 @@ async fn run_streaming_import(
                 break;
             }
         };
-        streamer.push(&chunk, &mut recs);
-        for rec in recs.drain(..) {
+        streamer.push_tracked(&chunk, &mut recs, &mut rec_offs);
+        let drained: Vec<(Vec<String>, u64)> =
+            recs.drain(..).zip(rec_offs.drain(..)).collect();
+        for (rec, roff) in drained {
             if !header_skipped {
                 header_skipped = true;
                 expected_cols.store(rec.len(), Ordering::Relaxed);
@@ -1925,14 +1997,16 @@ async fn run_streaming_import(
             if batch.len() >= per_request {
                 let n = batch.len();
                 processed += n;
-                if committed.contains(&batch_idx) {
-                    // 前回コミット済み → 再送しない。resumed として数え、written には
-                    // 含めない（written は「今回書いた行数」。証跡レポートの更新数推定で
-                    // 二重計上しないため）。
+                // このバッチ末尾レコードの絶対終端バイト位置（次バッチの開始位置）と累積行数。
+                let end_off = base_offset + bom_len + roff;
+                let end_row = processed;
+                if committed.contains_key(&batch_idx) {
+                    // 前回コミット済み（飛び石分） → 再送しない。resumed として数え、
+                    // written には含めない（証跡レポートの更新数推定で二重計上しないため）。
                     resumed += n;
                     batch.clear();
                 } else if tx
-                    .send((batch_idx, start_line, std::mem::take(&mut batch)))
+                    .send((batch_idx, start_line, end_off, end_row, std::mem::take(&mut batch)))
                     .await
                     .is_err()
                 {
@@ -1945,8 +2019,11 @@ async fn run_streaming_import(
     }
     // 末尾レコードを送る（エラー/中断時は送らない）。
     if producer_err.is_none() && !abort.load(Ordering::Relaxed) {
-        streamer.finish(&mut recs);
-        for rec in recs.drain(..) {
+        streamer.finish_tracked(&mut recs, &mut rec_offs);
+        let mut last_off: u64 = base_offset; // 末尾バッチの終端位置
+        let drained: Vec<(Vec<String>, u64)> =
+            recs.drain(..).zip(rec_offs.drain(..)).collect();
+        for (rec, roff) in drained {
             if !header_skipped {
                 header_skipped = true;
                 expected_cols.store(rec.len(), Ordering::Relaxed);
@@ -1960,17 +2037,18 @@ async fn run_streaming_import(
             }
             batch.push(rec);
             next_line += 1;
+            last_off = base_offset + bom_len + roff;
         }
         if !batch.is_empty() {
             let n = batch.len();
             processed += n;
-            if committed.contains(&batch_idx) {
+            if committed.contains_key(&batch_idx) {
                 // resumed のみ。written には含めない（上の主ループと同じ理由）。
                 resumed += n;
                 batch.clear();
             } else {
                 let _ = tx
-                    .send((batch_idx, start_line, std::mem::take(&mut batch)))
+                    .send((batch_idx, start_line, last_off, processed, std::mem::take(&mut batch)))
                     .await;
             }
         }
@@ -2232,6 +2310,24 @@ pub async fn gcs_get_stream(uri: &str) -> anyhow::Result<reqwest::Response> {
     Ok(resp)
 }
 
+/// GCS オブジェクトを `start` バイト目から取得する（再開シーク用。Range リクエスト）。
+async fn gcs_get_stream_range(uri: &str, start: u64) -> anyhow::Result<reqwest::Response> {
+    let (bucket, object) = parse_gs_uri(uri).map_err(|e| anyhow::anyhow!(e))?;
+    let provider = gcp_auth::provider().await?;
+    let token = provider.token(&[GCS_SCOPE]).await?;
+    let encoded = encode_object(&object);
+    let url =
+        format!("https://storage.googleapis.com/storage/v1/b/{bucket}/o/{encoded}?alt=media");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(token.as_str())
+        .header("Range", format!("bytes={start}-"))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(resp)
+}
+
 // ── ストリーミング CSV パーサ（バイト単位・全行を溜めない） ──
 
 /// RFC 4180 風のインクリメンタル CSV パーサ。チャンクを `push` するたびに
@@ -2246,6 +2342,7 @@ struct CsvStreamer {
     swallow_lf: bool,    // 直前が CRLF の CR（続く LF を 1 つ飲む）
     started: bool,       // 現レコードに何か読み始めたか
     bom_checked: bool,   // 先頭フィールドの BOM 除去を済ませたか
+    consumed: u64,       // これまでに処理したバイト数（push したバイト基準。再開オフセット用）
     encoding: Encoding,  // フィールドのデコード方式
     delimiter: u8,       // フィールド区切り文字
 }
@@ -2266,6 +2363,7 @@ impl CsvStreamer {
             swallow_lf: false,
             started: false,
             bom_checked: false,
+            consumed: 0,
             encoding,
             delimiter,
         }
@@ -2273,11 +2371,21 @@ impl CsvStreamer {
 
     fn push(&mut self, bytes: &[u8], out: &mut Vec<Vec<String>>) {
         for &b in bytes {
-            self.byte(b, out);
+            self.byte(b, out, None);
         }
     }
 
-    fn byte(&mut self, b: u8, out: &mut Vec<Vec<String>>) {
+    /// `push` と同じだが、各レコード確定時の「処理済みバイト数」を `offsets` に
+    /// 1:1 で積む（out[i] のレコードは offsets[i] バイト目で終端＝次レコードの開始位置）。
+    /// 再開のシーク位置算出に使う。
+    fn push_tracked(&mut self, bytes: &[u8], out: &mut Vec<Vec<String>>, offsets: &mut Vec<u64>) {
+        for &b in bytes {
+            self.byte(b, out, Some(&mut *offsets));
+        }
+    }
+
+    fn byte(&mut self, b: u8, out: &mut Vec<Vec<String>>, offsets: Option<&mut Vec<u64>>) {
+        self.consumed += 1; // すべてのバイトを位置として数える
         if self.swallow_lf {
             self.swallow_lf = false;
             if b == b'\n' {
@@ -2314,10 +2422,10 @@ impl CsvStreamer {
                 self.started = true;
             }
             b'\r' => {
-                self.end_record(out);
+                self.end_record(out, offsets);
                 self.swallow_lf = true;
             }
-            b'\n' => self.end_record(out),
+            b'\n' => self.end_record(out, offsets),
             _ => {
                 self.field.push(b);
                 self.started = true;
@@ -2339,12 +2447,16 @@ impl CsvStreamer {
         self.record.push(s);
     }
 
-    fn end_record(&mut self, out: &mut Vec<Vec<String>>) {
+    fn end_record(&mut self, out: &mut Vec<Vec<String>>, offsets: Option<&mut Vec<u64>>) {
         self.end_field();
         let rec = std::mem::take(&mut self.record);
         // 全列が空（空行）は捨てる。
         if !(rec.len() == 1 && rec[0].is_empty()) {
             out.push(rec);
+            // 確定レコードの終端バイト位置（次レコードの開始位置）を記録する。
+            if let Some(o) = offsets {
+                o.push(self.consumed);
+            }
         }
         self.started = false;
     }
@@ -2352,7 +2464,14 @@ impl CsvStreamer {
     /// 末尾の改行が無い場合の最終レコードを確定する。
     fn finish(&mut self, out: &mut Vec<Vec<String>>) {
         if self.started || !self.field.is_empty() || !self.record.is_empty() {
-            self.end_record(out);
+            self.end_record(out, None);
+        }
+    }
+
+    /// `finish` のオフセット追跡版。
+    fn finish_tracked(&mut self, out: &mut Vec<Vec<String>>, offsets: &mut Vec<u64>) {
+        if self.started || !self.field.is_empty() || !self.record.is_empty() {
+            self.end_record(out, Some(offsets));
         }
     }
 }
@@ -3587,6 +3706,23 @@ mod tests {
         assert_eq!(stream_all(b"\"a,b\",c\n"), vec![vec!["a,b", "c"]]);
     }
 
+    /// push_tracked がレコードごとの終端バイト位置を 1:1 で返す（再開シーク用）。
+    #[test]
+    fn streamer_tracks_byte_offsets() {
+        let input = b"a,b\nc,d\nlast"; // 末尾改行なし
+        let mut s = CsvStreamer::default();
+        let mut out = Vec::new();
+        let mut offs = Vec::new();
+        // チャンク境界をまたいでも累積位置が正しいことも見る（3 バイトずつ）。
+        for ch in input.chunks(3) {
+            s.push_tracked(ch, &mut out, &mut offs);
+        }
+        s.finish_tracked(&mut out, &mut offs);
+        assert_eq!(out, vec![vec!["a", "b"], vec!["c", "d"], vec!["last"]]);
+        // "a,b\n"=4, "c,d\n"=8(累積), "last"=12(EOF)。
+        assert_eq!(offs, vec![4, 8, 12]);
+    }
+
     /// 先頭の UTF-8 BOM は、1 バイトずつ供給して境界をまたいでも先頭フィールドから除かれる。
     #[test]
     fn csv_streamer_strips_bom_across_chunks() {
@@ -3708,18 +3844,31 @@ mod tests {
         // 新規作成 → committed は空。
         let w = CheckpointWriter::open(&path, sig, true);
         assert!(load_checkpoint(&path, sig).is_empty());
-        w.mark(2);
-        w.mark(5);
-        let set = load_checkpoint(&path, sig);
-        assert_eq!(set.len(), 2);
-        assert!(set.contains(&2) && set.contains(&5));
+        w.mark(2, 400, 30);
+        w.mark(5, 1000, 60);
+        let map = load_checkpoint(&path, sig);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&2), Some(&(400u64, 30usize)));
+        assert_eq!(map.get(&5), Some(&(1000u64, 60usize)));
         // シグネチャ不一致なら読まない。
         assert!(load_checkpoint(&path, "v1\tsig-B").is_empty());
         // 追記オープンで継続できる。
         let w2 = CheckpointWriter::open(&path, sig, false);
-        w2.mark(9);
-        assert!(load_checkpoint(&path, sig).contains(&9));
+        w2.mark(9, 1800, 90);
+        assert_eq!(load_checkpoint(&path, sig).get(&9), Some(&(1800u64, 90usize)));
         let _ = std::fs::remove_file(&path);
+
+        // 連続コミット先頭部分: 0,1,2 が連続 → (3, 終端400, 累積30)。
+        let mut cm: HashMap<usize, (u64, usize)> = HashMap::new();
+        cm.insert(0, (100, 10));
+        cm.insert(1, (250, 20));
+        cm.insert(2, (400, 30));
+        cm.insert(5, (900, 60)); // 飛び石
+        assert_eq!(contiguous_resume_point(&cm), (3, 400, 30));
+        // 0 が無ければ最初から。
+        let mut cm2: HashMap<usize, (u64, usize)> = HashMap::new();
+        cm2.insert(1, (250, 20));
+        assert_eq!(contiguous_resume_point(&cm2), (0, 0, 0));
     }
 
     /// parse_limit: 非 ASCII を含む SQL でも panic せず LIMIT を取れる。
@@ -5016,12 +5165,14 @@ mod tests {
         let sig = import_signature(&req, per_request);
         let ckpt = checkpoint_path(&sig);
         // バッチ 0 を「コミット済み」として用意（実際にはまだ未書き込み）。
+        // CSV は "Id,Name\n1,a\n2,b\n3,c\n" = ヘッダ8 + データ12 = 20 バイト、データ 3 行。
+        // バッチ 0 の終端は 20 バイト目・累積 3 行。
         if let Some(p) = ckpt.parent() {
             let _ = std::fs::create_dir_all(p);
         }
-        std::fs::write(&ckpt, format!("{sig}\n0\n")).unwrap();
+        std::fs::write(&ckpt, format!("{sig}\n0 20 3\n")).unwrap();
 
-        // 再開: バッチ 0 はスキップ → 1 件も書き込まれない。
+        // 再開: バッチ 0 まではシークで読み飛ばす → 1 件も書き込まれない。
         let (tx, _rx) = std::sync::mpsc::channel::<ImportProgress>();
         let out = run_streaming_import(&test_env(), &req, false, &tx).await;
         assert_eq!(out.error, None, "err: {:?}", out.error);
@@ -5042,6 +5193,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows[0][0], "3");
+    }
+
+    /// バイトオフセット再開: チェックポイントの終端位置までシークし、それ以降だけ書く
+    /// （手前の行は読み直さず・再書き込みもしない）（emulator 前提）。
+    #[tokio::test]
+    async fn streaming_import_seek_resume_midfile() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _import_guard = EMU_LOCK.lock().await;
+        let table = "ImportSeek";
+        create_import_table_named(table).await;
+        let client = client().await;
+
+        // ヘッダ8B + "1,a\n".."5,e\n"(各4B)。2 行目の終端は 8+8=16 バイト目。
+        let csv = "Id,Name\n1,a\n2,b\n3,c\n4,d\n5,e\n";
+        let path = write_temp_csv("seek", csv);
+        let req = ImportRequest {
+            id: 0,
+            table: table.into(),
+            columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)")]),
+            source: ImportSource::File(path),
+            has_header: true,
+            mode: ImportMode::InsertOrUpdate,
+            empty_as_null: true,
+            fresh: false,
+            encoding: Encoding::Utf8,
+            delimiter: b',',
+            skip_bad_rows: false,
+            dry_run: false,
+            null_token: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let per_request = (BATCH_CELLS_PER_REQUEST / 2).max(1);
+        let sig = import_signature(&req, per_request);
+        let ckpt = checkpoint_path(&sig);
+        if let Some(p) = ckpt.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        // バッチ 0 = 先頭 2 行を「コミット済み」（終端 16 バイト・累積 2 行）として用意。
+        std::fs::write(&ckpt, format!("{sig}\n0 16 2\n")).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel::<ImportProgress>();
+        let out = run_streaming_import(&test_env(), &req, false, &tx).await;
+        assert_eq!(out.error, None, "err: {:?}", out.error);
+        assert_eq!(out.resumed, 2, "先頭 2 行はシークで読み飛ばす");
+        assert_eq!(out.written, 3, "3 行目以降の 3 行だけ書く");
+
+        // DB には Id 3,4,5 だけが入る（1,2 はシークで飛ばし未書き込み）。
+        let (_, rows, _) = try_query(&client, &format!("SELECT Id FROM {table} ORDER BY Id"))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(ids, vec!["3", "4", "5"]);
     }
 
     /// インポート検証用の標準テーブル ImportTest を作成（冪等・中身を消す）。
