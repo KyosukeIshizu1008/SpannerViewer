@@ -723,6 +723,10 @@ fn canon_cell(raw: &str, empty_as_null: bool, null_token: Option<&str>) -> Strin
             return "NULL".to_string();
         }
     }
+    // 取込側 convert_cell と同じく <null>/(null) は既定で NULL 扱いにし、突合が一致する。
+    if is_default_null_token(raw) {
+        return "NULL".to_string();
+    }
     if empty_as_null && raw.is_empty() {
         return "NULL".to_string();
     }
@@ -2581,6 +2585,12 @@ fn build_mutation_with_mode(
     })
 }
 
+/// 既定で NULL とみなすプレースホルダか（DataGrip/DBeaver 等の `<null>` / `(null)`）。
+/// 大文字小文字は区別しない。`null_token` 設定とは独立に常に効く。
+fn is_default_null_token(value: &str) -> bool {
+    value.eq_ignore_ascii_case("<null>") || value.eq_ignore_ascii_case("(null)")
+}
+
 /// 文字列セルを、Spanner の型に合わせた値（ToKind）へ変換する。
 /// 数値・真偽はパースして型付きで送り、それ以外は文字列のまま送る
 /// （NUMERIC / TIMESTAMP / DATE / BYTES(base64) / JSON などは文字列表現で受理される）。
@@ -2595,8 +2605,11 @@ fn convert_cell(
     if t.starts_with("ARRAY") || t.starts_with("STRUCT") {
         return Err(format!("未対応の型です: {ty}"));
     }
-    // NULL トークン一致、または空欄を NULL 扱い。
-    if null_token.is_some_and(|tok| value == tok) || (empty_as_null && value.is_empty()) {
+    // NULL トークン一致 / 既定プレースホルダ(<null>,(null)) / 空欄 を NULL 扱い。
+    if null_token.is_some_and(|tok| value == tok)
+        || is_default_null_token(value)
+        || (empty_as_null && value.is_empty())
+    {
         return Ok(Box::new(None::<String>));
     }
     if t.starts_with("BOOL") {
@@ -3913,6 +3926,28 @@ mod tests {
         assert!(convert_cell("[1,2]", "ARRAY<INT64>", true, None).is_err());
     }
 
+    /// <null> / (null) は既定（トークン未指定）で NULL 扱い。大小無視。
+    #[test]
+    fn default_null_placeholders() {
+        assert!(is_default_null_token("<null>"));
+        assert!(is_default_null_token("(null)"));
+        assert!(is_default_null_token("<NULL>")); // 大小無視
+        assert!(is_default_null_token("(Null)"));
+        assert!(!is_default_null_token("null")); // 括弧なしは対象外
+        assert!(!is_default_null_token("<nullable>"));
+        assert!(!is_default_null_token(""));
+        // INT64 列でも <null>/(null) はパースエラーにならない＝NULL 化されている証拠。
+        assert!(convert_cell("<null>", "INT64", false, None).is_ok());
+        assert!(convert_cell("(null)", "INT64", false, None).is_ok());
+        // 通常文字列は影響なし（STRING はそのまま、INT64 はエラー）。
+        assert!(convert_cell("hello", "STRING(MAX)", false, None).is_ok());
+        assert!(convert_cell("abc", "INT64", false, None).is_err());
+        // 照合の正規化も同じ規則。
+        assert_eq!(canon_cell("<null>", false, None), "NULL");
+        assert_eq!(canon_cell("(NULL)", false, None), "NULL");
+        assert_eq!(canon_cell("keep", false, None), "keep");
+    }
+
     /// 空欄は empty_as_null=true のとき、型に関わらず NULL として通る。
     #[test]
     fn convert_cell_empty_null() {
@@ -4269,6 +4304,58 @@ mod tests {
 
         // 後始末。
         let _ = run_ddl(&env, &format!("DROP TABLE {tbl}")).await;
+    }
+
+    /// <null> / (null) がトークン未指定でも DB に NULL として入る（emulator 前提）。
+    #[tokio::test]
+    async fn import_default_null_placeholders_to_db() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _guard = EMU_LOCK.lock().await;
+        create_import_table().await;
+        let client = client().await;
+
+        let csv = "Id,Name,Note\n\
+                   1,<null>,(null)\n\
+                   2,bob,keep\n\
+                   3,<NULL>,Keep<null>Inside\n";
+        let path = write_temp_csv("default_null", csv);
+        let req = ImportRequest {
+            id: 0,
+            table: "ImportTest".into(),
+            columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)"), ("Note", "STRING(MAX)")]),
+            source: ImportSource::File(path),
+            has_header: true,
+            mode: ImportMode::InsertOrUpdate,
+            empty_as_null: true,
+            fresh: true,
+            encoding: Encoding::Utf8,
+            delimiter: b',',
+            skip_bad_rows: false,
+            dry_run: false,
+            null_token: None, // 未指定でも <null>/(null) は NULL になるはず
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (ptx, _prx) = std::sync::mpsc::channel::<ImportProgress>();
+        let out = run_streaming_import(&test_env(), &req, false, &ptx).await;
+        assert_eq!(out.error, None, "import error: {:?}", out.error);
+
+        let (_, rows, _) = try_query(&client, "SELECT Id, Name, Note FROM ImportTest ORDER BY Id")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        // 1: <null>→NULL, (null)→NULL
+        assert_eq!(rows[0][1], "NULL");
+        assert_eq!(rows[0][2], "NULL");
+        // 2: 通常値はそのまま
+        assert_eq!(rows[1][1], "bob");
+        assert_eq!(rows[1][2], "keep");
+        // 3: 大小無視で <NULL>→NULL。途中に <null> を含む文字列は完全一致でないので保持。
+        assert_eq!(rows[2][1], "NULL");
+        assert_eq!(rows[2][2], "Keep<null>Inside");
     }
 
     /// クォート/カンマ/改行/途中のクォートを含む実データが、欠落・結合・余計な
