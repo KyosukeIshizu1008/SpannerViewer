@@ -2100,6 +2100,8 @@ struct CsvTab {
     selected: Option<(u64, usize)>,
     /// 直近にコピーしたセル値（ツールバーに表示。確認用）。
     copied_note: Option<String>,
+    /// 列診断の結果（列ズレ/桁落ち/科学表記の判定）。ボタンで生成。
+    diag: Option<String>,
 }
 
 impl CsvTab {
@@ -2140,7 +2142,118 @@ impl CsvTab {
             col_widths: Vec::new(),
             selected: None,
             copied_note: None,
+            diag: None,
         }
+    }
+
+    /// 読み込んだ CSV を解析し、「列ズレ（読み方/区切りの問題）」か
+    /// 「データ自体の桁落ち/科学表記」かを判定する診断レポートを作る。
+    /// 先頭から最大 sample 行を走査する（巨大ファイルでも軽い）。
+    fn diagnose(&self) -> String {
+        let total = self.total_lines();
+        let header_off: u64 = if self.has_header && total > 0 { 1 } else { 0 };
+        let data_rows = total.saturating_sub(header_off);
+        if data_rows == 0 {
+            return "データ行がありません。".into();
+        }
+        let sample = data_rows.min(50_000);
+        let rows = self.visible_rows(0, sample);
+        if rows.is_empty() {
+            return "行を読めませんでした。".into();
+        }
+        let ncols = self.ncols().max(1);
+        let headers = self.header_cells();
+
+        // 列数ヒストグラム（バラバラ = 列ズレ）。
+        let mut field_hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        for r in &rows {
+            *field_hist.entry(r.len()).or_default() += 1;
+        }
+
+        // 各列の解析: 長さレンジ・科学表記・小数・非数値の出現数。
+        let mut min_len = vec![usize::MAX; ncols];
+        let mut max_len = vec![0usize; ncols];
+        let mut sci = vec![0usize; ncols];
+        let mut dec = vec![0usize; ncols];
+        let mut nonnum = vec![0usize; ncols];
+        let mut nonempty = vec![0usize; ncols];
+        for r in &rows {
+            for c in 0..ncols {
+                let Some(v) = r.get(c) else { continue };
+                let v = v.trim();
+                if v.is_empty() {
+                    continue;
+                }
+                nonempty[c] += 1;
+                let len = v.chars().count();
+                min_len[c] = min_len[c].min(len);
+                max_len[c] = max_len[c].max(len);
+                let digits = v.bytes().filter(|b| b.is_ascii_digit()).count();
+                let has_e = v.bytes().any(|b| b == b'e' || b == b'E');
+                if has_e && digits > 0 && v.bytes().all(|b| {
+                    b.is_ascii_digit() || matches!(b, b'e' | b'E' | b'+' | b'-' | b'.')
+                }) {
+                    sci[c] += 1;
+                }
+                if v.contains('.')
+                    && v.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.'))
+                {
+                    dec[c] += 1;
+                }
+                if !v.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-')) {
+                    nonnum[c] += 1;
+                }
+            }
+        }
+
+        let mut s = String::new();
+        s.push_str(&format!("診断（先頭 {} 行を解析）\n", fmt_count(rows.len())));
+        s.push_str(&format!("区切り='{}' / 文字コード={}\n",
+            match self.delim { b'\t' => "Tab".into(), d => (d as char).to_string() },
+            match self.encoding { query::Encoding::ShiftJis => "Shift-JIS", _ => "UTF-8" }));
+
+        // 列ズレ判定。
+        if field_hist.len() > 1 {
+            s.push_str("⚠ 列数がバラバラです（=列ズレ・読み方/区切りの問題の可能性大）:\n");
+            for (cols, cnt) in &field_hist {
+                s.push_str(&format!("   {cols}列 … {} 行\n", fmt_count(*cnt)));
+            }
+            s.push_str("→ 区切り文字が正しいか確認。引用符で囲まれていない区切り/改行が\n   データ内にあると列がズレます。\n");
+        } else if let Some((cols, _)) = field_hist.iter().next() {
+            s.push_str(&format!("列数は一定（{cols}列）= 列ズレなし。\n"));
+        }
+
+        // 各列のフラグ。
+        s.push_str("\n列ごとの値:\n");
+        for c in 0..ncols {
+            let name = headers.get(c).cloned().unwrap_or_else(|| format!("列{}", c + 1));
+            if nonempty[c] == 0 {
+                s.push_str(&format!("  [{c}] {name}: （空）\n"));
+                continue;
+            }
+            let (mn, mx) = (min_len[c], max_len[c]);
+            let mut flags = Vec::new();
+            if mn != mx {
+                flags.push(format!("桁数 {mn}〜{mx}（不揃い）"));
+            } else {
+                flags.push(format!("桁数 {mn}"));
+            }
+            if sci[c] > 0 {
+                flags.push(format!("⚠科学表記 {}件", fmt_count(sci[c])));
+            }
+            if dec[c] > 0 {
+                flags.push(format!("小数 {}件", fmt_count(dec[c])));
+            }
+            if nonnum[c] > 0 && nonnum[c] < nonempty[c] {
+                flags.push("数値と非数値が混在".to_string());
+            }
+            s.push_str(&format!("  [{c}] {name}: {}\n", flags.join(" / ")));
+        }
+        s.push_str("\n判定の目安:\n");
+        s.push_str("・科学表記あり / 桁数が大きく不揃い → 表計算でIDが桁落ち（データの問題・要再エクスポート）\n");
+        s.push_str("・列数バラバラ → 区切り/引用符の問題（区切りを直すと解決することが多い）\n");
+        s.push_str("・列数一定で桁数も妥当 → 読み込みは正常\n");
+        s
     }
 
     /// 各列の表示幅を内容（ヘッダ + 先頭付近のデータ行）から算出する。
@@ -2551,6 +2664,16 @@ impl CsvTab {
                     do_goto = true;
                 }
                 ui.separator();
+                if ui
+                    .button("🔍 診断")
+                    .on_hover_text(
+                        "読み込んだCSVを解析し、列ズレ（読み方/区切りの問題）か\n\
+                         データ自体の桁落ち/科学表記かを判定します。",
+                    )
+                    .clicked()
+                {
+                    self.diag = Some(self.diagnose());
+                }
                 if let Some(c) = &self.copied_note {
                     ui.label(egui::RichText::new(format!("📋 {c}")).color(ACCENT))
                         .on_hover_text("クリップボードにコピー済み");
@@ -2732,6 +2855,31 @@ impl CsvTab {
         }
         if !self.ready() {
             return;
+        }
+        // 診断レポート（出ていれば畳めるパネルで表示）。
+        if self.diag.is_some() {
+            let mut close = false;
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("CSV 診断").strong());
+                    if ui.button("コピー").clicked() {
+                        if let Some(d) = &self.diag {
+                            ui.ctx().copy_text(d.clone());
+                        }
+                    }
+                    if ui.button("閉じる").clicked() {
+                        close = true;
+                    }
+                });
+                if let Some(d) = &self.diag {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(d).monospace().small()).wrap(),
+                    );
+                }
+            });
+            if close {
+                self.diag = None;
+            }
         }
         ui.add_space(4.0);
         self.grid_ui(ui);

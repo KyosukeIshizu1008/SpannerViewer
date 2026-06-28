@@ -4415,6 +4415,75 @@ mod tests {
         path
     }
 
+    /// インポートの忠実性: STRING 列は CSV の中身を一字一句そのまま格納し、
+    /// 勝手に化けさせない（ゼロ詰め・科学表記風・空白・引用符・日本語・巨大数字）。
+    /// 「変なデータが入る」のは CSV 側に既にある場合だけ、を証明する（emulator 前提）。
+    #[tokio::test]
+    async fn import_preserves_string_values_exactly() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _g = EMU_LOCK.lock().await;
+        create_import_table().await;
+        let client = client().await;
+
+        // Name(STRING) に難しい値を入れる。RFC4180 でクォートが要るものは囲む。
+        let csv = "Id,Name\n\
+                   1,007\n\
+                   2,\"1.23E+17\"\n\
+                   3,\"  spaced  \"\n\
+                   4,\"He said \"\"hi\"\"\"\n\
+                   5,日本語テスト\n\
+                   6,\"a,b,c\"\n\
+                   7,000123456789012345678\n";
+        let path = write_temp_csv("faithful", csv);
+        let req = ImportRequest {
+            id: 0,
+            table: "ImportTest".into(),
+            columns: cols(&[("Id", "INT64"), ("Name", "STRING(MAX)")]),
+            source: ImportSource::File(path),
+            has_header: true,
+            mode: ImportMode::InsertOrUpdate,
+            empty_as_null: true,
+            fresh: true,
+            encoding: Encoding::Utf8,
+            delimiter: b',',
+            skip_bad_rows: false,
+            dry_run: false,
+            null_token: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (ptx, _p) = std::sync::mpsc::channel::<ImportProgress>();
+        let out = run_streaming_import(&test_env(), &req, false, &ptx).await;
+        assert_eq!(out.error, None, "import error: {:?}", out.error);
+        assert_eq!(out.written, 7);
+
+        let (rows, _) = read_all_rows(
+            &client,
+            "SELECT CAST(Id AS STRING), Name FROM ImportTest ORDER BY Id",
+            100,
+        )
+        .await
+        .unwrap();
+        let got: Vec<(&str, &str)> =
+            rows.iter().map(|r| (r[0].as_str(), r[1].as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("1", "007"),                       // ゼロ詰めは保持
+                ("2", "1.23E+17"),                  // 科学表記の文字列も保持
+                ("3", "  spaced  "),                // 前後空白も保持
+                ("4", "He said \"hi\""),            // 埋め込み引用符
+                ("5", "日本語テスト"),              // UTF-8
+                ("6", "a,b,c"),                     // 埋め込みカンマ
+                ("7", "000123456789012345678"),     // 巨大数字文字列もそのまま
+            ],
+            "STRING 列は CSV の中身を一字一句そのまま格納するはず"
+        );
+    }
+
     /// ストリーミング取り込み: ローカル CSV から型付きの行を並列 BatchWrite で投入（emulator 前提）。
     #[tokio::test]
     async fn streaming_import_typed_rows() {
