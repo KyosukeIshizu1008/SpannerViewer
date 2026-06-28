@@ -857,8 +857,11 @@ impl MonitorApp {
         let running = self.auth_running.clone();
         let status = self.auth_status.clone();
         std::thread::spawn(move || {
+            // Finder 起動だと PATH が最小で gcloud 自身が python 等を見つけられない。
+            // よくある bin を PATH に補ってから実行する（ターミナル起動相当にする）。
             let out = std::process::Command::new(gcloud_bin())
                 .args(["auth", "application-default", "login"])
+                .env("PATH", k8s::augmented_path())
                 .output();
             let msg = match out {
                 Ok(o) if o.status.success() => {
@@ -7298,6 +7301,7 @@ fn gcloud_discover(mut project: String) -> Result<Vec<EnvProfile>, String> {
     let run = |args: &[&str]| -> Result<Vec<String>, String> {
         let out = std::process::Command::new(gcloud_bin())
             .args(args)
+            .env("PATH", k8s::augmented_path())
             .output()
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {

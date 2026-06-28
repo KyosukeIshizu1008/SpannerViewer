@@ -35,8 +35,8 @@ fn context_args() -> Vec<String> {
 /// GUI（Finder 起動）では PATH が `/usr/bin:/bin` 程度しか無く、Homebrew や
 /// gcloud SDK にある kubectl / gke-gcloud-auth-plugin を見つけられない。
 /// k9s 等のターミナル起動では繋がるのにアプリだと繋がらない典型原因なので、
-/// よくある bin ディレクトリを PATH に補う。
-fn augmented_path() -> String {
+/// よくある bin ディレクトリを PATH に補う。gcloud 実行（app.rs）でも使う。
+pub(crate) fn augmented_path() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut dirs: Vec<String> = std::env::var("PATH")
         .map(|p| p.split(':').map(String::from).collect())
