@@ -160,7 +160,7 @@ pub struct QueryOutcome {
 // ── CSV インポート用モデル ──
 
 /// 既存行と衝突したときの書き込み方式。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ImportMode {
     /// 新規挿入のみ。主キーが既存だと失敗する。
     #[default]
@@ -170,7 +170,7 @@ pub enum ImportMode {
 }
 
 /// インポート先の 1 カラム（名前・型・対応する CSV 列）。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ImportColumn {
     pub name: String,
     /// SPANNER_TYPE 文字列（例: "INT64" / "STRING(MAX)"）。値の変換に使う。
@@ -180,7 +180,7 @@ pub struct ImportColumn {
 }
 
 /// CSV の取得元。行データは UI に溜め込まず、ここから都度ストリーミングする。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ImportSource {
     /// ローカルファイル。
     File(std::path::PathBuf),
@@ -189,7 +189,7 @@ pub enum ImportSource {
 }
 
 /// CSV の文字コード。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Encoding {
     #[default]
     Utf8,

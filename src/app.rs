@@ -695,6 +695,9 @@ impl MonitorApp {
             }
         }
 
+        // 前回の未完インポートジョブを「中断」状態で復元（再キューで続きから再開可）。
+        let (restored_jobs, restored_next_id) = restore_import_jobs();
+
         Self {
             sample_rx: ch.sample_rx,
             samples: VecDeque::new(),
@@ -710,8 +713,8 @@ impl MonitorApp {
             import_res_rx: ch.import_res_rx,
             import_dialog: None,
             import_pending: false,
-            import_jobs: Vec::new(),
-            import_next_id: 1,
+            import_jobs: restored_jobs,
+            import_next_id: restored_next_id,
             pending_report_dir: None,
             pending_report_wait: 0,
             pending_bulk: None,
@@ -1198,6 +1201,8 @@ impl MonitorApp {
                     self.copy_note = Some(msg);
                     // 空いた枠で次の待機ジョブを動かす。
                     self.pump_import_queue();
+                    // 完了/失敗/中断で状態が変わったので保存（Done は保存対象外になる）。
+                    save_import_jobs(&self.import_jobs);
                 }
             }
         }
@@ -3927,6 +3932,7 @@ impl MonitorApp {
             outcome: None,
         });
         self.pump_import_queue();
+        save_import_jobs(&self.import_jobs);
     }
 
     /// 同時に走らせるインポートジョブ数の上限（リソース保護）。
@@ -4364,10 +4370,12 @@ impl MonitorApp {
         if let Some(i) = remove_idx {
             if i < self.import_jobs.len() && self.import_jobs[i].status != JobStatus::Running {
                 self.import_jobs.remove(i);
+                save_import_jobs(&self.import_jobs);
             }
         }
         if clear_done {
             self.import_jobs.retain(|j| j.is_active());
+            save_import_jobs(&self.import_jobs);
         }
         if do_report {
             self.export_import_report(ui.ctx());
@@ -7281,6 +7289,110 @@ fn save_envs(profiles: &[EnvProfile], active: &Option<String>) {
     }
 }
 
+/// 再起動後の再開用に保存するインポートジョブ（未完のみ）。
+/// 実行時専用の cancel/id/進捗は持たず、再開に必要な要求内容だけを保存する。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedImportJob {
+    table: String,
+    columns: Vec<query::ImportColumn>,
+    source: query::ImportSource,
+    source_name: String,
+    has_header: bool,
+    mode: query::ImportMode,
+    empty_as_null: bool,
+    encoding: query::Encoding,
+    delimiter: u8,
+    skip_bad_rows: bool,
+    null_token: Option<String>,
+}
+
+/// 未完ジョブの保存先（チェックポイントと同じ ~/.spanner-viewer/ 配下）。
+fn import_jobs_file() -> std::path::PathBuf {
+    let base = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(".spanner-viewer").join("import_jobs.json")
+}
+
+/// 未完（Done 以外）のジョブをディスクに保存する。空なら削除。
+fn save_import_jobs(jobs: &[ImportJob]) {
+    let saved: Vec<SavedImportJob> = jobs
+        .iter()
+        .filter(|j| j.status != JobStatus::Done)
+        .map(|j| SavedImportJob {
+            table: j.req.table.clone(),
+            columns: j.req.columns.clone(),
+            source: j.req.source.clone(),
+            source_name: j.source_name.clone(),
+            has_header: j.req.has_header,
+            mode: j.req.mode,
+            empty_as_null: j.req.empty_as_null,
+            encoding: j.req.encoding,
+            delimiter: j.req.delimiter,
+            skip_bad_rows: j.req.skip_bad_rows,
+            null_token: j.req.null_token.clone(),
+        })
+        .collect();
+    let path = import_jobs_file();
+    if saved.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(p) = path.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&saved) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+fn load_import_jobs() -> Vec<SavedImportJob> {
+    std::fs::read_to_string(import_jobs_file())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// 保存済みの未完ジョブを「中断」状態の ImportJob に復元する（id は連番で振り直す）。
+fn restore_import_jobs() -> (Vec<ImportJob>, u64) {
+    saved_jobs_to_import_jobs(load_import_jobs())
+}
+
+fn saved_jobs_to_import_jobs(saved: Vec<SavedImportJob>) -> (Vec<ImportJob>, u64) {
+    let mut jobs = Vec::new();
+    let mut next_id = 1u64;
+    for s in saved {
+        let req = query::ImportRequest {
+            id: next_id,
+            table: s.table,
+            columns: s.columns,
+            source: s.source,
+            has_header: s.has_header,
+            mode: s.mode,
+            empty_as_null: s.empty_as_null,
+            fresh: false, // チェックポイントから再開する
+            encoding: s.encoding,
+            delimiter: s.delimiter,
+            skip_bad_rows: s.skip_bad_rows,
+            dry_run: false,
+            null_token: s.null_token,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        jobs.push(ImportJob {
+            req,
+            source_name: s.source_name,
+            sent: false,
+            status: JobStatus::Cancelled, // プロセス終了で中断扱い
+            started: None,
+            progress: None,
+            result: Some("前回終了で中断。「⟳ 再キュー」で続きから再開できます。".into()),
+            outcome: None,
+        });
+        next_id += 1;
+    }
+    (jobs, next_id)
+}
+
 /// 単発の async（ADC 一覧 API など）を専用ランタイムでブロッキング実行する。
 fn run_blocking<T>(fut: impl std::future::Future<Output = anyhow::Result<T>>) -> Result<T, String> {
     match tokio::runtime::Builder::new_current_thread()
@@ -9883,6 +9995,61 @@ mod tests {
         assert_eq!(fmt_count(1000), "1,000");
         assert_eq!(fmt_count(12_345), "12,345");
         assert_eq!(fmt_count(1_234_567), "1,234,567");
+    }
+
+    /// 未完ジョブの保存→復元: 内容が保たれ、状態は「中断」、id は振り直し、fresh=false。
+    #[test]
+    fn import_jobs_save_restore_roundtrip() {
+        let saved = vec![
+            SavedImportJob {
+                table: "Users".into(),
+                columns: vec![query::ImportColumn {
+                    name: "Id".into(),
+                    ty: "INT64".into(),
+                    src_index: 0,
+                }],
+                source: query::ImportSource::File("/tmp/u.csv".into()),
+                source_name: "u.csv".into(),
+                has_header: true,
+                mode: query::ImportMode::InsertOrUpdate,
+                empty_as_null: true,
+                encoding: query::Encoding::Utf8,
+                delimiter: b',',
+                skip_bad_rows: false,
+                null_token: Some("<null>".into()),
+            },
+            SavedImportJob {
+                table: "Orders".into(),
+                columns: vec![],
+                source: query::ImportSource::Gcs("gs://b/o.csv".into()),
+                source_name: "o.csv".into(),
+                has_header: false,
+                mode: query::ImportMode::Insert,
+                empty_as_null: false,
+                encoding: query::Encoding::ShiftJis,
+                delimiter: b'\t',
+                skip_bad_rows: true,
+                null_token: None,
+            },
+        ];
+        // serde 往復で壊れないこと。
+        let json = serde_json::to_string(&saved).unwrap();
+        let back: Vec<SavedImportJob> = serde_json::from_str(&json).unwrap();
+        let (jobs, next_id) = saved_jobs_to_import_jobs(back);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(next_id, 3);
+        // 中断状態・id 振り直し・チェックポイント再開(fresh=false)。
+        assert_eq!(jobs[0].status, JobStatus::Cancelled);
+        assert_eq!(jobs[0].req.id, 1);
+        assert_eq!(jobs[1].req.id, 2);
+        assert!(!jobs[0].req.fresh);
+        // 内容が保たれている。
+        assert_eq!(jobs[0].req.table, "Users");
+        assert_eq!(jobs[0].req.null_token.as_deref(), Some("<null>"));
+        assert_eq!(jobs[0].req.mode, query::ImportMode::InsertOrUpdate);
+        assert_eq!(jobs[1].req.encoding, query::Encoding::ShiftJis);
+        assert_eq!(jobs[1].req.delimiter, b'\t');
+        matches!(jobs[1].req.source, query::ImportSource::Gcs(_));
     }
 
     /// 並列ディスパッチ判定: 別テーブルは並列・同一テーブルは直列・上限まで。
