@@ -1676,8 +1676,16 @@ impl eframe::App for MonitorApp {
         self.drain();
         self.drain_screenshot(ctx);
         self.check_login_state(ctx);
-        // 取込中は進捗バーを滑らかに更新するため高頻度で再描画。
-        if self.import_pending {
+        // 背景処理中（取込/照合/ログ追従/各種取得）は進捗・スピナー・ログを
+        // 滑らかに更新するため高頻度で再描画する。それ以外は 1 秒間隔で十分。
+        let busy = self.import_pending
+            || self.verify_running
+            || self.kube_log_following
+            || self.plan_pending
+            || self.schema_pending
+            || self.gcs_pending
+            || self.res_pending;
+        if busy {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else {
             ctx.request_repaint_after(Duration::from_secs(1));
