@@ -2413,6 +2413,17 @@ impl CsvTab {
         }
     }
 
+    /// 表示上の「データ行数」。先頭行ヘッダのチェックが入っていればヘッダを除く。
+    /// インポート/照合タブの件数（データ行のみ）と一致する。
+    fn data_rows(&self) -> u64 {
+        let total = self.total_lines();
+        if self.has_header {
+            total.saturating_sub(1)
+        } else {
+            total
+        }
+    }
+
     /// ファイル行 i の生バイト列（所有）。索引/プレビューの両方を吸収する。
     fn line_at(&self, i: u64) -> Option<Vec<u8>> {
         if let Some(pv) = &self.preview {
@@ -2533,16 +2544,31 @@ impl CsvTab {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(idx) = &self.index {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} 行 · {}",
-                            fmt_count(idx.total_rows as usize),
-                            human_bytes(idx.bytes as f64)
-                        ))
-                        .color(MUTED),
-                    )
-                    .on_hover_text("列の境界をドラッグで幅変更・ダブルクリックで内容にフィット");
+                if self.ready() {
+                    let total = self.total_lines();
+                    let rows = self.data_rows();
+                    // バイト数: 索引はファイル全体、プレビューは読み込み済み。
+                    let bytes = if let Some(idx) = &self.index {
+                        Some(idx.bytes as f64)
+                    } else {
+                        self.preview
+                            .as_ref()
+                            .map(|pv| pv.lock().unwrap().bytes_read as f64)
+                    };
+                    let suffix = match bytes {
+                        Some(b) => format!(" · {}", human_bytes(b)),
+                        None => String::new(),
+                    };
+                    let label = if self.has_header {
+                        format!("{} 行（ヘッダ除く）{}", fmt_count(rows as usize), suffix)
+                    } else {
+                        format!("{} 行{}", fmt_count(rows as usize), suffix)
+                    };
+                    ui.label(egui::RichText::new(label).color(MUTED)).on_hover_text(format!(
+                        "データ行数（インポート/照合の件数と一致）。ファイル総レコード数: {}\n\
+                         列の境界をドラッグで幅変更・ダブルクリックで内容にフィット",
+                        fmt_count(total as usize)
+                    ));
                 }
             });
         });
