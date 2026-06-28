@@ -2096,6 +2096,10 @@ struct CsvTab {
     filter_result: std::sync::Arc<std::sync::Mutex<Option<Vec<u64>>>>,
     /// 各列の表示幅（内容に合わせて算出。空なら次の描画で再計算）。
     col_widths: Vec<f32>,
+    /// クリックで選択中のセル（データ行インデックス, 列）。コピー対象のハイライト用。
+    selected: Option<(u64, usize)>,
+    /// 直近にコピーしたセル値（ツールバーに表示。確認用）。
+    copied_note: Option<String>,
 }
 
 impl CsvTab {
@@ -2134,6 +2138,8 @@ impl CsvTab {
             filter_cancel: Arc::new(AtomicBool::new(false)),
             filter_result: Arc::new(Mutex::new(None)),
             col_widths: Vec::new(),
+            selected: None,
+            copied_note: None,
         }
     }
 
@@ -2544,6 +2550,15 @@ impl CsvTab {
                 {
                     do_goto = true;
                 }
+                ui.separator();
+                if let Some(c) = &self.copied_note {
+                    ui.label(egui::RichText::new(format!("📋 {c}")).color(ACCENT))
+                        .on_hover_text("クリップボードにコピー済み");
+                } else {
+                    ui.label(
+                        egui::RichText::new("セルをクリックでコピー").color(MUTED).small(),
+                    );
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.ready() {
@@ -2844,6 +2859,40 @@ impl CsvTab {
         let coloff = self.col_off;
         let header_cells = self.header_cells();
         let rows = self.visible_rows(first, visible);
+
+        // セルクリックで値をクリップボードにコピー（カスタム描画なので手動ヒットテスト）。
+        let body_rect = egui::Rect::from_min_max(
+            egui::pos2(grid.left(), body_top),
+            egui::pos2(grid.right(), grid.bottom()),
+        );
+        let cell_click =
+            ui.interact(body_rect, ui.id().with(("csv_cellclick", &salt)), egui::Sense::click());
+        if cell_click.clicked() {
+            if let Some(p) = cell_click.interact_pointer_pos() {
+                let vr = ((p.y - body_top) / row_h).floor() as i64;
+                let content_x = p.x - grid.left() + coloff;
+                let mut ci = None;
+                for c in 0..ncols {
+                    if content_x >= col_x[c] && content_x < col_x[c + 1] {
+                        ci = Some(c);
+                        break;
+                    }
+                }
+                if vr >= 0 && (vr as usize) < rows.len() {
+                    if let Some(ci) = ci {
+                        if let Some(v) = rows[vr as usize].get(ci) {
+                            ui.ctx().copy_text(v.clone());
+                            self.selected = Some((first + vr as u64, ci));
+                            // 確認用に表示（長い値は頭だけ）。桁数の目視確認にも使える。
+                            let short: String = v.chars().take(120).collect();
+                            self.copied_note = Some(format!("{}（{}文字）", short, v.chars().count()));
+                        }
+                    }
+                }
+            }
+        }
+        let selected = self.selected;
+
         let painter = ui.painter_at(full);
         painter.rect_filled(full, 0.0, BASE);
 
@@ -2910,6 +2959,23 @@ impl CsvTab {
                 );
             }
             draw_cells(cells, y, false, egui::Color32::from_gray(210));
+            // 選択中セルを枠でハイライト。
+            if let Some((srow, scol)) = selected {
+                if srow == first + vr as u64 && scol < ncols {
+                    let cx = grid.left() + col_x[scol] - coloff;
+                    let cw = widths.get(scol).copied().unwrap_or(120.0);
+                    let left = cx.max(grid.left());
+                    let right = (cx + cw).min(grid.right());
+                    if right > left {
+                        painter.rect_stroke(
+                            egui::Rect::from_min_max(egui::pos2(left, y), egui::pos2(right, y + row_h)),
+                            0.0,
+                            egui::Stroke::new(2.0, ACCENT),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
+            }
         }
 
         let vbar_bg = egui::Color32::from_gray(30);
