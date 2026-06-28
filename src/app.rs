@@ -4585,21 +4585,32 @@ impl MonitorApp {
                     ui.separator();
                     ui.label(egui::RichText::new("列のマッピング").strong());
                     ui.label(
-                        egui::RichText::new("テーブル列 ← CSV 列")
-                            .color(MUTED)
-                            .small(),
+                        egui::RichText::new(
+                            "テーブル列 ← CSV 列（ヘッダ無しは列の並び順で対応。\
+                             右の「先頭行の値」で対応を確認してください）",
+                        )
+                        .color(MUTED)
+                        .small(),
                     );
                     ui.add_space(2.0);
 
+                    // 先頭データ行（ヘッダ有なら 2 行目）。各列に入る実値の確認用。
+                    let sample_row: Vec<String> = d.data_rows().first().cloned().unwrap_or_default();
                     egui::ScrollArea::vertical()
                         .max_height(260.0)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             egui::Grid::new("import_map_grid")
-                                .num_columns(2)
+                                .num_columns(3)
                                 .spacing([12.0, 6.0])
                                 .striped(true)
                                 .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("テーブル列").color(MUTED).small());
+                                    ui.label(egui::RichText::new("CSV 列").color(MUTED).small());
+                                    ui.label(
+                                        egui::RichText::new("先頭行の値").color(MUTED).small(),
+                                    );
+                                    ui.end_row();
                                     for (ci, col) in d.table_columns.iter().enumerate() {
                                         let key = if col.pk { "🔑 " } else { "" };
                                         ui.label(
@@ -4621,7 +4632,7 @@ impl MonitorApp {
                                         };
                                         egui::ComboBox::from_id_salt(("import_map", ci))
                                             .selected_text(sel_text)
-                                            .width(220.0)
+                                            .width(200.0)
                                             .show_ui(ui, |ui| {
                                                 ui.selectable_value(
                                                     &mut d.mapping[ci],
@@ -4636,6 +4647,28 @@ impl MonitorApp {
                                                     );
                                                 }
                                             });
+                                        // 先頭行の実値（対応確認用）。
+                                        let sample = match d.mapping[ci] {
+                                            Some(src) => match sample_row.get(src) {
+                                                Some(s) if s.is_empty() => "(空欄→NULL)".to_string(),
+                                                Some(s) => {
+                                                    let t: String = s.chars().take(24).collect();
+                                                    if s.chars().count() > 24 {
+                                                        format!("{t}…")
+                                                    } else {
+                                                        t
+                                                    }
+                                                }
+                                                None => "(該当列なし)".to_string(),
+                                            },
+                                            None => "—".to_string(),
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(sample)
+                                                .color(MUTED)
+                                                .monospace()
+                                                .small(),
+                                        );
                                         ui.end_row();
                                     }
                                 });
@@ -9980,6 +10013,58 @@ mod tests {
         apply_sql_completion(&mut sql, (14, 16), "Users", &mut cur);
         assert_eq!(sql, "SELECT * FROM Users ");
         assert_eq!(cur, Some(20));
+    }
+
+    /// ImportDialog.recompute: ヘッダ無は位置対応・ヘッダ有は名前一致。列順が保たれる。
+    #[test]
+    fn import_dialog_no_header_positional_mapping() {
+        let col = |n: &str, t: &str, pk: bool| query::Column {
+            name: n.into(),
+            ty: t.into(),
+            pk,
+        };
+        let mut d = ImportDialog {
+            table: "T".into(),
+            table_columns: vec![
+                col("Id", "INT64", true),
+                col("Name", "STRING(MAX)", false),
+                col("Score", "FLOAT64", false),
+            ],
+            source: query::ImportSource::File("/dev/null".into()),
+            file_name: "x.csv".into(),
+            preview_bytes: vec![],
+            records: vec![
+                vec!["1".into(), "alice".into(), "1.5".into()],
+                vec!["2".into(), "bob".into(), "2.0".into()],
+            ],
+            encoding: query::Encoding::Utf8,
+            delimiter: b',',
+            skip_bad_rows: false,
+            null_token: String::new(),
+            has_header: false,
+            csv_headers: vec![],
+            mapping: vec![],
+            mode: query::ImportMode::Insert,
+            empty_as_null: true,
+            fresh: false,
+            note: None,
+            config_msg: None,
+        };
+        // ヘッダ無し → 位置対応（Id←列1, Name←列2, Score←列3）。
+        d.recompute();
+        assert_eq!(d.mapping, vec![Some(0), Some(1), Some(2)]);
+        assert_eq!(
+            d.csv_headers,
+            vec!["列1".to_string(), "列2".to_string(), "列3".to_string()]
+        );
+        // ヘッダ有りに切替: 先頭行が見出しになり、テーブル列名と一致しないので全て None。
+        d.has_header = true;
+        d.recompute();
+        assert_eq!(d.mapping, vec![None, None, None]);
+        assert_eq!(
+            d.csv_headers,
+            vec!["1".to_string(), "alice".to_string(), "1.5".to_string()]
+        );
     }
 
     /// マッピング初期値: ヘッダ有=名前一致 / ヘッダ無=位置対応（スキップにしない）。
