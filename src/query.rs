@@ -4306,6 +4306,56 @@ mod tests {
         let _ = run_ddl(&env, &format!("DROP TABLE {tbl}")).await;
     }
 
+    /// STRING(5) 列に <null>(6文字) が来ても NULL 化されるので桁エラーにならない（emulator 前提）。
+    #[tokio::test]
+    async fn import_null_placeholder_into_fixed_size_string() {
+        let Some(_) = emulator_db() else {
+            eprintln!("skip: SPANNER_EMULATOR_HOST 未設定");
+            return;
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _guard = EMU_LOCK.lock().await;
+        let env = test_env();
+        let tbl = "NullSizeTest";
+        let _ = run_ddl(&env, &format!("DROP TABLE {tbl}")).await;
+        let out = run_ddl(
+            &env,
+            &format!("CREATE TABLE {tbl} (Id INT64 NOT NULL, Code STRING(5)) PRIMARY KEY(Id)"),
+        )
+        .await;
+        assert_eq!(out.error, None, "create: {:?}", out.error);
+
+        let csv = "Id,Code\n1,<null>\n2,abcde\n";
+        let path = write_temp_csv("nullsize", csv);
+        let req = ImportRequest {
+            id: 0,
+            table: tbl.into(),
+            columns: cols(&[("Id", "INT64"), ("Code", "STRING(5)")]),
+            source: ImportSource::File(path),
+            has_header: true,
+            mode: ImportMode::InsertOrUpdate,
+            empty_as_null: true,
+            fresh: true,
+            encoding: Encoding::Utf8,
+            delimiter: b',',
+            skip_bad_rows: false,
+            dry_run: false,
+            null_token: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (ptx, _prx) = std::sync::mpsc::channel::<ImportProgress>();
+        let out = run_streaming_import(&test_env(), &req, false, &ptx).await;
+        assert_eq!(out.error, None, "import error: {:?}", out.error);
+
+        let client = client().await;
+        let (_, rows, _) = try_query(&client, &format!("SELECT Id, Code FROM {tbl} ORDER BY Id"))
+            .await
+            .unwrap();
+        assert_eq!(rows[0][1], "NULL", "<null> は NULL になる（桁エラーにならない）");
+        assert_eq!(rows[1][1], "abcde");
+        let _ = run_ddl(&env, &format!("DROP TABLE {tbl}")).await;
+    }
+
     /// <null> / (null) がトークン未指定でも DB に NULL として入る（emulator 前提）。
     #[tokio::test]
     async fn import_default_null_placeholders_to_db() {
