@@ -101,25 +101,43 @@ pub async fn poll_loop(
         return;
     }
 
-    let provider = match gcp_auth::provider().await {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = tx.send(Sample::error_at(
-                now_unix(),
-                format!("認証初期化に失敗: {e}（gcloud auth application-default login などで認証してください）"),
-            ));
-            return;
-        }
-    };
     let client = reqwest::Client::new();
+    // 認証プロバイダはループ内で遅延生成し、認証失敗時は破棄して作り直す。
+    // こうすることで「起動時は未ログイン → 後でログイン」や「セッション切れ →
+    // 再ログイン」のあとに、アプリを再起動しなくても監視が自動復帰する。
+    let mut provider: Option<Arc<dyn TokenProvider>> = None;
 
     loop {
         // 接続先は設定画面で切り替えられるので毎回読む
         let env = crate::query::current_spanner_env();
-        let sample = if env.configured() {
-            poll_once(&provider, &client, &env.project, &env.instance).await
-        } else {
+        let sample = if !env.configured() {
             Sample::error_at(now_unix(), "Spanner 環境が未設定です".to_string())
+        } else {
+            // 認証プロバイダが無ければ作る（再ログインを毎回ここで拾える）。
+            if provider.is_none() {
+                if let Ok(p) = gcp_auth::provider().await {
+                    provider = Some(p);
+                }
+            }
+            match &provider {
+                None => {
+                    // 初期化に失敗してもループは止めない（後でログインすれば復帰）。
+                    Sample::error_at(
+                        now_unix(),
+                        "未認証です（gcloud auth application-default login などでログインしてください）"
+                            .to_string(),
+                    )
+                }
+                Some(p) => {
+                    let (sample, auth_failed) =
+                        poll_once(p, &client, &env.project, &env.instance).await;
+                    if auth_failed {
+                        // セッション切れ等。次回はプロバイダを作り直して再ログインを拾う。
+                        provider = None;
+                    }
+                    sample
+                }
+            }
         };
         if tx.send(sample).is_err() {
             break; // UI が閉じられた
@@ -172,35 +190,59 @@ fn pseudo_noise(tick: u64) -> f64 {
     frac * 2.0 - 1.0
 }
 
+/// 1 回ポーリングする。戻り値 `(Sample, auth_failed)`。`auth_failed=true` のとき
+/// 呼び出し側はプロバイダを破棄して作り直す（セッション切れ→再ログインの復帰用）。
 async fn poll_once(
     provider: &Arc<dyn TokenProvider>,
     client: &reqwest::Client,
     project: &str,
     instance: &str,
-) -> Sample {
+) -> (Sample, bool) {
     let t = now_unix();
-    match try_poll(provider, client, project, instance).await {
-        Ok((cpu, used, limit, pu)) => Sample {
-            t,
-            cpu_percent: cpu * 100.0,
-            storage_used: used,
-            storage_limit: limit,
-            processing_units: pu,
-            error: None,
-        },
-        Err(e) => Sample::error_at(t, e.to_string()),
+    // トークン取得失敗はセッション切れ等の認証問題なので作り直し対象。
+    let token = match provider.token(&[SCOPE]).await {
+        Ok(tok) => tok,
+        Err(e) => {
+            return (
+                Sample::error_at(
+                    t,
+                    format!("認証に失敗: {e}（gcloud auth application-default login で再ログインしてください）"),
+                ),
+                true,
+            );
+        }
+    };
+    match try_poll(token.as_str(), client, project, instance).await {
+        Ok((cpu, used, limit, pu)) => (
+            Sample {
+                t,
+                cpu_percent: cpu * 100.0,
+                storage_used: used,
+                storage_limit: limit,
+                processing_units: pu,
+                error: None,
+            },
+            false,
+        ),
+        Err(e) => {
+            // HTTP 401/403 等も認証起因として作り直し対象にする。
+            let s = e.to_string();
+            let auth = s.contains("401")
+                || s.contains("403")
+                || s.contains("UNAUTHENTICATED")
+                || s.contains("PERMISSION_DENIED")
+                || s.contains("invalid_grant");
+            (Sample::error_at(t, s), auth)
+        }
     }
 }
 
 async fn try_poll(
-    provider: &Arc<dyn TokenProvider>,
+    bearer: &str,
     client: &reqwest::Client,
     project: &str,
     instance: &str,
 ) -> anyhow::Result<(f64, f64, f64, f64)> {
-    let token = provider.token(&[SCOPE]).await?;
-    let bearer = token.as_str();
-
     let cpu = fetch_latest(
         client,
         bearer,

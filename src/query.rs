@@ -533,6 +533,10 @@ pub async fn query_loop(
                     } else {
                         ensure_and_run(&mut guard, &env, &sql).await
                     };
+                    // 認証エラーならキャッシュを破棄し、次回は作り直して再ログインを拾う。
+                    if out.error.as_deref().map(is_auth_error).unwrap_or(false) {
+                        *guard = None;
+                    }
                     out.target = Target::Data;
                     out.elapsed_ms = start.elapsed().as_millis();
                     let _ = data_tx_task.send(out);
@@ -563,6 +567,9 @@ pub async fn query_loop(
                             },
                         }
                     };
+                    if graph.error.as_deref().map(is_auth_error).unwrap_or(false) {
+                        *guard = None;
+                    }
                     let _ = schema_tx_task.send(graph);
                 }
                 Target::Plan => {
@@ -587,6 +594,9 @@ pub async fn query_loop(
                             },
                         }
                     };
+                    if out.error.as_deref().map(is_auth_error).unwrap_or(false) {
+                        *guard = None;
+                    }
                     out.elapsed_ms = start.elapsed().as_millis();
                     let _ = plan_tx_task.send(out);
                 }
@@ -3119,6 +3129,19 @@ fn panic_message(err: tokio::task::JoinError) -> String {
 }
 
 /// クライアントを遅延生成して借用を返す。接続先 env が変わっていれば作り直す。
+/// エラーメッセージが認証起因かを大まかに判定する。これが真ならクライアント
+/// キャッシュを破棄して作り直す（セッション切れ→再ログイン後の自動復帰用）。
+fn is_auth_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("unauthenticated")
+        || m.contains("invalid_grant")
+        || m.contains("permission_denied")
+        || m.contains("credential")
+        || m.contains("認証")
+        || m.contains("401")
+        || m.contains("token")
+}
+
 async fn ensure_client<'a>(
     cache: &'a mut Option<(SpannerEnv, Client)>,
     env: &SpannerEnv,
